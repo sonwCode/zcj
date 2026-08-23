@@ -1,0 +1,13 @@
+services:
+  app:
+    build: .
+    container_name: zcj-register
+    ports:
+      - "0.0.0.0:8001:8000"
+    environment:
+      DISPLAY: ":99"
+      ACCOUNT_MANAGER_DATABASE_URL: "sqlite:////app/data/account_manager.db"
+      APP_PASSWORD: "${ZCJ_APP_PASSWORD}"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

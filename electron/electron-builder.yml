@@ -1,0 +1,35 @@
+appId: com.zcj.registerconsole
+productName: 注册机zcj
+copyright: Copyright © 2026
+
+directories:
+  output: dist
+  buildResources: build
+
+extraResources:
+  - from: backend
+    to: backend
+    filter:
+      - "**/*"
+
+mac:
+  category: public.app-category.utilities
+  target:
+    - target: dmg
+    - target: zip
+  icon: build/icon.icns
+
+win:
+  target:
+    - target: nsis
+  icon: build/icon.ico
+
+linux:
+  target:
+    - target: AppImage
+  category: Utility
+  icon: build/icon.png
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true

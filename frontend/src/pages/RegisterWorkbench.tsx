@@ -1,0 +1,1322 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
+import {
+  AlertTriangle,
+  ArrowRight,
+  Check,
+  CheckCircle,
+  ChevronDown,
+  CircleDot,
+  Cpu,
+  Database,
+  Gauge,
+  History,
+  Layers3,
+  Loader2,
+  Mail,
+  MailCheck,
+  MapPin,
+  Orbit,
+  Play,
+  Radio,
+  ScanText,
+  Server,
+  Settings2,
+  ShieldCheck,
+  Smartphone,
+  Users,
+  Workflow,
+  XCircle,
+} from 'lucide-react'
+
+import { TaskLogPanel } from '@/components/tasks/TaskLogPanel'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent } from '@/components/ui/card'
+import { getConfig, getConfigOptions, getPlatforms } from '@/lib/app-data'
+import type {
+  ConfigOptionsResponse,
+  ProviderField,
+  ProviderSetting,
+} from '@/lib/config-options'
+import {
+  getCaptchaStrategyLabel,
+  getProviderSelectOptions,
+  listProviderFieldKeys,
+} from '@/lib/config-options'
+import { useI18n } from '@/lib/i18n-context'
+import {
+  buildExecutorOptions,
+  buildRegistrationOptions,
+  hasReusableOAuthBrowser,
+  pickOAuthExecutor,
+} from '@/lib/registration'
+import { normalizeFreeSub2Model, SUB2_FREE_MODEL_OPTIONS } from '@/lib/sub2api-models'
+import { getTaskStatusText, isTerminalTaskStatus, TASK_STATUS_VARIANTS } from '@/lib/tasks'
+import { apiFetch } from '@/lib/utils'
+
+type SelectOption = readonly [string | number, string]
+
+const EMPTY_CONFIG_OPTIONS: ConfigOptionsResponse = {
+  mailbox_providers: [],
+  captcha_providers: [],
+  sms_providers: [],
+  mailbox_settings: [],
+  captcha_settings: [],
+  sms_settings: [],
+  captcha_policy: {},
+  executor_options: [],
+  identity_mode_options: [],
+  oauth_provider_options: [],
+}
+
+const DEFAULT_FORM: Record<string, any> = {
+  platform: 'chatgpt',
+  email: '',
+  password: '',
+  count: 1,
+  concurrency: 1,
+  proxy: '',
+  executor_type: 'headless',
+  captcha_solver: 'auto',
+  identity_provider: 'mailbox',
+  oauth_provider: '',
+  oauth_email_hint: '',
+  chrome_user_data_dir: '',
+  chrome_cdp_url: '',
+  mail_provider: '',
+  sms_provider: '',
+  phone_bind_email_after_registration: true,
+  email_otp_timeout_seconds: 300,
+  sub2api_auto_sync: false,
+  sub2api_proxy_id: 0,
+  sub2api_agent_identity_region: 'CO',
+  sub2api_default_model: '',
+  proxy_strategy: 'auto',
+  failure_policy: 'retry_then_continue',
+  complete_started_attempts: false,
+  post_registration_liveness_delay_seconds: 60,
+}
+
+const SMS_COUNTRY_PROXY_REGIONS: Record<string, { code: string; label: string }> = {
+  '187': { code: 'US', label: '美国' },
+  '16': { code: 'GB', label: '英国' },
+  '33': { code: 'CO', label: '哥伦比亚' },
+  '151': { code: 'CL', label: '智利' },
+  '10': { code: 'VN', label: '越南' },
+  '73': { code: 'BR', label: '巴西' },
+  '22': { code: 'IN', label: '印度' },
+  '6': { code: 'ID', label: '印度尼西亚' },
+  '4': { code: 'PH', label: '菲律宾' },
+  '52': { code: 'TH', label: '泰国' },
+  '0': { code: 'RU', label: '俄罗斯' },
+}
+
+const REGION_OPTIONS: SelectOption[] = [
+  ['CO', 'CO · 哥伦比亚'],
+  ['US', 'US · 美国'],
+  ['GB', 'GB · 英国'],
+  ['CL', 'CL · 智利'],
+  ['BR', 'BR · 巴西'],
+  ['IN', 'IN · 印度'],
+  ['ID', 'ID · 印度尼西亚'],
+  ['PH', 'PH · 菲律宾'],
+  ['TH', 'TH · 泰国'],
+  ['VN', 'VN · 越南'],
+]
+
+function FieldInput({
+  label,
+  value,
+  onChange,
+  type = 'text',
+  placeholder = '',
+  min,
+  max,
+  hint,
+}: {
+  label: string
+  value: string | number
+  onChange: (value: string | number) => void
+  type?: 'text' | 'password' | 'number'
+  placeholder?: string
+  min?: number
+  max?: number
+  hint?: string
+}) {
+  return (
+    <label className="block min-w-0">
+      <span className="mb-1.5 block text-xs font-medium text-[var(--text-secondary)]">{label}</span>
+      <input
+        type={type}
+        value={value}
+        min={min}
+        max={max}
+        onChange={(event) => onChange(type === 'number' ? Number(event.target.value) : event.target.value)}
+        placeholder={placeholder}
+        className="control-surface"
+      />
+      {hint ? <span className="mt-1.5 block text-[11px] leading-4 text-[var(--text-muted)]">{hint}</span> : null}
+    </label>
+  )
+}
+
+function FieldSelect({
+  label,
+  value,
+  onChange,
+  options,
+  hint,
+}: {
+  label: string
+  value: string | number
+  onChange: (value: string) => void
+  options: readonly SelectOption[]
+  hint?: string
+}) {
+  return (
+    <label className="block min-w-0">
+      <span className="mb-1.5 block text-xs font-medium text-[var(--text-secondary)]">{label}</span>
+      <select
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="control-surface appearance-none"
+      >
+        {options.map(([optionValue, optionLabel]) => (
+          <option key={String(optionValue)} value={optionValue}>{optionLabel}</option>
+        ))}
+      </select>
+      {hint ? <span className="mt-1.5 block text-[11px] leading-4 text-[var(--text-muted)]">{hint}</span> : null}
+    </label>
+  )
+}
+
+function ToggleRow({
+  label,
+  description,
+  checked,
+  onChange,
+}: {
+  label: string
+  description?: string
+  checked: boolean
+  onChange: (checked: boolean) => void
+}) {
+  return (
+    <label className="flex min-h-12 cursor-pointer items-center justify-between gap-4 rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] px-4 py-3 transition-colors hover:border-[var(--accent-edge)]">
+      <span className="min-w-0">
+        <span className="block text-sm font-medium text-[var(--text-primary)]">{label}</span>
+        {description ? <span className="mt-0.5 block text-[11px] leading-4 text-[var(--text-muted)]">{description}</span> : null}
+      </span>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+        className="checkbox-accent h-4 w-4 shrink-0"
+      />
+    </label>
+  )
+}
+
+function ProviderFieldControl({
+  field,
+  value,
+  onChange,
+}: {
+  field: ProviderField
+  value: any
+  onChange: (value: any) => void
+}) {
+  if (field.type === 'toggle') {
+    const checked = value === true || String(value || '').toLowerCase() === 'true'
+    return <ToggleRow label={field.label} description={field.hint} checked={checked} onChange={onChange} />
+  }
+  if (field.type === 'select' && field.options?.length) {
+    return (
+      <FieldSelect
+        label={field.label}
+        value={String(value ?? '')}
+        onChange={onChange}
+        options={field.options.map(option => [option.value, option.label] as const)}
+        hint={field.hint}
+      />
+    )
+  }
+  if (field.type === 'textarea') {
+    return (
+      <label className="block min-w-0 md:col-span-2">
+        <span className="mb-1.5 block text-xs font-medium text-[var(--text-secondary)]">{field.label}</span>
+        <textarea
+          value={String(value ?? '')}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={field.placeholder || ''}
+          className="control-surface min-h-24 resize-y"
+        />
+        {field.hint ? <span className="mt-1.5 block text-[11px] leading-4 text-[var(--text-muted)]">{field.hint}</span> : null}
+      </label>
+    )
+  }
+  return (
+    <FieldInput
+      label={field.label}
+      value={String(value ?? '')}
+      onChange={onChange}
+      type={field.secret ? 'password' : 'text'}
+      placeholder={field.placeholder || ''}
+      hint={field.hint}
+    />
+  )
+}
+
+function SectionHeading({
+  number,
+  title,
+  description,
+  icon: Icon,
+}: {
+  number: string
+  title: string
+  description: string
+  icon: typeof Workflow
+}) {
+  return (
+    <div className="mb-5 flex items-start gap-3">
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-[var(--accent-edge)] bg-[var(--accent-soft)] text-[var(--text-accent)]">
+        <Icon className="h-4.5 w-4.5" />
+      </div>
+      <div className="min-w-0">
+        <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-[var(--text-muted)]">STEP {number}</div>
+        <h2 className="mt-0.5 text-base font-semibold tracking-[-0.02em] text-[var(--text-primary)]">{title}</h2>
+        <p className="mt-1 text-xs leading-5 text-[var(--text-muted)]">{description}</p>
+      </div>
+    </div>
+  )
+}
+
+function selectedSmsCountry(form: Record<string, any>) {
+  const value = [
+    form.smsbower_default_country,
+    form.sms_country,
+    form.herosms_country,
+    form.herosms_default_country,
+    form.sms_activate_default_country,
+  ].find(item => String(item || '').trim())
+  return String(value || '').trim()
+}
+
+function infer711ProxyRegion(proxy: string) {
+  const match = String(proxy || '').match(/(?:^|-)region-([a-z]{2})(?:-|:|@)/i)
+  return match?.[1]?.toUpperCase() || ''
+}
+
+function getProviderSetting(settings: ProviderSetting[] = [], providerKey: string) {
+  return settings.find(item => item.provider_key === providerKey) || null
+}
+
+function getProviderMergedValues(setting: ProviderSetting | null) {
+  return { ...(setting?.config || {}), ...(setting?.auth || {}) }
+}
+
+function getDefaultProviderKey(settings: ProviderSetting[] = []) {
+  return settings.find(item => item.is_default)?.provider_key || settings[0]?.provider_key || ''
+}
+
+function asBoolean(value: unknown, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback
+  return String(value).toLowerCase() === 'true' || value === true
+}
+
+export default function RegisterWorkbench() {
+  const { t, language } = useI18n()
+  const [searchParams] = useSearchParams()
+  const requestedPlatform = String(searchParams.get('platform') || '').trim()
+  const fromAccounts = searchParams.get('from') === 'accounts'
+  const [form, setForm] = useState<Record<string, any>>(DEFAULT_FORM)
+  const [platforms, setPlatforms] = useState<any[]>([])
+  const [configOptions, setConfigOptions] = useState<ConfigOptionsResponse>(EMPTY_CONFIG_OPTIONS)
+  const [loadingOptions, setLoadingOptions] = useState(true)
+  const [optionsError, setOptionsError] = useState('')
+  const [task, setTask] = useState<any>(null)
+  const [polling, setPolling] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+  const [submitError, setSubmitError] = useState('')
+  const handledTerminalTaskIdsRef = useRef<Set<string>>(new Set())
+  const openedCashierTaskIdsRef = useRef<Set<string>>(new Set())
+
+  const set = useCallback((key: string, value: any) => {
+    setForm(current => ({ ...current, [key]: value }))
+  }, [])
+
+  const applyTerminalTask = useCallback((latest: any, statusHint?: string) => {
+    const resolved = statusHint && !latest?.status ? { ...latest, status: statusHint } : latest
+    setTask(resolved)
+    const taskKey = String(resolved?.task_id || resolved?.id || '')
+    if (!taskKey) return
+    handledTerminalTaskIdsRef.current.add(taskKey)
+    if (
+      (statusHint || resolved?.status) === 'succeeded'
+      && Array.isArray(resolved?.cashier_urls)
+      && resolved.cashier_urls.length > 0
+      && !openedCashierTaskIdsRef.current.has(taskKey)
+    ) {
+      openedCashierTaskIdsRef.current.add(taskKey)
+      resolved.cashier_urls.forEach((url: string) => window.open(url, '_blank'))
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    setLoadingOptions(true)
+    Promise.all([getConfig(), getPlatforms(), getConfigOptions()])
+      .then(([cfg, platformResult, optionResult]) => {
+        if (cancelled) return
+        const loadedPlatforms = Array.isArray(platformResult) ? platformResult : []
+        const loadedOptions = optionResult || EMPTY_CONFIG_OPTIONS
+        setPlatforms(loadedPlatforms)
+        setConfigOptions(loadedOptions)
+        setOptionsError(loadedPlatforms.length === 0 ? '平台列表为空，请刷新页面或重新登录。' : '')
+        setForm(current => {
+          const configuredPlatform = loadedPlatforms.some((item: any) => item.name === requestedPlatform)
+            ? requestedPlatform
+            : loadedPlatforms.some((item: any) => item.name === current.platform)
+              ? current.platform
+              : loadedPlatforms.find((item: any) => item.name === 'chatgpt')?.name
+                || loadedPlatforms[0]?.name
+                || current.platform
+          const next: Record<string, any> = {
+            ...current,
+            platform: configuredPlatform,
+            executor_type: cfg.default_executor || current.executor_type,
+            identity_provider: cfg.default_identity_provider || current.identity_provider || 'mailbox',
+            oauth_provider: cfg.default_oauth_provider || current.oauth_provider,
+            oauth_email_hint: cfg.oauth_email_hint || current.oauth_email_hint,
+            chrome_user_data_dir: cfg.chrome_user_data_dir || current.chrome_user_data_dir,
+            chrome_cdp_url: cfg.chrome_cdp_url || current.chrome_cdp_url,
+            mail_provider: getDefaultProviderKey(loadedOptions.mailbox_settings || []) || current.mail_provider,
+            sms_provider: getDefaultProviderKey(loadedOptions.sms_settings || []) || current.sms_provider,
+            sub2api_auto_sync: asBoolean(cfg.sub2api_auto_sync, current.sub2api_auto_sync),
+            sub2api_proxy_id: Number(cfg.sub2api_proxy_id ?? current.sub2api_proxy_id ?? 0),
+            sub2api_agent_identity_region: String(cfg.sub2api_agent_identity_region || current.sub2api_agent_identity_region || 'CO').toUpperCase(),
+            sub2api_default_model: Object.prototype.hasOwnProperty.call(cfg, 'sub2api_default_model')
+              ? normalizeFreeSub2Model(cfg.sub2api_default_model)
+              : normalizeFreeSub2Model(current.sub2api_default_model),
+          }
+          listProviderFieldKeys([
+            ...(loadedOptions.mailbox_providers || []),
+            ...(loadedOptions.captcha_providers || []),
+            ...(loadedOptions.sms_providers || []),
+          ]).forEach(fieldKey => {
+            next[fieldKey] = cfg[fieldKey] ?? current[fieldKey] ?? ''
+          })
+          return next
+        })
+      })
+      .catch((error) => {
+        if (cancelled) return
+        setConfigOptions(EMPTY_CONFIG_OPTIONS)
+        setOptionsError(`注册配置加载失败：${error instanceof Error ? error.message : String(error || 'unknown error')}`)
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingOptions(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [requestedPlatform])
+
+  const currentPlatform = useMemo(
+    () => platforms.find((platform: any) => platform.name === form.platform) || null,
+    [form.platform, platforms],
+  )
+  const platformOptions = useMemo<SelectOption[]>(
+    () => platforms.map((platform: any) => [platform.name, platform.display_name] as const),
+    [platforms],
+  )
+  const supportedExecutors = useMemo<string[]>(
+    () => currentPlatform?.supported_executors || [],
+    [currentPlatform],
+  )
+  const registrationOptions = useMemo(
+    () => buildRegistrationOptions(currentPlatform, language),
+    [currentPlatform, language],
+  )
+  const reusableOAuthBrowser = hasReusableOAuthBrowser({
+    chrome_user_data_dir: form.chrome_user_data_dir,
+    chrome_cdp_url: form.chrome_cdp_url,
+  })
+  const executorOptions = useMemo(
+    () => buildExecutorOptions(
+      form.identity_provider,
+      supportedExecutors,
+      reusableOAuthBrowser,
+      currentPlatform?.supported_executor_options || [],
+      language,
+    ),
+    [
+      currentPlatform?.supported_executor_options,
+      form.identity_provider,
+      language,
+      reusableOAuthBrowser,
+      supportedExecutors,
+    ],
+  )
+  const mailboxProviderOptions = useMemo<SelectOption[]>(
+    () => getProviderSelectOptions(configOptions.mailbox_providers || []),
+    [configOptions.mailbox_providers],
+  )
+  const smsProviderOptions = useMemo<SelectOption[]>(
+    () => getProviderSelectOptions(configOptions.sms_providers || []),
+    [configOptions.sms_providers],
+  )
+  const currentMailboxProvider = (configOptions.mailbox_providers || [])
+    .find(provider => provider.value === form.mail_provider) || null
+  const currentMailboxSetting = getProviderSetting(configOptions.mailbox_settings || [], form.mail_provider)
+  const currentSmsProvider = (configOptions.sms_providers || [])
+    .find(provider => provider.value === form.sms_provider) || null
+  const currentSmsSetting = getProviderSetting(configOptions.sms_settings || [], form.sms_provider)
+  const allProviderFieldKeys = useMemo(
+    () => listProviderFieldKeys([
+      ...(configOptions.mailbox_providers || []),
+      ...(configOptions.captcha_providers || []),
+      ...(configOptions.sms_providers || []),
+    ]),
+    [configOptions.captcha_providers, configOptions.mailbox_providers, configOptions.sms_providers],
+  )
+
+  useEffect(() => {
+    const defaultProvider = getDefaultProviderKey(configOptions.mailbox_settings || [])
+    if (['mailbox', 'phone'].includes(form.identity_provider) && !form.mail_provider && defaultProvider) {
+      set('mail_provider', defaultProvider)
+    }
+  }, [configOptions.mailbox_settings, form.identity_provider, form.mail_provider, set])
+
+  useEffect(() => {
+    if (!currentMailboxProvider) return
+    const values = getProviderMergedValues(currentMailboxSetting)
+    setForm(current => {
+      let changed = false
+      const next = { ...current }
+      ;(currentMailboxProvider.fields || []).forEach(field => {
+        const nextValue = values[field.key] ?? current[field.key] ?? ''
+        if ((next[field.key] ?? '') !== nextValue) {
+          next[field.key] = nextValue
+          changed = true
+        }
+      })
+      return changed ? next : current
+    })
+  }, [currentMailboxProvider, currentMailboxSetting, form.mail_provider])
+
+  useEffect(() => {
+    const defaultProvider = getDefaultProviderKey(configOptions.sms_settings || [])
+    if (!form.sms_provider && defaultProvider) set('sms_provider', defaultProvider)
+  }, [configOptions.sms_settings, form.sms_provider, set])
+
+  useEffect(() => {
+    if (!currentSmsProvider) return
+    const values = getProviderMergedValues(currentSmsSetting)
+    setForm(current => {
+      let changed = false
+      const next = { ...current }
+      ;(currentSmsProvider.fields || []).forEach(field => {
+        const nextValue = values[field.key] ?? current[field.key] ?? ''
+        if ((next[field.key] ?? '') !== nextValue) {
+          next[field.key] = nextValue
+          changed = true
+        }
+      })
+      return changed ? next : current
+    })
+  }, [currentSmsProvider, currentSmsSetting, form.sms_provider])
+
+  useEffect(() => {
+    if (platforms.length === 0 || platforms.some((platform: any) => platform.name === form.platform)) return
+    set('platform', platforms.find((platform: any) => platform.name === 'chatgpt')?.name || platforms[0]?.name)
+  }, [form.platform, platforms, set])
+
+  useEffect(() => {
+    if (registrationOptions.length === 0) return
+    const selected = registrationOptions.find(option => (
+      option.identityProvider === form.identity_provider && option.oauthProvider === form.oauth_provider
+    ))
+    if (selected) return
+    const preferred = registrationOptions.find(option => option.identityProvider === form.identity_provider)
+      || registrationOptions[0]
+    setForm(current => ({
+      ...current,
+      identity_provider: preferred.identityProvider,
+      oauth_provider: preferred.oauthProvider,
+    }))
+  }, [form.identity_provider, form.oauth_provider, registrationOptions])
+
+  useEffect(() => {
+    const validExecutors = executorOptions.filter(option => !option.disabled)
+    if (validExecutors.length === 0 || validExecutors.some(option => option.value === form.executor_type)) return
+    const preferred = form.identity_provider === 'oauth_browser'
+      ? pickOAuthExecutor(supportedExecutors, form.executor_type, reusableOAuthBrowser)
+      : supportedExecutors.includes(form.executor_type)
+        ? form.executor_type
+        : supportedExecutors[0] || ''
+    set('executor_type', validExecutors.find(option => option.value === preferred)?.value || validExecutors[0].value)
+  }, [
+    executorOptions,
+    form.executor_type,
+    form.identity_provider,
+    reusableOAuthBrowser,
+    set,
+    supportedExecutors,
+  ])
+
+  const needsMailbox = ['mailbox', 'phone'].includes(form.identity_provider)
+  const needsSms = form.identity_provider === 'phone' || Boolean(
+    form.platform === 'chatgpt' && form.sub2api_auto_sync && form.identity_provider === 'mailbox',
+  )
+  const summaryRegistration = needsSms && form.identity_provider === 'mailbox'
+    ? '邮箱注册 + 手机验证'
+    : registrationOptions.find(option => (
+      option.identityProvider === form.identity_provider && option.oauthProvider === form.oauth_provider
+    ))?.label || '-'
+  const summaryExecutor = executorOptions.find(option => option.value === form.executor_type)?.label || '-'
+  const summaryVerification = getCaptchaStrategyLabel(
+    form.executor_type,
+    configOptions.captcha_policy,
+    configOptions.captcha_providers,
+    language,
+  )
+  const smsCountry = selectedSmsCountry(form)
+  const smsRegion = SMS_COUNTRY_PROXY_REGIONS[smsCountry]
+  const configuredSub2Region = String(form.sub2api_agent_identity_region || 'CO').trim().toUpperCase()
+  const requiredProxyRegion = smsRegion?.code || (form.sub2api_auto_sync ? configuredSub2Region : '')
+  const requiredProxyLabel = smsRegion?.label || (form.sub2api_auto_sync ? configuredSub2Region : '自动选择')
+  const explicitRegistrationProxyRegion = infer711ProxyRegion(form.proxy)
+  const registrationProxyMismatch = Boolean(
+    explicitRegistrationProxyRegion
+    && requiredProxyRegion
+    && explicitRegistrationProxyRegion !== requiredProxyRegion,
+  )
+  const sub2ProxyMismatch = Boolean(
+    form.sub2api_auto_sync
+    && smsRegion?.code
+    && configuredSub2Region !== smsRegion.code,
+  )
+  const sub2ProxyMissing = Boolean(form.sub2api_auto_sync && Number(form.sub2api_proxy_id || 0) <= 0)
+  const routeConfigurationInvalid = registrationProxyMismatch || sub2ProxyMismatch || sub2ProxyMissing
+  const selectedSub2Model = SUB2_FREE_MODEL_OPTIONS
+    .find(([value]) => value === form.sub2api_default_model)?.[1]
+    || form.sub2api_default_model
+    || '自动选择'
+  const activeTaskId = String(task?.task_id || task?.id || '')
+  const taskIsTerminal = Boolean(task?.status && isTerminalTaskStatus(task.status))
+
+  const blockingIssues = useMemo(() => {
+    const issues: string[] = []
+    if (loadingOptions) issues.push('正在加载平台注册能力')
+    else if (!currentPlatform) issues.push('请选择可用平台')
+    if (!loadingOptions && registrationOptions.length === 0) issues.push('当前平台没有可用注册方式')
+    if (!executorOptions.some(option => option.value === form.executor_type && !option.disabled)) {
+      issues.push('请选择可用执行器')
+    }
+    if (needsMailbox && !form.mail_provider) issues.push('请选择邮箱服务')
+    if (needsSms && !form.sms_provider) issues.push('请选择短信服务')
+    if (sub2ProxyMissing) issues.push('Sub2 自动上传需要有效代理 ID')
+    if (registrationProxyMismatch || sub2ProxyMismatch) issues.push('注册代理、短信国家和 Sub2 地区需要保持一致')
+    if (Number(form.count || 0) < 1) issues.push('注册数量至少为 1')
+    return issues
+  }, [
+    currentPlatform,
+    executorOptions,
+    form.count,
+    form.executor_type,
+    form.mail_provider,
+    form.sms_provider,
+    loadingOptions,
+    needsMailbox,
+    needsSms,
+    registrationOptions.length,
+    registrationProxyMismatch,
+    sub2ProxyMismatch,
+    sub2ProxyMissing,
+  ])
+
+  const warnings = useMemo(() => {
+    const items: string[] = []
+    if (Number(form.concurrency || 1) > 5) items.push('并发超过 5 会明显增加验证码、代理和接码压力')
+    if (Number(form.count || 1) > 1 && form.email) items.push('批量任务填写固定邮箱可能导致多次尝试复用同一身份')
+    if (form.proxy_strategy === 'direct' && (needsSms || form.sub2api_auto_sync)) {
+      items.push('直连模式无法保证手机号国家与出口地区一致')
+    }
+    if (Number(form.post_registration_liveness_delay_seconds || 0) < 30) {
+      items.push('复检等待少于 30 秒，可能漏掉注册后快速失效的账号')
+    }
+    if (form.proxy_strategy === 'sticky' || form.proxy_strategy === 'polling') {
+      items.push('代理池策略依赖设置页中已有可用代理')
+    }
+    return items
+  }, [form, needsSms])
+
+  const canSubmit = blockingIssues.length === 0 && !submitting && !polling
+  const targetReady = Boolean(currentPlatform && Number(form.count || 0) > 0)
+  const identityReady = registrationOptions.length > 0
+    && (!needsMailbox || Boolean(form.mail_provider))
+    && (!needsSms || Boolean(form.sms_provider))
+  const routeReady = Boolean(form.executor_type) && !registrationProxyMismatch
+  const deliveryReady = !routeConfigurationInvalid
+  const workflowSteps = [
+    { label: '任务目标', ready: targetReady },
+    { label: '身份资源', ready: identityReady },
+    { label: '执行线路', ready: routeReady },
+    { label: '交付质检', ready: deliveryReady },
+    { label: taskIsTerminal ? '已完成' : task ? '运行中' : '等待启动', ready: taskIsTerminal },
+  ]
+  const firstIncompleteConfig = workflowSteps.slice(0, 4).findIndex(step => !step.ready)
+  const activeStepIndex = task ? 4 : firstIncompleteConfig >= 0 ? firstIncompleteConfig : 4
+
+  const submit = async () => {
+    if (!canSubmit) return
+    setSubmitting(true)
+    setSubmitError('')
+    try {
+      const count = Math.min(Math.max(Number(form.count || 1), 1), 100)
+      const concurrency = Math.min(Math.max(Number(form.concurrency || 1), 1), 20)
+      const extra: Record<string, any> = {
+        identity_provider: form.identity_provider,
+        oauth_provider: form.oauth_provider,
+        oauth_email_hint: form.oauth_email_hint,
+        chrome_user_data_dir: form.chrome_user_data_dir || undefined,
+        chrome_cdp_url: form.chrome_cdp_url || undefined,
+        phone_bind_email_after_registration: form.identity_provider === 'phone'
+          ? Boolean(form.phone_bind_email_after_registration)
+          : undefined,
+        email_otp_timeout_seconds: form.identity_provider === 'phone'
+          ? Math.min(Math.max(Number(form.email_otp_timeout_seconds || 300), 60), 600)
+          : undefined,
+        require_phone_verification: Boolean(
+          form.platform === 'chatgpt'
+          && form.sub2api_auto_sync
+          && form.identity_provider === 'mailbox'
+        ),
+        register_mode: form.identity_provider === 'phone'
+          ? 'phone'
+          : needsSms && form.identity_provider === 'mailbox'
+            ? 'email_then_phone'
+            : 'email',
+        proxy_strategy: form.proxy ? 'manual_template' : form.proxy_strategy,
+        proxy_country: requiredProxyRegion || undefined,
+        failure_policy: form.failure_policy,
+        complete_started_attempts: Boolean(form.complete_started_attempts),
+        post_registration_liveness_delay_seconds: Math.min(
+          Math.max(Number(form.post_registration_liveness_delay_seconds || 60), 0),
+          600,
+        ),
+        sub2api_auto_sync: Boolean(form.sub2api_auto_sync),
+        sub2api_proxy_id: Number(form.sub2api_proxy_id || 0),
+        sub2api_proxy_region: configuredSub2Region,
+        sub2api_model: String(form.sub2api_default_model || '').trim(),
+      }
+      if (form.mail_provider) extra.mail_provider = form.mail_provider
+      if (form.sms_provider) extra.sms_provider = form.sms_provider
+      allProviderFieldKeys.forEach(fieldKey => {
+        if (form[fieldKey] !== undefined) extra[fieldKey] = form[fieldKey]
+      })
+      const created = await apiFetch('/tasks/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform: form.platform,
+          email: form.email || null,
+          password: form.password || null,
+          count,
+          concurrency,
+          proxy: form.proxy || null,
+          executor_type: form.executor_type,
+          captcha_solver: 'auto',
+          extra,
+        }),
+      })
+      const nextTask = {
+        ...created,
+        id: created?.id || created?.task_id,
+        status: created?.status || 'pending',
+        progress: created?.progress || `0/${count}`,
+      }
+      handledTerminalTaskIdsRef.current.delete(String(nextTask.id || ''))
+      setTask(nextTask)
+      setPolling(!isTerminalTaskStatus(nextTask.status))
+    } catch (error) {
+      setSubmitError(error instanceof Error ? error.message : String(error || '启动注册失败'))
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const handleTaskUpdate = useCallback((latest: any) => {
+    setTask(latest)
+    if (isTerminalTaskStatus(latest?.status)) setPolling(false)
+  }, [])
+
+  const handleTaskDone = useCallback(async (status: string) => {
+    if (!activeTaskId) return
+    if (handledTerminalTaskIdsRef.current.has(activeTaskId)) {
+      setPolling(false)
+      return
+    }
+    try {
+      const latest = await apiFetch(`/tasks/${activeTaskId}`)
+      applyTerminalTask(latest, status)
+    } catch {
+      setTask((current: any) => ({ ...current, status }))
+    } finally {
+      setPolling(false)
+    }
+  }, [activeTaskId, applyTerminalTask])
+
+  const activeTaskStats = task ? [
+    { label: t('common.status'), value: getTaskStatusText(task.status, language), icon: Orbit },
+    { label: t('common.progress'), value: task.progress || '0/0', icon: Workflow },
+    { label: t('common.success'), value: String(task.success ?? 0), icon: CheckCircle },
+    { label: t('common.failure'), value: String(task.error_count ?? task.errors?.length ?? 0), icon: XCircle },
+    { label: 'Sub2 已上传', value: String(task.result?.sub2_sync?.synced ?? 0), icon: Server },
+  ] : []
+
+  return (
+    <div className="space-y-5 pb-8">
+      <section className="relative overflow-hidden rounded-2xl border border-[var(--border-soft)] bg-[var(--bg-pane)] px-5 py-5 sm:px-7 sm:py-6">
+        <div className="pointer-events-none absolute -right-16 -top-24 h-56 w-56 rounded-full bg-[var(--accent-soft)] blur-3xl" />
+        <div className="relative flex flex-col justify-between gap-5 lg:flex-row lg:items-end">
+          <div className="min-w-0">
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <Badge variant="secondary">REGISTER WORKBENCH</Badge>
+              {fromAccounts ? <Badge variant="secondary">来自账号池</Badge> : null}
+            </div>
+            <h1 className="text-2xl font-semibold tracking-[-0.035em] text-[var(--text-primary)] sm:text-3xl">注册工作台</h1>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--text-secondary)]">
+              按注册真实顺序配置资源，启动前统一检查身份、线路、交付和存活复检；运行后在同一页查看结果。
+            </p>
+          </div>
+          <div className="flex shrink-0 flex-wrap gap-2">
+            <Button variant="outline" asChild>
+              <Link to={`/accounts/${encodeURIComponent(form.platform || 'chatgpt')}`}>
+                <Database className="mr-2 h-4 w-4" />账号池
+              </Link>
+            </Button>
+            <Button variant="outline" asChild>
+              <Link to="/history"><History className="mr-2 h-4 w-4" />任务历史</Link>
+            </Button>
+          </div>
+        </div>
+      </section>
+
+      <Card className="overflow-hidden">
+        <CardContent className="p-0">
+          <div className="overflow-x-auto">
+            <div className="grid min-w-[680px] grid-cols-5">
+              {workflowSteps.map((step, index) => {
+                const active = index === activeStepIndex
+                return (
+                  <div
+                    key={`${index}-${step.label}`}
+                    className={`relative border-r border-[var(--border-soft)] px-4 py-4 last:border-r-0 ${active ? 'bg-[var(--accent-soft)]' : ''}`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className={`flex h-6 w-6 items-center justify-center rounded-full border ${
+                        step.ready
+                          ? 'border-emerald-500/30 bg-emerald-500/12 text-emerald-400'
+                          : active
+                            ? 'border-[var(--accent-edge)] bg-[var(--bg-pane)] text-[var(--text-accent)]'
+                            : 'border-[var(--border-soft)] text-[var(--text-muted)]'
+                      }`}>
+                        {step.ready ? <Check className="h-3.5 w-3.5" /> : <CircleDot className="h-3.5 w-3.5" />}
+                      </span>
+                      <span className="text-[10px] font-bold tracking-[0.18em] text-[var(--text-muted)]">0{index + 1}</span>
+                    </div>
+                    <div className={`mt-2 text-xs font-medium ${active ? 'text-[var(--text-primary)]' : 'text-[var(--text-secondary)]'}`}>{step.label}</div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+        <div className="space-y-5">
+          <Card>
+            <CardContent className="p-5 sm:p-6">
+              <SectionHeading number="01" title="任务目标" description="先决定注册到哪里、需要多少账号，以及一次允许多少流程并行。" icon={Users} />
+              <div className="grid gap-4 md:grid-cols-3">
+                <FieldSelect
+                  label={t('common.platform')}
+                  value={form.platform}
+                  onChange={value => set('platform', value)}
+                  options={platformOptions}
+                  hint={loadingOptions ? '正在加载平台注册能力…' : currentPlatform?.description}
+                />
+                <FieldInput label="成功目标" value={form.count} onChange={value => set('count', value)} type="number" min={1} max={100} hint="达到目标后停止投放新尝试" />
+                <FieldInput
+                  label="并发窗口"
+                  value={form.concurrency}
+                  onChange={value => set('concurrency', value)}
+                  type="number"
+                  min={1}
+                  max={20}
+                  hint={needsSms
+                    ? '并发接码时每条流程自动租用独立号码；建议先从 1–2 验证线路'
+                    : '建议从 1–2 开始，稳定后再增加'}
+                />
+              </div>
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <span className="mr-1 text-xs text-[var(--text-muted)]">快速并发</span>
+                {[1, 2, 5, 10].map(value => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => set('concurrency', value)}
+                    className={`rounded-lg border px-3 py-1.5 text-xs transition-colors ${
+                      Number(form.concurrency) === value
+                        ? 'border-[var(--accent-edge)] bg-[var(--accent-soft)] text-[var(--text-accent)]'
+                        : 'border-[var(--border-soft)] bg-[var(--chip-bg)] text-[var(--text-secondary)] hover:border-[var(--accent-edge)]'
+                    }`}
+                  >{value}</button>
+                ))}
+                <span className="ml-auto flex items-center gap-1.5 text-xs text-[var(--text-muted)]">
+                  <Gauge className="h-3.5 w-3.5" />最多同时运行 {Math.min(Math.max(Number(form.concurrency || 1), 1), 20)} 条流程
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardContent className="p-5 sm:p-6">
+              <SectionHeading number="02" title="身份与验证资源" description="先选身份入口，再只显示这条流程真正会使用的邮箱和短信资源。" icon={Layers3} />
+              {optionsError ? (
+                <div className="mb-4 rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-300">{optionsError}</div>
+              ) : null}
+              <div className="grid gap-3 md:grid-cols-2">
+                {registrationOptions.map(option => {
+                  const active = form.identity_provider === option.identityProvider && form.oauth_provider === option.oauthProvider
+                  const IdentityIcon = option.identityProvider === 'phone'
+                    ? Smartphone
+                    : option.identityProvider === 'mailbox'
+                      ? Mail
+                      : ShieldCheck
+                  return (
+                    <button
+                      key={option.key}
+                      type="button"
+                      onClick={() => setForm(current => ({
+                        ...current,
+                        identity_provider: option.identityProvider,
+                        oauth_provider: option.oauthProvider,
+                      }))}
+                      className={`rounded-xl border p-4 text-left transition-colors ${
+                        active
+                          ? 'border-[var(--accent-edge)] bg-[var(--accent-soft)]'
+                          : 'border-[var(--border-soft)] bg-[var(--chip-bg)] hover:border-[var(--accent-edge)]'
+                      }`}
+                    >
+                      <div className="flex items-start gap-3">
+                        <span className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${active ? 'bg-[var(--bg-pane)] text-[var(--text-accent)]' : 'bg-[var(--bg-hover)] text-[var(--text-secondary)]'}`}>
+                          <IdentityIcon className="h-4 w-4" />
+                        </span>
+                        <span>
+                          <span className="block text-sm font-medium text-[var(--text-primary)]">{option.label}</span>
+                          <span className="mt-1 block text-xs leading-5 text-[var(--text-muted)]">{option.description}</span>
+                        </span>
+                      </div>
+                    </button>
+                  )
+                })}
+              </div>
+
+              {form.identity_provider === 'phone' ? (
+                <div className="mt-4 grid grid-cols-[1fr_auto_1fr_auto_1fr] items-center gap-2 rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] px-3 py-3 text-center text-xs text-[var(--text-secondary)]">
+                  <span className="flex items-center justify-center gap-1.5"><Smartphone className="h-4 w-4" />手机号</span>
+                  <ArrowRight className="h-4 w-4 text-[var(--text-muted)]" />
+                  <span>短信 OTP</span>
+                  <ArrowRight className="h-4 w-4 text-[var(--text-muted)]" />
+                  <span className="flex items-center justify-center gap-1.5"><MailCheck className="h-4 w-4" />邮箱 OTP</span>
+                </div>
+              ) : null}
+
+              {needsMailbox ? (
+                <div className="mt-5 rounded-xl border border-[var(--border-soft)] bg-[var(--bg-pane)]/40 p-4">
+                  <div className="mb-4 flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold text-[var(--text-primary)]">邮箱资源</div>
+                      <div className="mt-1 text-xs text-[var(--text-muted)]">用于创建账号或手机号注册后的邮箱绑定</div>
+                    </div>
+                    <Badge variant={form.mail_provider ? 'secondary' : 'danger'}>{form.mail_provider ? '已选择' : '待配置'}</Badge>
+                  </div>
+                  {mailboxProviderOptions.length > 0 ? (
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <FieldSelect label={t('register.mailboxService')} value={form.mail_provider} onChange={value => set('mail_provider', value)} options={mailboxProviderOptions} />
+                      {(currentMailboxProvider?.fields || []).map(field => (
+                        <ProviderFieldControl key={field.key} field={field} value={form[field.key]} onChange={value => set(field.key, value)} />
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-sm text-amber-300">没有可用邮箱服务，请先到设置中启用 Provider。</div>
+                  )}
+                  {currentMailboxProvider?.description ? <p className="mt-3 text-xs leading-5 text-[var(--text-muted)]">{currentMailboxProvider.description}</p> : null}
+                  {form.identity_provider === 'phone' ? (
+                    <div className="mt-4 grid gap-4 md:grid-cols-2">
+                      <ToggleRow
+                        label="注册成功后绑定邮箱"
+                        description="手机号完成后继续获取邮箱 OTP，便于后续登录和恢复"
+                        checked={Boolean(form.phone_bind_email_after_registration)}
+                        onChange={checked => set('phone_bind_email_after_registration', checked)}
+                      />
+                      {form.phone_bind_email_after_registration ? (
+                        <FieldSelect
+                          label="邮箱验证码等待时间"
+                          value={form.email_otp_timeout_seconds}
+                          onChange={value => set('email_otp_timeout_seconds', value)}
+                          options={[[120, '2 分钟'], [180, '3 分钟'], [300, '5 分钟'], [480, '8 分钟']]}
+                        />
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {needsSms ? (
+                <div className="mt-4 rounded-xl border border-[var(--border-soft)] bg-[var(--bg-pane)]/40 p-4">
+                  <div className="mb-4 flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold text-[var(--text-primary)]">短信资源</div>
+                      <div className="mt-1 text-xs text-[var(--text-muted)]">{form.identity_provider === 'mailbox' ? '邮箱建号后继续手机验证，再进入 Sub2 交付' : '用于手机号注册与短信 OTP'}</div>
+                    </div>
+                    <Badge variant={form.sms_provider ? 'secondary' : 'danger'}>{form.sms_provider ? '已选择' : '待配置'}</Badge>
+                  </div>
+                  {smsProviderOptions.length > 0 ? (
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <FieldSelect label={t('register.smsService')} value={form.sms_provider} onChange={value => set('sms_provider', value)} options={smsProviderOptions} />
+                      {(currentSmsProvider?.fields || []).map(field => (
+                        <ProviderFieldControl key={field.key} field={field} value={form[field.key]} onChange={value => set(field.key, value)} />
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-sm text-amber-300">没有可用短信服务，请先到设置中启用 Provider。</div>
+                  )}
+                  {currentSmsProvider?.description ? <p className="mt-3 text-xs leading-5 text-[var(--text-muted)]">{currentSmsProvider.description}</p> : null}
+                </div>
+              ) : null}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardContent className="p-5 sm:p-6">
+              <SectionHeading number="03" title="执行器与网络线路" description="执行方式和出口线路放在一起配置，减少代理国家与接码国家不一致。" icon={Radio} />
+              <div className="grid gap-3 md:grid-cols-3">
+                {executorOptions.map(option => {
+                  const active = form.executor_type === option.value
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      disabled={option.disabled}
+                      onClick={() => !option.disabled && set('executor_type', option.value)}
+                      className={`rounded-xl border p-4 text-left transition-colors ${
+                        option.disabled
+                          ? 'cursor-not-allowed border-[var(--border-soft)] bg-[var(--bg-hover)] opacity-45'
+                          : active
+                            ? 'border-[var(--accent-edge)] bg-[var(--accent-soft)]'
+                            : 'border-[var(--border-soft)] bg-[var(--chip-bg)] hover:border-[var(--accent-edge)]'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-sm font-medium text-[var(--text-primary)]">{option.label}</span>
+                        {active ? <Check className="h-4 w-4 text-[var(--text-accent)]" /> : null}
+                      </div>
+                      <div className="mt-2 text-xs leading-5 text-[var(--text-muted)]">{option.description}</div>
+                      {option.reason ? <div className="mt-2 text-xs text-amber-300">{option.reason}</div> : null}
+                    </button>
+                  )
+                })}
+              </div>
+
+              <div className="mt-5 rounded-xl border border-[var(--border-soft)] bg-[var(--bg-pane)]/40 p-4">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-[var(--text-primary)]">代理策略</div>
+                    <div className="mt-1 text-xs text-[var(--text-muted)]">手动代理优先级最高；未填写时按下方策略运行</div>
+                  </div>
+                  <Badge variant="secondary">{requiredProxyRegion || 'AUTO'} · {requiredProxyLabel}</Badge>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                  {[
+                    ['auto', '自动', '有池用池，无池直连'],
+                    ['polling', '轮换', '每次尝试切换代理'],
+                    ['sticky', '固定会话', '同一流程保持出口'],
+                    ['direct', '直连', '完全不使用代理池'],
+                  ].map(([value, label, description]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => set('proxy_strategy', value)}
+                      className={`rounded-lg border px-3 py-3 text-left transition-colors ${
+                        form.proxy_strategy === value
+                          ? 'border-[var(--accent-edge)] bg-[var(--accent-soft)]'
+                          : 'border-[var(--border-soft)] bg-[var(--chip-bg)] hover:border-[var(--accent-edge)]'
+                      }`}
+                    >
+                      <span className="block text-xs font-medium text-[var(--text-primary)]">{label}</span>
+                      <span className="mt-1 block text-[10px] leading-4 text-[var(--text-muted)]">{description}</span>
+                    </button>
+                  ))}
+                </div>
+                <div className="mt-4">
+                  <FieldInput
+                    label="手动代理（可选）"
+                    value={form.proxy}
+                    onChange={value => set('proxy', value)}
+                    placeholder="http://user:pass@host:port"
+                    hint="填写后覆盖代理池策略；711 代理中的 region-xx 会参与地区预检"
+                  />
+                </div>
+                <div className={`mt-4 flex items-start gap-2 rounded-lg border px-3 py-2.5 text-xs leading-5 ${
+                  registrationProxyMismatch
+                    ? 'border-red-500/25 bg-red-500/10 text-red-300'
+                    : 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300'
+                }`}>
+                  {registrationProxyMismatch ? <XCircle className="mt-0.5 h-4 w-4 shrink-0" /> : <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" />}
+                  <span>{registrationProxyMismatch
+                    ? `手动代理地区 ${explicitRegistrationProxyRegion} 与流程要求 ${requiredProxyRegion} 不一致`
+                    : `线路预检通过：${form.proxy ? '使用手动代理' : form.proxy_strategy === 'direct' ? '直连' : '使用代理池策略'}${requiredProxyRegion ? `，目标地区 ${requiredProxyRegion}` : ''}`}</span>
+                </div>
+                <div className="mt-3 flex items-center gap-2 text-xs text-[var(--text-muted)]">
+                  <ScanText className="h-3.5 w-3.5" />验证码策略：{summaryVerification}
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardContent className="p-5 sm:p-6">
+              <SectionHeading number="04" title="交付与存活质检" description="注册结束后的保存、上传和延迟复检集中在最后一步，避免“显示成功但账号已经失效”。" icon={ShieldCheck} />
+              <div className="grid gap-4 md:grid-cols-2">
+                <FieldSelect
+                  label="注册后存活复检"
+                  value={form.post_registration_liveness_delay_seconds}
+                  onChange={value => set('post_registration_liveness_delay_seconds', value)}
+                  options={[[15, '15 秒 · 极速'], [30, '30 秒'], [60, '60 秒 · 推荐'], [120, '2 分钟 · 严格'], [180, '3 分钟']]}
+                  hint="任务成功前再验证一次账号状态；默认 60 秒用于捕获快速失效"
+                />
+                <div className="rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] px-4 py-3">
+                  <div className="flex items-center gap-2 text-xs text-[var(--text-muted)]"><Database className="h-4 w-4" />基础交付</div>
+                  <div className="mt-2 text-sm font-medium text-[var(--text-primary)]">保存到 {currentPlatform?.display_name || form.platform} 账号池</div>
+                  <div className="mt-1 text-[11px] text-[var(--text-muted)]">账号状态与检测时间一并记录</div>
+                </div>
+              </div>
+
+              {form.platform === 'chatgpt' ? (
+                <div className="mt-4 space-y-4">
+                  <ToggleRow
+                    label="通过存活复检后自动上传 Sub2"
+                    description="启用后邮箱注册会自动增加手机验证，并要求注册线路与 Sub2 地区一致"
+                    checked={Boolean(form.sub2api_auto_sync)}
+                    onChange={checked => set('sub2api_auto_sync', checked)}
+                  />
+                  {form.sub2api_auto_sync ? (
+                    <div className="rounded-xl border border-[var(--border-soft)] bg-[var(--bg-pane)]/40 p-4">
+                      <div className="grid gap-4 md:grid-cols-3">
+                        <FieldInput label="Sub2 代理 ID" value={form.sub2api_proxy_id} onChange={value => set('sub2api_proxy_id', value)} type="number" min={1} />
+                        <FieldSelect label="Sub2 代理地区" value={configuredSub2Region} onChange={value => set('sub2api_agent_identity_region', value)} options={REGION_OPTIONS} />
+                        <FieldSelect label="Sub2 模型" value={form.sub2api_default_model} onChange={value => set('sub2api_default_model', value)} options={SUB2_FREE_MODEL_OPTIONS} />
+                      </div>
+                      <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                        <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--chip-bg)] p-3">
+                          <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)]"><MapPin className="h-3.5 w-3.5" />注册地区</div>
+                          <div className="mt-2 text-sm font-semibold text-[var(--text-primary)]">{requiredProxyRegion || '-'} · {requiredProxyLabel}</div>
+                        </div>
+                        <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--chip-bg)] p-3">
+                          <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)]"><Server className="h-3.5 w-3.5" />Sub2 路由</div>
+                          <div className="mt-2 text-sm font-semibold text-[var(--text-primary)]">#{Number(form.sub2api_proxy_id || 0) || '-'} · {configuredSub2Region}</div>
+                        </div>
+                        <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--chip-bg)] p-3">
+                          <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)]"><Cpu className="h-3.5 w-3.5" />模型</div>
+                          <div className="mt-2 truncate text-sm font-semibold text-[var(--text-primary)]" title={selectedSub2Model}>{selectedSub2Model}</div>
+                        </div>
+                      </div>
+                      <div className={`mt-4 flex items-start gap-2 rounded-lg border px-3 py-2.5 text-xs ${
+                        routeConfigurationInvalid
+                          ? 'border-red-500/25 bg-red-500/10 text-red-300'
+                          : 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300'
+                      }`}>
+                        {routeConfigurationInvalid ? <XCircle className="h-4 w-4 shrink-0" /> : <CheckCircle className="h-4 w-4 shrink-0" />}
+                        <span>{sub2ProxyMissing
+                          ? '请先选择有效的 Sub2 代理 ID'
+                          : routeConfigurationInvalid
+                            ? `地区不一致：注册需要 ${requiredProxyRegion}，Sub2 当前为 ${configuredSub2Region}`
+                            : `交付链路就绪：${requiredProxyRegion} 注册 → 延迟复检 → Sub2 proxy #${Number(form.sub2api_proxy_id)} → ${selectedSub2Model}`}</span>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+            </CardContent>
+          </Card>
+
+          <details className="group rounded-xl border border-[var(--border-soft)] bg-[var(--bg-pane)]">
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-4 px-5 py-4 sm:px-6">
+              <span className="flex items-center gap-3">
+                <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[var(--chip-bg)] text-[var(--text-secondary)]"><Settings2 className="h-4 w-4" /></span>
+                <span>
+                  <span className="block text-sm font-semibold text-[var(--text-primary)]">高级控制</span>
+                  <span className="mt-0.5 block text-xs text-[var(--text-muted)]">固定账号、失败策略和并发窗口策略</span>
+                </span>
+              </span>
+              <ChevronDown className="h-4 w-4 text-[var(--text-muted)] transition-transform group-open:rotate-180" />
+            </summary>
+            <div className="border-t border-[var(--border-soft)] px-5 py-5 sm:px-6">
+              <div className="grid gap-4 md:grid-cols-2">
+                <FieldInput label="固定邮箱（可选）" value={form.email} onChange={value => set('email', value)} placeholder="仅建议单账号调试时使用" />
+                <FieldInput label="固定密码（可选）" value={form.password} onChange={value => set('password', value)} type="password" placeholder="留空则自动生成" />
+                <FieldSelect
+                  label="失败处理"
+                  value={form.failure_policy}
+                  onChange={value => set('failure_policy', value)}
+                  options={[
+                    ['retry_then_continue', '失败重试后继续 · 推荐'],
+                    ['continue', '记录失败并继续'],
+                    ['stop_on_failure', '首次失败即停止'],
+                  ]}
+                  hint="批量任务建议保留默认策略"
+                />
+                <ToggleRow
+                  label="预启动完整并发窗口"
+                  description="并发大于成功目标时仍先启动整个窗口；可能产出超过目标的账号"
+                  checked={Boolean(form.complete_started_attempts)}
+                  onChange={checked => set('complete_started_attempts', checked)}
+                />
+              </div>
+              {form.identity_provider === 'oauth_browser' ? (
+                <div className="mt-5 grid gap-4 border-t border-[var(--border-soft)] pt-5 md:grid-cols-2">
+                  <FieldInput label={t('register.oauthHintOptional')} value={form.oauth_email_hint} onChange={value => set('oauth_email_hint', value)} placeholder="your-account@example.com" />
+                  <FieldInput label={t('settings.chromeProfile')} value={form.chrome_user_data_dir} onChange={value => set('chrome_user_data_dir', value)} placeholder="Chrome user data directory" />
+                  <div className="md:col-span-2">
+                    <FieldInput label={t('settings.chromeCdp')} value={form.chrome_cdp_url} onChange={value => set('chrome_cdp_url', value)} placeholder="http://localhost:9222" hint={t('register.browserReuseHint')} />
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </details>
+        </div>
+
+        <aside className="space-y-4 xl:sticky xl:top-4">
+          <Card className="overflow-hidden">
+            <CardContent className="p-0">
+              <div className={`border-b border-[var(--border-soft)] px-5 py-4 ${blockingIssues.length === 0 ? 'bg-emerald-500/8' : 'bg-amber-500/8'}`}>
+                <div className="flex items-center gap-3">
+                  <span className={`flex h-9 w-9 items-center justify-center rounded-xl ${blockingIssues.length === 0 ? 'bg-emerald-500/15 text-emerald-400' : 'bg-amber-500/15 text-amber-300'}`}>
+                    {blockingIssues.length === 0 ? <CheckCircle className="h-4.5 w-4.5" /> : <AlertTriangle className="h-4.5 w-4.5" />}
+                  </span>
+                  <div>
+                    <div className="text-sm font-semibold text-[var(--text-primary)]">{blockingIssues.length === 0 ? '启动前预检通过' : `还有 ${blockingIssues.length} 项待处理`}</div>
+                    <div className="mt-0.5 text-[11px] text-[var(--text-muted)]">配置变动会在这里即时校验</div>
+                  </div>
+                </div>
+              </div>
+              <div className="space-y-4 p-5">
+                <div className="space-y-2.5">
+                  {[
+                    ['平台', currentPlatform?.display_name || form.platform || '-'],
+                    ['目标', `${Math.max(Number(form.count || 0), 0)} 个 · 并发 ${Math.max(Number(form.concurrency || 1), 1)}`],
+                    ['身份', summaryRegistration],
+                    ['执行', summaryExecutor],
+                    ['线路', form.proxy ? '手动代理' : form.proxy_strategy === 'direct' ? '直连' : `${form.proxy_strategy} · ${requiredProxyRegion || '自动地区'}`],
+                    ['复检', `${Number(form.post_registration_liveness_delay_seconds || 0)} 秒后`],
+                    ['交付', form.sub2api_auto_sync ? `账号池 + Sub2 #${Number(form.sub2api_proxy_id || 0) || '-'}` : '仅账号池'],
+                  ].map(([label, value]) => (
+                    <div key={label} className="flex items-start justify-between gap-4 text-xs">
+                      <span className="shrink-0 text-[var(--text-muted)]">{label}</span>
+                      <span className="min-w-0 text-right font-medium text-[var(--text-primary)]">{value}</span>
+                    </div>
+                  ))}
+                </div>
+
+                {blockingIssues.length > 0 ? (
+                  <div className="space-y-2 rounded-xl border border-red-500/20 bg-red-500/8 p-3">
+                    {blockingIssues.map(issue => (
+                      <div key={issue} className="flex items-start gap-2 text-xs leading-5 text-red-300">
+                        <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />{issue}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {warnings.length > 0 ? (
+                  <div className="space-y-2 rounded-xl border border-amber-500/20 bg-amber-500/8 p-3">
+                    {warnings.map(warning => (
+                      <div key={warning} className="flex items-start gap-2 text-xs leading-5 text-amber-300">
+                        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />{warning}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {submitError ? (
+                  <div className="rounded-xl border border-red-500/25 bg-red-500/10 px-3 py-2.5 text-xs leading-5 text-red-300">{submitError}</div>
+                ) : null}
+
+                <Button onClick={submit} disabled={!canSubmit} className="h-11 w-full">
+                  {submitting ? (
+                    <><Loader2 className="mr-2 h-4 w-4 animate-spin" />正在创建任务</>
+                  ) : polling ? (
+                    <><Orbit className="mr-2 h-4 w-4 animate-spin" />当前任务运行中</>
+                  ) : (
+                    <><Play className="mr-2 h-4 w-4" />启动注册任务</>
+                  )}
+                </Button>
+                <p className="text-center text-[10px] leading-4 text-[var(--text-muted)]">启动后无需停留在页面；全局任务坞会保留运行状态。</p>
+              </div>
+            </CardContent>
+          </Card>
+        </aside>
+      </div>
+
+      {task && activeTaskId ? (
+        <section className="space-y-4 scroll-mt-4" aria-live="polite">
+          <Card>
+            <CardContent className="p-5 sm:p-6">
+              <div className="mb-5 flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h2 className="text-base font-semibold text-[var(--text-primary)]">05 · 运行与结果</h2>
+                    <Badge variant={TASK_STATUS_VARIANTS[task.status] || 'secondary'}>{getTaskStatusText(task.status, language)}</Badge>
+                  </div>
+                  <div className="mt-1 break-all font-mono text-[11px] text-[var(--text-muted)]">{activeTaskId}</div>
+                </div>
+                <Button variant="outline" asChild><Link to="/history"><History className="mr-2 h-4 w-4" />查看全部任务</Link></Button>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+                {activeTaskStats.map(({ label, value, icon: Icon }) => (
+                  <div key={label} className="rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] p-3">
+                    <div className="flex items-center gap-2 text-[10px] uppercase tracking-[0.15em] text-[var(--text-muted)]"><Icon className="h-3.5 w-3.5" />{label}</div>
+                    <div className="mt-2 text-sm font-semibold text-[var(--text-primary)]">{value}</div>
+                  </div>
+                ))}
+              </div>
+              {task.error || task.errors?.length ? (
+                <div className="mt-4 space-y-2 rounded-xl border border-red-500/20 bg-red-500/8 p-3">
+                  {[...(task.errors || []), ...(task.error ? [task.error] : [])].map((error: string, index: number) => (
+                    <div key={`${index}-${error}`} className="flex items-start gap-2 text-xs leading-5 text-red-300"><XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />{error}</div>
+                  ))}
+                </div>
+              ) : null}
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-5 sm:p-6">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-[var(--text-primary)]">实时执行日志</h3>
+                  <p className="mt-1 text-xs text-[var(--text-muted)]">日志流同时负责刷新任务进度，不再额外启动页面轮询。</p>
+                </div>
+                <span className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)]"><Radio className="h-3.5 w-3.5" />LIVE</span>
+              </div>
+              <TaskLogPanel taskId={activeTaskId} onDone={handleTaskDone} onTaskUpdate={handleTaskUpdate} />
+            </CardContent>
+          </Card>
+        </section>
+      ) : null}
+    </div>
+  )
+}
