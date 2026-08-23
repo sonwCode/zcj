@@ -76,6 +76,15 @@ pytest -q
 python scripts/smoke.py http://127.0.0.1:8001/api
 ```
 
+## 注册与自动检测可靠性
+
+- 批量注册按“目标成功数”补位：单个邮箱建号、手机验证、Codex 凭据或首次存活复检失败，只结束当前尝试，不会提前终止整个批次。
+- 并发 worker 使用独立任务参数和独立邮箱租约；固定邮箱仅允许单账号、单并发，数据库以 `platform + email` 防止重复账号行。
+- ChatGPT 手机流程在注册完成后先做即时存活检查，再默认安排注册后 300 秒和 900 秒的持久化观察期复检。服务重启后排程仍保留，检测未知会退避重试，明确失效才标记无效。
+- 全量检测默认 5 并发，和新号观察期使用独立调度周期。`GET /api/scheduler/status` 可查看调度线程、最近开始/完成时间、耗时、结果和错误，避免后台检测静默失效。
+- 可在任务 `extra` 中通过 `post_registration_liveness_delay_seconds`（0–600）、`post_registration_probation_enabled` 和 `post_registration_probation_offsets_seconds` 调整新号检测；全量检测并发读取配置项 `account_check_concurrency`（1–20）。
+- 注册成功与外部交付分开记录：账号落库后即保留 `registration_status=registered`；Sub2API 未完成会记录 `delivery_status=pending`，等待后台补传，不再把两种状态混为一个“失败”。
+
 ## 配置与数据安全
 
 - `.env`、数据库、日志、账号文本、HAR、Token 导出和本地备份不得提交。

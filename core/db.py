@@ -1,11 +1,13 @@
 """数据库模型 - SQLite via SQLModel"""
 import json
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import UniqueConstraint, inspect
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, SQLModel, Session, create_engine, select
 
 
@@ -21,9 +23,19 @@ def _default_database_url() -> str:
 DATABASE_URL = os.getenv("ACCOUNT_MANAGER_DATABASE_URL", _default_database_url())
 engine = create_engine(DATABASE_URL)
 
+_ACCOUNT_SAVE_LOCKS = tuple(threading.RLock() for _ in range(64))
+
+
+def _account_save_lock(platform: str, email: str) -> threading.RLock:
+    key = (str(platform or "").strip().lower(), str(email or "").strip().lower())
+    return _ACCOUNT_SAVE_LOCKS[hash(key) % len(_ACCOUNT_SAVE_LOCKS)]
+
 
 class AccountModel(SQLModel, table=True):
     __tablename__ = "accounts"
+    __table_args__ = (
+        UniqueConstraint("platform", "email", name="uq_accounts_platform_email"),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     platform: str = Field(index=True)
@@ -325,34 +337,52 @@ def save_account(account) -> 'AccountModel':
     """从 base_platform.Account 存入数据库（同平台同邮箱则更新）"""
     from core.account_graph import sync_platform_account_graph
 
-    with Session(engine) as session:
-        existing = session.exec(
-            select(AccountModel)
-            .where(AccountModel.platform == account.platform)
-            .where(AccountModel.email == account.email)
-        ).first()
-        if existing:
-            existing.password = account.password
-            existing.user_id = account.user_id or ""
-            existing.updated_at = _utcnow()
-            session.add(existing)
+    platform = str(account.platform or "").strip()
+    email = str(account.email or "").strip()
+    with _account_save_lock(platform, email):
+        with Session(engine) as session:
+            model = session.exec(
+                select(AccountModel)
+                .where(AccountModel.platform == platform)
+                .where(AccountModel.email == email)
+            ).first()
+            if model is None:
+                model = AccountModel(
+                    platform=platform,
+                    email=email,
+                    password=account.password,
+                    user_id=account.user_id or "",
+                )
+                session.add(model)
+                try:
+                    session.commit()
+                    session.refresh(model)
+                except IntegrityError:
+                    # A second process may have inserted the same identity
+                    # after our SELECT.  The database uniqueness constraint is
+                    # the final arbiter; reload and continue as an update.
+                    session.rollback()
+                    model = session.exec(
+                        select(AccountModel)
+                        .where(AccountModel.platform == platform)
+                        .where(AccountModel.email == email)
+                    ).first()
+                    if model is None:
+                        raise
+
+            model.password = account.password
+            model.user_id = account.user_id or ""
+            model.updated_at = _utcnow()
+            session.add(model)
             session.commit()
-            session.refresh(existing)
-            sync_platform_account_graph(session, existing, account)
+            session.refresh(model)
+            sync_platform_account_graph(session, model, account)
             session.commit()
-            return existing
-        m = AccountModel(
-            platform=account.platform,
-            email=account.email,
-            password=account.password,
-            user_id=account.user_id or "",
-        )
-        session.add(m)
-        session.commit()
-        session.refresh(m)
-        sync_platform_account_graph(session, m, account)
-        session.commit()
-        return m
+            # ``sync_platform_account_graph`` performs a second commit.  A
+            # final refresh keeps returned scalar attributes usable after the
+            # session closes instead of returning an expired detached model.
+            session.refresh(model)
+            return model
 
 
 LEGACY_ACCOUNT_COLUMNS = (
@@ -448,12 +478,63 @@ def _migrate_legacy_accounts_schema() -> None:
         connection.exec_driver_sql("PRAGMA foreign_keys=ON")
 
 
+def _ensure_accounts_unique_index() -> None:
+    """Add the cross-process identity guard without deleting legacy rows.
+
+    Some older databases may already contain duplicate platform/email pairs.
+    Those rows are preserved for manual review; in that case the in-process
+    keyed lock still prevents new duplicates and startup reports why the
+    database-level index could not yet be installed.
+    """
+    inspector = inspect(engine)
+    if "accounts" not in set(inspector.get_table_names()):
+        return
+    existing = {
+        str(item.get("name") or "")
+        for item in inspector.get_unique_constraints("accounts")
+    }
+    existing.update(
+        str(item.get("name") or "")
+        for item in inspector.get_indexes("accounts")
+        if item.get("unique")
+    )
+    if "uq_accounts_platform_email" in existing:
+        return
+
+    with engine.begin() as connection:
+        duplicate_groups = int(
+            connection.exec_driver_sql(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT platform, email
+                    FROM accounts
+                    GROUP BY platform, email
+                    HAVING COUNT(*) > 1
+                ) AS duplicate_accounts
+                """
+            ).scalar()
+            or 0
+        )
+        if duplicate_groups:
+            print(
+                "[DB] 检测到旧账号库存在重复 platform/email 组合；"
+                "已保留原记录并跳过唯一索引，新的进程内写入仍会串行去重"
+            )
+            return
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_accounts_platform_email "
+            "ON accounts (platform, email)"
+        )
+
+
 def init_db():
     SQLModel.metadata.create_all(engine)
     from core.account_graph import sync_all_account_graphs
     from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 
     _migrate_legacy_accounts_schema()
+    _ensure_accounts_unique_index()
     _ensure_column("provider_definitions", "category", "TEXT DEFAULT ''")
     SQLModel.metadata.create_all(engine)
 

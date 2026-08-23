@@ -1,6 +1,7 @@
 """Task orchestration and persistence helpers."""
 from __future__ import annotations
 
+import copy
 import json
 import queue
 import threading
@@ -822,9 +823,15 @@ def _auto_push_sub2api(
     try:
         from core.sub2api_sync import push_account_to_sub2api, sub2api_auto_sync_enabled
 
-        if not sub2api_auto_sync_enabled():
-            return None
         opts = dict(options or {})
+        enabled = sub2api_auto_sync_enabled()
+        if "sub2api_auto_sync" in opts:
+            # A registration task can explicitly opt in even when the global
+            # backfill switch is off. Previously the task advertised/enforced
+            # Sub2 delivery but this early global-only gate silently skipped it.
+            enabled = _bool_config(opts.get("sub2api_auto_sync"), enabled)
+        if not enabled:
+            return None
         # Hard gate: never push web-only sessions without Codex RT.
         if not _account_has_codex_rt(account):
             msg = "skip Sub2 push: missing Codex access_token/refresh_token"
@@ -1526,6 +1533,13 @@ def _upgrade_protocol_codex_credentials(
     return False
 
 
+def _post_registration_liveness_delay_seconds(extra: dict[str, Any]) -> int:
+    return min(
+        max(_int_config(extra.get("post_registration_liveness_delay_seconds"), 15), 0),
+        600,
+    )
+
+
 def _post_registration_chatgpt_liveness_error(
     *,
     platform_name: str,
@@ -1546,10 +1560,7 @@ def _post_registration_chatgpt_liveness_error(
     if not sms_flow:
         return ""
 
-    delay_seconds = min(
-        max(_int_config(extra.get("post_registration_liveness_delay_seconds"), 15), 0),
-        60,
-    )
+    delay_seconds = _post_registration_liveness_delay_seconds(extra)
     if delay_seconds:
         logger.log(f"注册完成，等待 {delay_seconds} 秒后执行远端存活复检...")
         deadline = time.monotonic() + delay_seconds
@@ -1586,6 +1597,86 @@ def _post_registration_chatgpt_liveness_error(
     reason = str(overview.get("validity_reason") or "远端账号已停用").strip()
     logger.log(f"新账号远端存活复检失败: {reason}", level="error")
     return f"新账号注册后已被远端停用: {reason}"
+
+
+def _registration_pipeline_update(
+    account,
+    stage: str,
+    status: str,
+    *,
+    error: str = "",
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """Persist registration and delivery as two independent state machines."""
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    account_extra = dict(getattr(account, "extra", {}) or {})
+    overview = dict(account_extra.get("account_overview") or {})
+    pipeline = dict(overview.get("registration_pipeline") or {})
+    stages = dict(pipeline.get("stages") or {})
+    stage_state = dict(stages.get(stage) or {})
+    stage_state.update({"status": str(status or "unknown"), "updated_at": now})
+    if error:
+        stage_state["error"] = str(error)[:500]
+    else:
+        stage_state.pop("error", None)
+    if detail:
+        stage_state["detail"] = dict(detail)
+    stages[stage] = stage_state
+    pipeline["stages"] = stages
+    pipeline["current_stage"] = stage
+    pipeline.setdefault("started_at", now)
+    pipeline["updated_at"] = now
+
+    core_registration_stages = {
+        "account_created",
+        "phone_verified",
+        "credentials_ready",
+        "liveness",
+        "persisted",
+    }
+    post_registration_stages = {
+        "probation",
+        "workspace_join",
+        "payment",
+        "post_registration",
+    }
+    if stage == "delivery":
+        pipeline["delivery_status"] = str(status or "unknown")
+        if status == "delivered":
+            pipeline["delivered_at"] = now
+    elif stage in post_registration_stages:
+        pipeline["post_registration_status"] = str(status or "unknown")
+    elif status == "failed" and stage in core_registration_stages:
+        pipeline["registration_status"] = "failed"
+    elif stage == "persisted" and status == "passed":
+        pipeline["registration_status"] = "registered"
+        pipeline["registered_at"] = now
+    else:
+        pipeline.setdefault("registration_status", "in_progress")
+
+    overview["registration_pipeline"] = pipeline
+    account_extra["account_overview"] = overview
+    account.extra = account_extra
+
+
+def _post_registration_probation_offsets(extra: dict[str, Any]) -> list[int]:
+    raw = extra.get("post_registration_probation_offsets_seconds", [300, 900])
+    values: list[Any]
+    if isinstance(raw, str):
+        values = [part.strip() for part in raw.replace(";", ",").split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = [raw]
+    offsets: set[int] = set()
+    for value in values:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            offsets.add(min(parsed, 86400))
+    return sorted(offsets)
 
 
 def _int_config(value: Any, default: int) -> int:
@@ -2170,6 +2261,14 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         concurrency_cap,
         20 if (is_chatgpt_email_then_phone or complete_started_attempts) else count,
     )
+    if email and (count > 1 or concurrency > 1):
+        error = (
+            "固定邮箱只能用于单账号、单并发注册；批量或并发任务必须由邮箱 provider "
+            "为每个 worker 分配独立邮箱"
+        )
+        logger.log(error, level="error")
+        logger.finish(TASK_STATUS_FAILED, error=error)
+        return
 
     inline_mailbox_pool_text = ""
     inline_mailbox_pool_size = 0
@@ -2422,7 +2521,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     errors: list[str] = []
     successful_account_ids: list[int] = []
     successful_account_ids_lock = threading.Lock()
-    email_then_phone_account_created_failure = threading.Event()
+    delivery_pending_account_ids: list[int] = []
+    delivery_pending_account_ids_lock = threading.Lock()
     failure_policy = str(
         extra.get("failure_policy")
         or ("retry_then_continue" if platform_name == "chatgpt" else "")
@@ -2560,12 +2660,16 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         _shortlink_reuse = (
             platform_name == "chatgpt" and _shortlink_payment_enabled(payload)
         )
-        _build_payload = payload
+        # Every worker owns an isolated payload.  Proxy preflight and browser
+        # reuse inject attempt-specific values into ``extra``; sharing the task
+        # dictionary allowed one worker's route/session data to overwrite
+        # another worker while both were registering.
+        _build_payload = copy.deepcopy(payload)
         _sl_acquired_profile = ""
         email_account_created = False
         if _shortlink_reuse:
             from platforms._browser_backend import parse_checkout_mode
-            _pcfg = dict((payload.get("extra") or {}).get("chatgpt_payment") or {})
+            _pcfg = dict((_build_payload.get("extra") or {}).get("chatgpt_payment") or {})
             _ckmode = str(_pcfg.get("checkout_mode") or "camoufox_headed").strip().lower()
             if _ckmode == "protocol":
                 _ckmode = "camoufox_headed"  # 短链复用必须用浏览器
@@ -2588,12 +2692,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 payload=payload, logger=logger, proxy=resolved_proxy,
                 sms_pool_override=slot_state["slot_value"] or sms_slot_value,
             )
-            _reuse_extra = dict(payload.get("extra") or {})
+            _reuse_extra = dict(_build_payload.get("extra") or {})
             _reuse_extra["_reuse_backend_config"] = parse_checkout_mode(
                 _ckmode, bit_profile_id=_sl_bit_profile,
             )
             _reuse_extra["_post_register_in_browser"] = _cb
-            _build_payload = dict(payload)
+            _build_payload = dict(_build_payload)
             _build_payload["extra"] = _reuse_extra
             # **关键**：短链物理复用必须走浏览器注册（headed/headless），
             # 否则 base_platform.register 会走 ProtocolMailboxFlow（协议邮箱
@@ -2615,6 +2719,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             except Exception as exc:
                 logger.log(f"Workspace Join 配置检查失败，继续原注册流程: {exc}", level="error")
         platform = None
+        account = None
+        saved_account_id = 0
         try:
             if (
                 platform_name == "chatgpt"
@@ -2654,6 +2760,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 account_extra.setdefault("auth_proxy_url", resolved_proxy)
                 account.extra = account_extra
             email_account_created = True
+            _registration_pipeline_update(account, "account_created", "passed")
             if logger.is_cancel_requested():
                 return "__cancel_requested__"
             require_phone_verification = (
@@ -2661,6 +2768,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 and _bool_config(extra.get("require_phone_verification"), False)
             )
             if require_phone_verification:
+                _registration_pipeline_update(account, "phone_verified", "in_progress")
                 try:
                     _complete_required_chatgpt_phone_verification(
                         platform=platform,
@@ -2669,8 +2777,15 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         logger=logger,
                         country_offset=index,
                     )
+                    _registration_pipeline_update(account, "phone_verified", "passed")
                 except Exception as phone_exc:
                     account.status = AccountStatus.PENDING_VERIFICATION
+                    _registration_pipeline_update(
+                        account,
+                        "phone_verified",
+                        "failed",
+                        error=str(phone_exc),
+                    )
                     account_extra = dict(getattr(account, "extra", {}) or {})
                     overview = dict(account_extra.get("account_overview") or {})
                     overview["phone_binding"] = {
@@ -2683,11 +2798,14 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     account.extra = account_extra
                     save_account(account)
                     raise
+            else:
+                _registration_pipeline_update(account, "phone_verified", "not_required")
             require_codex_rt = _bool_config(
                 extra.get("require_codex_refresh_token"),
                 _bool_config(extra.get("sub2api_auto_sync"), False)
                 or _bool_config(extra.get("require_phone_verification"), False),
             )
+            _registration_pipeline_update(account, "credentials_ready", "in_progress")
             try:
                 _upgrade_protocol_codex_credentials(
                     platform_name=platform_name,
@@ -2699,9 +2817,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 )
             except Exception as codex_exc:
                 if require_phone_verification or require_codex_rt:
-                    if _bool_config(extra.get("require_phone_verification"), False):
-                        email_then_phone_account_created_failure.set()
                     account.status = AccountStatus.PENDING_VERIFICATION
+                    _registration_pipeline_update(
+                        account,
+                        "credentials_ready",
+                        "failed",
+                        error=str(codex_exc),
+                    )
                     account_extra = dict(getattr(account, "extra", {}) or {})
                     account_extra["codex_credential_status"] = {
                         "status": "failed",
@@ -2713,13 +2835,23 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     raise
             if require_codex_rt and not _account_has_codex_rt(account):
                 err = "CODEX_RT_MISSING: 注册流程结束时仍无 Codex refresh_token，拒绝记成功/上传 Sub2"
-                if _bool_config(extra.get("require_phone_verification"), False):
-                    email_then_phone_account_created_failure.set()
                 account.status = AccountStatus.PENDING_VERIFICATION
+                _registration_pipeline_update(
+                    account,
+                    "credentials_ready",
+                    "failed",
+                    error=err,
+                )
                 save_account(account)
                 logger.record_error(err)
                 _save_task_log(platform_name, account.email, "failed", error=err)
                 return err
+            _registration_pipeline_update(
+                account,
+                "credentials_ready",
+                "passed" if _account_has_codex_rt(account) else "not_required",
+            )
+            _registration_pipeline_update(account, "liveness", "in_progress")
             liveness_error = _post_registration_chatgpt_liveness_error(
                 platform_name=platform_name,
                 platform=platform,
@@ -2728,15 +2860,74 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 logger=logger,
             )
             if liveness_error:
-                if _bool_config(extra.get("require_phone_verification"), False):
-                    email_then_phone_account_created_failure.set()
+                _registration_pipeline_update(
+                    account,
+                    "liveness",
+                    "failed",
+                    error=liveness_error,
+                )
                 save_account(account)
                 logger.record_error(liveness_error)
                 _save_task_log(platform_name, account.email, "failed", error=liveness_error)
                 return liveness_error
-            save_account(account)
+            account_overview = dict((getattr(account, "extra", {}) or {}).get("account_overview") or {})
+            liveness_status = str(account_overview.get("validity_status") or "unknown").strip().lower()
+            _registration_pipeline_update(
+                account,
+                "liveness",
+                "passed" if liveness_status == "valid" else "unknown",
+                detail={"validity_status": liveness_status or "unknown"},
+            )
+            _registration_pipeline_update(account, "persisted", "passed")
+            saved_model = save_account(account)
+            saved_account_id = int(getattr(saved_model, "id", 0) or 0)
+            probation_enabled = (
+                platform_name == "chatgpt"
+                and _bool_config(extra.get("post_registration_probation_enabled"), True)
+                and (
+                    require_phone_verification
+                    or str((getattr(account, "extra", {}) or {}).get("register_mode") or "").strip().lower()
+                    in {"phone", "phone_with_email", "email_then_phone"}
+                )
+            )
+            if probation_enabled and saved_account_id > 0:
+                offsets = _post_registration_probation_offsets(extra)
+                if offsets:
+                    try:
+                        from core.lifecycle import schedule_account_probation
+
+                        probation = schedule_account_probation(
+                            saved_account_id,
+                            offsets_seconds=offsets,
+                        )
+                        logger.log(
+                            "已安排非阻塞观察期复检: "
+                            + "、".join(f"{seconds} 秒" for seconds in offsets)
+                        )
+                        _registration_pipeline_update(
+                            account,
+                            "probation",
+                            "scheduled",
+                            detail={
+                                "offsets_seconds": offsets,
+                                "next_check_at": probation.get("next_check_at", ""),
+                            },
+                        )
+                        save_account(account)
+                    except Exception as probation_exc:
+                        logger.log(
+                            f"观察期复检排程失败，账号已保留: {probation_exc}",
+                            level="warning",
+                        )
             workspace_join_error = _chatgpt_workspace_join_failure(account)
             if workspace_join_error:
+                _registration_pipeline_update(
+                    account,
+                    "workspace_join",
+                    "failed",
+                    error=workspace_join_error,
+                )
+                save_account(account)
                 logger.record_error(workspace_join_error)
                 logger.log(workspace_join_error, level="error")
                 _save_task_log(platform_name, account.email, "failed", error=workspace_join_error)
@@ -2750,6 +2941,15 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 account=account,
                 logger=logger,
             )
+            chatgpt_plus_enabled = (
+                platform_name == "chatgpt"
+                and _bool_config(extra.get("auto_chatgpt_plus_payment"), False)
+            )
+            _registration_pipeline_update(
+                account,
+                "payment",
+                "in_progress" if chatgpt_plus_enabled else "not_required",
+            )
             if _shortlink_reuse:
                 # 短链复用：PayPal checkout 已在注册浏览器里跑完，结果挂在
                 # account.extra["_shortlink_checkout"]（由注册器回调合并进
@@ -2762,22 +2962,37 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     _sl_res = {}
                 if _sl_res and not _sl_res.get("ok"):
                     chatgpt_plus_error = f"短链复用 PayPal 付款失败: {_sl_res.get('error') or _sl_res.get('status') or 'unknown'}"
+                    _registration_pipeline_update(
+                        account,
+                        "payment",
+                        "failed",
+                        error=chatgpt_plus_error,
+                    )
+                    save_account(account)
                     logger.record_error(chatgpt_plus_error)
                     logger.log(chatgpt_plus_error, level="error")
                     _save_task_log(platform_name, account.email, "failed", error=chatgpt_plus_error)
                     return chatgpt_plus_error
                 logger.log("短链复用 PayPal 付款完成（同一浏览器）")
-                return True
-            chatgpt_plus_error = _auto_followup_chatgpt_plus_payment(
-                platform_name=platform_name,
-                payload=payload,
-                platform=platform,
-                account=account,
-                logger=logger,
-                sms_pool_override=slot_state["slot_value"] or sms_slot_value,
-                phone_swap_callback=_swap_phone if sms_pool_slots else None,
-            )
+                chatgpt_plus_error = ""
+            else:
+                chatgpt_plus_error = _auto_followup_chatgpt_plus_payment(
+                    platform_name=platform_name,
+                    payload=payload,
+                    platform=platform,
+                    account=account,
+                    logger=logger,
+                    sms_pool_override=slot_state["slot_value"] or sms_slot_value,
+                    phone_swap_callback=_swap_phone if sms_pool_slots else None,
+                )
             if chatgpt_plus_error:
+                _registration_pipeline_update(
+                    account,
+                    "payment",
+                    "failed",
+                    error=chatgpt_plus_error,
+                )
+                save_account(account)
                 logger.record_error(chatgpt_plus_error)
                 logger.log(chatgpt_plus_error, level="error")
                 _save_task_log(platform_name, account.email, "failed", error=chatgpt_plus_error)
@@ -2790,11 +3005,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 elif _is_current_sms_phone_exhausted_error(chatgpt_plus_error):
                     slot_state["swapped_or_dead"] = True
                 return chatgpt_plus_error
-            chatgpt_plus_enabled = (
-                platform_name == "chatgpt"
-                and _bool_config(extra.get("auto_chatgpt_plus_payment"), False)
-            )
             if chatgpt_plus_enabled:
+                _registration_pipeline_update(account, "payment", "passed")
                 _mark_outlook_mailbox_event(shared_mailbox, account, "plus_success", logger)
             if resolved_proxy:
                 # 711Proxy workers receive a per-attempt pinned session URL,
@@ -2804,18 +3016,30 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             logger.record_success()
             logger.log(f"✓ 注册成功: {account.email}")
             _save_task_log(platform_name, account.email, "success")
-            with Session(engine) as session:
-                saved = session.exec(
-                    select(AccountModel)
-                    .where(AccountModel.platform == platform_name)
-                    .where(AccountModel.email == account.email)
-                ).first()
-                if saved and int(saved.id or 0) > 0:
-                    with successful_account_ids_lock:
-                        successful_account_ids.append(int(saved.id))
+            if saved_account_id > 0:
+                with successful_account_ids_lock:
+                    successful_account_ids.append(saved_account_id)
             _auto_upload_cpa(logger, account)
             _auto_push_any2api(logger, account)
-            _auto_push_sub2api(logger, account, options=extra)
+            sub2_result = _auto_push_sub2api(logger, account, options=extra)
+            delivery_status = (
+                "not_configured"
+                if sub2_result is None
+                else "delivered"
+                if sub2_result
+                else "pending"
+            )
+            _registration_pipeline_update(
+                account,
+                "delivery",
+                delivery_status,
+                error=("Sub2API 自动交付未完成，等待补传" if sub2_result is False else ""),
+                detail={"sub2api": delivery_status},
+            )
+            save_account(account)
+            if delivery_status == "pending" and saved_account_id > 0:
+                with delivery_pending_account_ids_lock:
+                    delivery_pending_account_ids.append(saved_account_id)
             account_extra = dict(account.extra or {})
             overview = dict(account_extra.get("account_overview") or {})
             cashier_url = str(account_extra.get("cashier_url") or overview.get("cashier_url") or "")
@@ -2866,7 +3090,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 if account_deactivated:
                     logger.log(
                         "当前邮箱账号已被目标服务停用，已释放号码并停止该账号流程；"
-                        "不会继续换号消耗接码资源",
+                        "不会在当前账号上继续换号，仍可由下一邮箱补足目标数量",
                         level="error",
                     )
                 retryable_phone = any(
@@ -2893,15 +3117,45 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         level="warning",
                     )
                 else:
-                    email_then_phone_account_created_failure.set()
+                    logger.log(
+                        "当前邮箱账号已完成建号，但后续步骤失败；仅结束本次 attempt，"
+                        "调度器会按目标成功数决定是否使用下一邮箱补位",
+                        level="warning",
+                    )
             if logger.is_cancel_requested():
                 return "__cancel_requested__"
             if resolved_proxy and _registration_error_counts_as_proxy_failure(exc):
                 proxy_pool.report_fail(leased_proxy_url or resolved_proxy)
             error = str(exc)
+            if account is not None and email_account_created:
+                try:
+                    account_extra = dict(getattr(account, "extra", {}) or {})
+                    account_overview = dict(account_extra.get("account_overview") or {})
+                    current_stage = str(
+                        (account_overview.get("registration_pipeline") or {}).get("current_stage")
+                        or "registration"
+                    )
+                    _registration_pipeline_update(
+                        account,
+                        current_stage,
+                        "failed",
+                        error=error,
+                    )
+                    save_account(account)
+                except Exception as pipeline_exc:
+                    logger.log(
+                        f"注册失败状态保存异常: {pipeline_exc}",
+                        level="warning",
+                    )
             logger.record_error(error)
             logger.log(f"✗ 注册失败: {error}", level="error")
-            _save_task_log(platform_name, email or "", "failed", error=error)
+            failure_email = str(
+                getattr(account, "email", "")
+                or getattr(mailbox_account, "email", "")
+                or email
+                or ""
+            )
+            _save_task_log(platform_name, failure_email, "failed", error=error)
             return error
         finally:
             # 归还 SMS 槽位：``swapped_or_dead`` 为 True 表示原号在跑过程中被
@@ -3029,8 +3283,6 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 return False
             if failure_policy in {"stop", "stop_on_failure", "fail_fast"} and errors:
                 return False
-            if email_then_phone_account_created_failure.is_set():
-                return False
             # SMS 号池被耗尽（某条号被拒 + 备份池空）→ 整个任务级别停止
             # 投新任务，让正在跑的任务跑完后退出。否则下一批又抢同一条死号
             # 继续被拒（用户实战日志 "开始注册第 2/1 个账号" 即此场景）。
@@ -3122,6 +3374,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
 
     result_data: dict[str, Any] = {
         "account_ids": list(dict.fromkeys(successful_account_ids)),
+        "delivery_pending_account_ids": list(dict.fromkeys(delivery_pending_account_ids)),
         "failure_summary": _registration_failure_summary(errors),
     }
     if herosms_enabled:

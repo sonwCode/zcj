@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import re
+import threading
 import time
 from urllib.parse import urlparse
 from typing import Any
@@ -120,6 +121,11 @@ class OutlookEmailMailbox(BaseMailbox):
         self._session: requests.Session | None = None
         self._admin_session: requests.Session | None = None
         self._csrf_token: str = ""
+        # One provider instance is shared by every worker in a registration
+        # task.  Reserve an address before returning it so concurrent workers
+        # cannot all select the first row while success tags are still pending.
+        self._allocation_lock = threading.Lock()
+        self._reserved_emails: set[str] = set()
 
         self._assert_ready()
 
@@ -332,9 +338,20 @@ class OutlookEmailMailbox(BaseMailbox):
 
     def _select_account(self) -> dict[str, Any]:
         accounts = self._list_accounts()
-        usable = [item for item in accounts if self._is_usable_account(item)]
+        usable = [
+            item
+            for item in accounts
+            if self._is_usable_account(item)
+            and self._account_email(item).lower() not in self._reserved_emails
+        ]
         if not usable:
-            fallback = [item for item in accounts if self._account_email(item) and not self._has_skip_tag(item)]
+            fallback = [
+                item
+                for item in accounts
+                if self._account_email(item)
+                and not self._has_skip_tag(item)
+                and self._account_email(item).lower() not in self._reserved_emails
+            ]
             usable = fallback
         if not usable:
             raise RuntimeError("outlookEmail 账号列表中没有可用邮箱")
@@ -378,13 +395,28 @@ class OutlookEmailMailbox(BaseMailbox):
         )
 
     def get_email(self) -> MailboxAccount:
-        if self.fixed_email:
-            self._assert_fixed_email_not_skipped()
-            return self._build_account(email=self.fixed_email, account_id=self.fixed_email, source="fixed")
+        with self._allocation_lock:
+            if self.fixed_email:
+                key = self.fixed_email.lower()
+                if key in self._reserved_emails:
+                    raise RuntimeError("outlookEmail 固定邮箱已被当前任务的另一个 worker 占用")
+                self._assert_fixed_email_not_skipped()
+                self._reserved_emails.add(key)
+                return self._build_account(
+                    email=self.fixed_email,
+                    account_id=self.fixed_email,
+                    source="fixed",
+                )
 
-        item = self._select_account()
-        email = self._account_email(item)
-        return self._build_account(email=email, account_id=_text(item.get("id")), source="account_list", raw=item)
+            item = self._select_account()
+            email = self._account_email(item)
+            self._reserved_emails.add(email.lower())
+            return self._build_account(
+                email=email,
+                account_id=_text(item.get("id")),
+                source="account_list",
+                raw=item,
+            )
 
     def _assert_fixed_email_not_skipped(self) -> None:
         if not self.skip_tag_names:
@@ -562,6 +594,18 @@ class OutlookEmailMailbox(BaseMailbox):
             account_id=account.account_id,
             tag_names=self.register_success_tag_names,
         )
+
+    def mark_attempt_failure(self, account: MailboxAccount, reason: str = "") -> bool:
+        """Retire a leased address for the remainder of this task.
+
+        A remote account may already have been partially created even when the
+        local attempt fails before it can be confirmed.  Keeping the in-memory
+        reservation is safer than handing the same identity to another worker.
+        """
+        return bool(_text(getattr(account, "email", "")))
+
+    def mark_registration_failure(self, account: MailboxAccount, reason: str = "") -> bool:
+        return self.mark_attempt_failure(account, reason)
 
     def mark_plus_success(self, account: MailboxAccount) -> list[str]:
         return self.add_tags_to_account(

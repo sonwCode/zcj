@@ -35,7 +35,13 @@ def test_split_unused_api_reports_blocked_rows(tmp_path):
     assert result["unused_text"].startswith("fresh@hotmail.com----")
 
 
-def test_inventory_api_expands_aliases_and_hides_credentials(tmp_path):
+def test_inventory_api_expands_aliases_and_hides_credentials(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "core.local_ms_mailbox.generate_microsoft_pool_aliases",
+        lambda email, count, existing=None: [
+            f"base+reg{index}@hotmail.com" for index in range(1, count + 1)
+        ],
+    )
     state_file = tmp_path / "state.json"
     state_file.write_text(
         json.dumps(

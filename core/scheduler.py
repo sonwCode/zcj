@@ -1,5 +1,7 @@
 """定时任务调度 - 账号有效性检测、trial 到期提醒"""
+import math
 import threading
+import time
 from datetime import datetime, timezone
 
 from sqlmodel import Session, select
@@ -14,10 +16,51 @@ class Scheduler:
     def __init__(self):
         self._running = False
         self._thread: threading.Thread = None
+        self._full_cycle_thread: threading.Thread = None
         self._stop_event = threading.Event()
+        self._full_cycle_lock = threading.Lock()
+        self._probation_cycle_lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._full_cycle_status = self._empty_cycle_status()
+        self._probation_cycle_status = self._empty_cycle_status()
+
+    @staticmethod
+    def _empty_cycle_status() -> dict:
+        return {
+            "running": False,
+            "last_started_at": "",
+            "last_completed_at": "",
+            "last_duration_seconds": 0.0,
+            "last_error": "",
+            "last_result": {},
+        }
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _set_cycle_status(self, kind: str, **updates) -> None:
+        with self._status_lock:
+            target = (
+                self._probation_cycle_status
+                if kind == "probation"
+                else self._full_cycle_status
+            )
+            target.update(updates)
+
+    def get_status(self) -> dict:
+        with self._status_lock:
+            full = dict(self._full_cycle_status)
+            probation = dict(self._probation_cycle_status)
+        return {
+            "running": bool(self._running),
+            "thread_alive": bool(self._thread and self._thread.is_alive()),
+            "full_cycle": full,
+            "probation_cycle": probation,
+        }
 
     def start(self):
-        if self._running:
+        if self._running and self._thread and self._thread.is_alive():
             return
         try:
             from core.sub2api_sync import repair_misclassified_registry_ineligible_accounts
@@ -38,7 +81,7 @@ class Scheduler:
         self._stop_event.set()
 
     def _loop(self):
-        first_cycle = True
+        next_full_run = time.monotonic() + 60
         while self._running:
             try:
                 from core.config_store import config_store
@@ -47,24 +90,41 @@ class Scheduler:
                     int(config_store.get("sub2api_check_interval_minutes", "5") or 5),
                     5,
                 )
-            except (TypeError, ValueError):
+            except Exception:
                 interval_minutes = 5
-            # Run once shortly after startup so accounts created before a
-            # restart do not wait a full interval.  LifecycleManager defers its
-            # legacy 6-hour check, avoiding two simultaneous liveness sweeps.
-            delay_seconds = 60 if first_cycle else interval_minutes * 60
+            # Wake at least once per minute for short post-registration
+            # probation checks. The heavier full-account sweep still follows
+            # its configured interval and first runs one minute after startup.
+            delay_seconds = max(
+                1,
+                min(60, int(math.ceil(next_full_run - time.monotonic()))),
+            )
             print(
-                f"[Scheduler] 下一次账号有效性检测将在 {delay_seconds} 秒后运行",
+                f"[Scheduler] 下一次维护检查将在 {delay_seconds} 秒后运行",
                 flush=True,
             )
             if self._stop_event.wait(delay_seconds):
                 break
-            first_cycle = False
             try:
-                print("[Scheduler] 开始账号有效性检测...", flush=True)
-                self._run_cycle()
+                self._run_probation_cycle()
             except Exception as e:
-                print(f"[Scheduler] 错误: {e}", flush=True)
+                print(f"[Scheduler] 观察期复检错误: {e}", flush=True)
+            if time.monotonic() >= next_full_run:
+                if not self._full_cycle_thread or not self._full_cycle_thread.is_alive():
+                    print("[Scheduler] 开始账号有效性检测...", flush=True)
+                    self._full_cycle_thread = threading.Thread(
+                        target=self._run_full_cycle_safely,
+                        daemon=True,
+                        name="account-validity-cycle",
+                    )
+                    self._full_cycle_thread.start()
+                next_full_run = time.monotonic() + interval_minutes * 60
+
+    def _run_full_cycle_safely(self):
+        try:
+            self._run_cycle()
+        except Exception as exc:
+            print(f"[Scheduler] 错误: {exc}", flush=True)
 
     def _run_cycle(self):
         """Run one maintenance cycle.
@@ -73,6 +133,33 @@ class Scheduler:
         auto-deletion.  The old coupling silently disabled all periodic local
         checks whenever ``sub2api_auto_delete_invalid`` was off.
         """
+        if not self._full_cycle_lock.acquire(blocking=False):
+            return {"skipped": "another_cycle_running"}
+        started = time.monotonic()
+        self._set_cycle_status(
+            "full",
+            running=True,
+            last_started_at=self._now_iso(),
+            last_error="",
+        )
+        try:
+            result = self._run_cycle_impl()
+        except Exception as exc:
+            self._set_cycle_status("full", last_error=str(exc))
+            raise
+        else:
+            self._set_cycle_status("full", last_result=dict(result or {}))
+            return result
+        finally:
+            self._set_cycle_status(
+                "full",
+                running=False,
+                last_completed_at=self._now_iso(),
+                last_duration_seconds=round(time.monotonic() - started, 3),
+            )
+            self._full_cycle_lock.release()
+
+    def _run_cycle_impl(self):
         self.check_trial_expiry()
         from core.config_store import config_store
 
@@ -110,6 +197,46 @@ class Scheduler:
                 cleanup_invalid_synced_accounts(limit=500)
             except Exception as exc:
                 print(f"[Scheduler] Sub2 清理跳过: {exc}", flush=True)
+        return {"validity": check_results, "remote_cleanup_enabled": auto_delete}
+
+    def _run_probation_cycle(self):
+        if not self._probation_cycle_lock.acquire(blocking=False):
+            return {"skipped": "another_cycle_running"}
+        started = time.monotonic()
+        self._set_cycle_status(
+            "probation",
+            running=True,
+            last_started_at=self._now_iso(),
+            last_error="",
+        )
+        try:
+            from core.config_store import config_store
+            from core.lifecycle import check_due_account_probations
+
+            try:
+                concurrency = min(
+                    max(int(config_store.get("account_check_concurrency", "5") or 5), 1),
+                    20,
+                )
+            except (TypeError, ValueError):
+                concurrency = 5
+            result = check_due_account_probations(
+                limit=100,
+                concurrency=concurrency,
+            )
+            self._set_cycle_status("probation", last_result=dict(result or {}))
+            return result
+        except Exception as exc:
+            self._set_cycle_status("probation", last_error=str(exc))
+            raise
+        finally:
+            self._set_cycle_status(
+                "probation",
+                running=False,
+                last_completed_at=self._now_iso(),
+                last_duration_seconds=round(time.monotonic() - started, 3),
+            )
+            self._probation_cycle_lock.release()
 
     def check_trial_expiry(self):
         """检查 trial 到期账号，更新状态"""
@@ -135,12 +262,23 @@ class Scheduler:
     def check_accounts_valid(self, platform: str = None, limit: int = 50):
         """批量检测账号有效性"""
         load_all()
+        from core.config_store import config_store
         from core.lifecycle import check_accounts_validity
+
+        try:
+            concurrency = min(
+                max(int(config_store.get("account_check_concurrency", "5") or 5), 1),
+                20,
+            )
+        except (TypeError, ValueError):
+            concurrency = 5
 
         return check_accounts_validity(
             platform=str(platform or ""),
             limit=max(int(limit), 1),
             include_inactive=True,
+            exclude_probation_pending=True,
+            concurrency=concurrency,
         )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
@@ -34,15 +35,144 @@ def _utcnow_ts() -> int:
     return int(_utcnow().timestamp())
 
 
+def _iso_from_ts(value: int | float) -> str:
+    return (
+        datetime.fromtimestamp(float(value), tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Account validity check
 # ---------------------------------------------------------------------------
+
+def check_account_validity(
+    account_id: int,
+    *,
+    log_fn=None,
+) -> dict[str, Any]:
+    """Check and persist one account without sharing a DB session or plugin.
+
+    Keeping the unit of work account-scoped makes it safe for both the regular
+    scheduler and the short post-registration probation queue to use bounded
+    concurrency.
+    """
+    log = log_fn or logger.info
+    with Session(engine) as session:
+        current = session.get(AccountModel, int(account_id))
+        if not current:
+            return {
+                "account_id": int(account_id),
+                "email": "",
+                "platform": "",
+                "validity_status": "skipped",
+                "valid": None,
+            }
+        email = str(current.email or "")
+        platform_name = str(current.platform or "")
+        account_obj = build_platform_account(session, current)
+
+    platform_cls = get(platform_name)
+    plugin = platform_cls(config=RegisterConfig())
+    valid = bool(plugin.check_valid(account_obj))
+    check_overview = (
+        dict(plugin.get_last_check_overview() or {})
+        if hasattr(plugin, "get_last_check_overview")
+        else {}
+    )
+    check_credential_updates = (
+        dict(plugin.get_last_check_credential_updates() or {})
+        if hasattr(plugin, "get_last_check_credential_updates")
+        else {}
+    )
+    validity_status = str(
+        check_overview.get("validity_status") or ("valid" if valid else "invalid")
+    ).strip().lower()
+    if validity_status not in {"valid", "invalid", "unknown"}:
+        validity_status = "unknown"
+
+    with Session(engine) as session:
+        model = session.get(AccountModel, int(account_id))
+        if not model:
+            return {
+                "account_id": int(account_id),
+                "email": email,
+                "platform": platform_name,
+                "validity_status": "skipped",
+                "valid": None,
+            }
+        model.updated_at = _utcnow()
+        summary_updates = {
+            "checked_at": _utcnow_iso(),
+            "valid": (
+                True
+                if validity_status == "valid"
+                else False
+                if validity_status == "invalid"
+                else None
+            ),
+            "validity_status": validity_status,
+            **check_overview,
+        }
+        lifecycle_status = None
+        if validity_status == "valid":
+            current_graph = load_account_graphs(session, [int(account_id)]).get(
+                int(account_id), {}
+            )
+            merged_graph = dict(current_graph)
+            merged_overview = dict(merged_graph.get("overview") or {})
+            merged_overview.update(summary_updates)
+            merged_graph["overview"] = merged_overview
+            lifecycle_status = recover_lifecycle_status_for_valid_account(merged_graph)
+        patch_account_graph(
+            session,
+            model,
+            lifecycle_status=lifecycle_status,
+            summary_updates=summary_updates,
+            credential_updates=check_credential_updates,
+        )
+        session.add(model)
+        session.commit()
+
+    if validity_status == "invalid":
+        try:
+            from core.sub2api_sync import delete_synced_account
+
+            delete_synced_account(
+                int(account_id),
+                reason=str(check_overview.get("validity_reason") or "invalid"),
+                log_fn=log,
+            )
+        except Exception as exc:
+            log(f"  [Sub2API] Auto delete error: {exc}")
+        log(f"  {email} ({platform_name}): 失效")
+    elif validity_status == "unknown":
+        log(f"  {email} ({platform_name}): 检测状态未知")
+
+    return {
+        "account_id": int(account_id),
+        "email": email,
+        "platform": platform_name,
+        "validity_status": validity_status,
+        "valid": (
+            True
+            if validity_status == "valid"
+            else False
+            if validity_status == "invalid"
+            else None
+        ),
+        "overview": check_overview,
+    }
+
 
 def check_accounts_validity(
     *,
     platform: str = "",
     limit: int = 100,
     include_inactive: bool = False,
+    exclude_probation_pending: bool = False,
+    concurrency: int = 1,
     log_fn=None,
 ) -> dict[str, int]:
     """Check accounts and keep transient check failures in ``unknown``.
@@ -67,85 +197,268 @@ def check_accounts_validity(
         a for a in accounts
         if graphs.get(int(a.id or 0), {}).get("lifecycle_status") in active_statuses
     ]
-
-    results = {"valid": 0, "invalid": 0, "unknown": 0, "error": 0, "skipped": len(accounts) - len(targets)}
-    for acc in targets:
-        try:
-            platform_cls = get(acc.platform)
-            plugin = platform_cls(config=RegisterConfig())
-            with Session(engine) as session:
-                current = session.get(AccountModel, acc.id)
-                if not current:
-                    continue
-                account_obj = build_platform_account(session, current)
-
-            valid = plugin.check_valid(account_obj)
-            check_overview = (
-                plugin.get_last_check_overview() or {}
-                if hasattr(plugin, "get_last_check_overview")
-                else {}
+    if exclude_probation_pending:
+        targets = [
+            account
+            for account in targets
+            if str(
+                (
+                    (graphs.get(int(account.id or 0), {}).get("overview") or {})
+                    .get("probation")
+                    or {}
+                ).get("status")
+                or ""
             )
-            check_credential_updates = (
-                plugin.get_last_check_credential_updates() or {}
-                if hasattr(plugin, "get_last_check_credential_updates")
-                else {}
-            )
-            validity_status = str(check_overview.get("validity_status") or ("valid" if valid else "invalid"))
-            with Session(engine) as session:
-                model = session.get(AccountModel, acc.id)
-                if model:
-                    model.updated_at = _utcnow()
-                    summary_updates = {
-                        "checked_at": _utcnow_iso(),
-                        "valid": True if validity_status == "valid" else False if validity_status == "invalid" else None,
-                        "validity_status": validity_status,
-                        **check_overview,
-                    }
-                    lifecycle_status = None
-                    if validity_status == "valid":
-                        current_graph = load_account_graphs(
-                            session,
-                            [int(acc.id or 0)],
-                        ).get(int(acc.id or 0), {})
-                        merged_graph = dict(current_graph)
-                        merged_overview = dict(merged_graph.get("overview") or {})
-                        merged_overview.update(summary_updates)
-                        merged_graph["overview"] = merged_overview
-                        lifecycle_status = recover_lifecycle_status_for_valid_account(
-                            merged_graph
-                        )
-                    patch_account_graph(
-                        session, model,
-                        lifecycle_status=lifecycle_status,
-                        summary_updates=summary_updates,
-                        credential_updates=check_credential_updates,
-                    )
-                    session.add(model)
-                    session.commit()
-            if validity_status == "valid":
-                results["valid"] += 1
-            elif validity_status == "invalid":
-                results["invalid"] += 1
-                try:
-                    from core.sub2api_sync import delete_synced_account
+            != "pending"
+        ]
 
-                    delete_synced_account(
-                        int(acc.id or 0),
-                        reason=str(check_overview.get("validity_reason") or "invalid"),
-                        log_fn=log,
-                    )
-                except Exception as exc:
-                    log(f"  [Sub2API] Auto delete error: {exc}")
-                log(f"  {acc.email} ({acc.platform}): 失效")
-            else:
-                results["unknown"] += 1
-                log(f"  {acc.email} ({acc.platform}): 检测状态未知")
-        except Exception as exc:
+    results = {
+        "valid": 0,
+        "invalid": 0,
+        "unknown": 0,
+        "error": 0,
+        "skipped": len(accounts) - len(targets),
+    }
+
+    def _record(
+        acc,
+        result: dict[str, Any] | None = None,
+        exc: Exception | None = None,
+    ) -> None:
+        if exc is not None:
             results["error"] += 1
             log(f"  {acc.email} ({acc.platform}): 检测异常 {exc}")
+            return
+        status = str((result or {}).get("validity_status") or "unknown")
+        if status in {"valid", "invalid", "unknown"}:
+            results[status] += 1
+        else:
+            results["skipped"] += 1
+
+    workers = min(max(int(concurrency or 1), 1), 20, max(len(targets), 1))
+    if workers == 1:
+        for acc in targets:
+            try:
+                _record(acc, check_account_validity(int(acc.id or 0), log_fn=log))
+            except Exception as exc:
+                _record(acc, exc=exc)
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="validity") as pool:
+            futures = {
+                pool.submit(check_account_validity, int(acc.id or 0), log_fn=log): acc
+                for acc in targets
+            }
+            for future in as_completed(futures):
+                acc = futures[future]
+                try:
+                    _record(acc, future.result())
+                except Exception as exc:
+                    _record(acc, exc=exc)
 
     log(f"检测完成: 有效 {results['valid']}, 失效 {results['invalid']}, 未知 {results['unknown']}, "
         f"异常 {results['error']}, 跳过 {results['skipped']}")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Post-registration probation checks
+# ---------------------------------------------------------------------------
+
+DEFAULT_PROBATION_OFFSETS_SECONDS = (300, 900)
+
+
+def _normalize_probation_offsets(values) -> list[int]:
+    result: set[int] = set()
+    for value in values or []:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            result.add(min(parsed, 86400))
+    return sorted(result)
+
+
+def schedule_account_probation(
+    account_id: int,
+    *,
+    offsets_seconds: list[int] | tuple[int, ...] | None = None,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    """Persist non-blocking follow-up checks for a newly registered account."""
+    start_ts = int(now_ts if now_ts is not None else _utcnow_ts())
+    raw_offsets = offsets_seconds or DEFAULT_PROBATION_OFFSETS_SECONDS
+    offsets = _normalize_probation_offsets(raw_offsets)
+    if not offsets:
+        return {}
+    state = {
+        "status": "pending",
+        "started_at": _iso_from_ts(start_ts),
+        "started_at_ts": start_ts,
+        "offsets_seconds": offsets,
+        "completed_offsets_seconds": [],
+        "next_offset_seconds": offsets[0],
+        "next_check_at": _iso_from_ts(start_ts + offsets[0]),
+        "next_check_at_ts": start_ts + offsets[0],
+        "last_status": "",
+        "retry_count": 0,
+    }
+    with Session(engine) as session:
+        model = session.get(AccountModel, int(account_id))
+        if not model:
+            return {}
+        patch_account_graph(session, model, summary_updates={"probation": state})
+        session.add(model)
+        session.commit()
+    return state
+
+
+def _finish_probation_probe(
+    account_id: int,
+    result: dict[str, Any] | None,
+    *,
+    now_ts: int,
+    error: str = "",
+) -> str:
+    """Advance one persisted probation state and return its new status."""
+    with Session(engine) as session:
+        overview_model = session.get(AccountOverviewModel, int(account_id))
+        account_model = session.get(AccountModel, int(account_id))
+        if not overview_model or not account_model:
+            return "skipped"
+        summary = overview_model.get_summary()
+        state = dict(summary.get("probation") or {})
+        if state.get("status") != "pending":
+            return str(state.get("status") or "skipped")
+
+        current_offset = int(state.get("next_offset_seconds") or 0)
+        validity_status = str((result or {}).get("validity_status") or "unknown")
+        state["last_checked_at"] = _iso_from_ts(now_ts)
+        state["last_checked_at_ts"] = now_ts
+        state["last_status"] = "error" if error else validity_status
+        state["last_error"] = str(error or "")[:500]
+
+        if validity_status == "invalid":
+            state["status"] = "failed"
+            state["next_offset_seconds"] = 0
+            state["next_check_at"] = ""
+            state["next_check_at_ts"] = 0
+        elif validity_status == "valid":
+            completed = set(
+                _normalize_probation_offsets(
+                    state.get("completed_offsets_seconds") or []
+                )
+            )
+            if current_offset:
+                completed.add(current_offset)
+            offsets = [
+                value
+                for value in _normalize_probation_offsets(
+                    state.get("offsets_seconds") or []
+                )
+                if value not in completed
+            ]
+            state["completed_offsets_seconds"] = sorted(completed)
+            state["retry_count"] = 0
+            if offsets:
+                next_offset = min(offsets)
+                start_ts = int(state.get("started_at_ts") or now_ts)
+                # When the process was offline past multiple deadlines, keep
+                # probes separate instead of executing them back-to-back.
+                next_ts = max(start_ts + next_offset, now_ts + 60)
+                state["next_offset_seconds"] = next_offset
+                state["next_check_at"] = _iso_from_ts(next_ts)
+                state["next_check_at_ts"] = next_ts
+            else:
+                state["status"] = "passed"
+                state["next_offset_seconds"] = 0
+                state["next_check_at"] = ""
+                state["next_check_at_ts"] = 0
+        else:
+            retries = int(state.get("retry_count") or 0) + 1
+            retry_delay = min(60 * (2 ** min(retries - 1, 3)), 300)
+            state["retry_count"] = retries
+            state["next_check_at"] = _iso_from_ts(now_ts + retry_delay)
+            state["next_check_at_ts"] = now_ts + retry_delay
+
+        patch_account_graph(session, account_model, summary_updates={"probation": state})
+        session.add(account_model)
+        session.commit()
+        return str(state.get("status") or "pending")
+
+
+def check_due_account_probations(
+    *,
+    limit: int = 100,
+    concurrency: int = 5,
+    now_ts: int | None = None,
+    log_fn=None,
+) -> dict[str, int]:
+    """Run due probation probes without blocking registration workers."""
+    log = log_fn or logger.info
+    current_ts = int(now_ts if now_ts is not None else _utcnow_ts())
+    with Session(engine) as session:
+        rows = session.exec(select(AccountOverviewModel)).all()
+    due_ids: list[int] = []
+    for row in rows:
+        state = dict(row.get_summary().get("probation") or {})
+        if (
+            state.get("status") == "pending"
+            and int(state.get("next_check_at_ts") or 0) <= current_ts
+        ):
+            due_ids.append(int(row.account_id))
+            if len(due_ids) >= max(int(limit), 1):
+                break
+
+    results = {
+        "due": len(due_ids),
+        "checked": 0,
+        "pending": 0,
+        "passed": 0,
+        "failed": 0,
+        "unknown": 0,
+        "error": 0,
+    }
+
+    def _probe(account_id: int) -> tuple[int, dict[str, Any] | None, str]:
+        try:
+            return account_id, check_account_validity(account_id, log_fn=log), ""
+        except Exception as exc:
+            return account_id, None, str(exc)
+
+    workers = min(max(int(concurrency or 1), 1), 20, max(len(due_ids), 1))
+    probe_results: list[tuple[int, dict[str, Any] | None, str]] = []
+    if workers == 1:
+        probe_results = [_probe(account_id) for account_id in due_ids]
+    elif due_ids:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="probation") as pool:
+            futures = [pool.submit(_probe, account_id) for account_id in due_ids]
+            probe_results = [future.result() for future in as_completed(futures)]
+
+    for account_id, result, error in probe_results:
+        results["checked"] += 1
+        validity_status = str((result or {}).get("validity_status") or "unknown")
+        if error:
+            results["error"] += 1
+            log(f"  账号 #{account_id} 观察期检测异常: {error}")
+        elif validity_status == "unknown":
+            results["unknown"] += 1
+        state_status = _finish_probation_probe(
+            account_id,
+            result,
+            now_ts=current_ts,
+            error=error,
+        )
+        if state_status in {"pending", "passed", "failed"}:
+            results[state_status] += 1
+
+    if due_ids:
+        log(
+            "观察期复检完成: "
+            f"到期 {results['due']}, 通过 {results['passed']}, "
+            f"失效 {results['failed']}, 待后续 {results['pending']}, "
+            f"未知 {results['unknown']}, 异常 {results['error']}"
+        )
     return results
 
 

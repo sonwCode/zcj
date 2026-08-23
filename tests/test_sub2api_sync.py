@@ -60,6 +60,15 @@ def _account(email: str) -> Account:
     )
 
 
+def _agent_options(**overrides) -> dict:
+    """Legacy Agent Identity is opt-in; production registration defaults OAuth."""
+    return {
+        "sub2api_auth_mode": "agent_identity",
+        "sub2api_allow_agent_identity": True,
+        **overrides,
+    }
+
+
 def _model_id(email: str) -> int:
     with Session(engine) as session:
         model = session.exec(
@@ -215,11 +224,11 @@ def test_successful_registration_sync_persists_remote_id(monkeypatch):
 
     assert push_account_to_sub2api(
         account,
-        sync_options={
+        sync_options=_agent_options(**{
             "sub2api_proxy_id": 9,
             "sub2api_proxy_region": "CO",
             "sub2api_model": "gpt-5.3-codex-spark",
-        },
+        }),
     ) is True
     assert captured["auth_json"]["auth_mode"] == "agentIdentity"
     assert set(captured["auth_json"]) == {"auth_mode", "agent_identity"}
@@ -266,7 +275,7 @@ def test_registry_disabled_marks_account_ineligible_without_import(monkeypatch):
         ),
     )
 
-    assert push_account_to_sub2api(account) is False
+    assert push_account_to_sub2api(account, sync_options=_agent_options()) is False
     assert "client_created" not in captured
     state = _legacy_extra(_model_id(email))["sub2api_sync"]
     assert state.get("remote_account_id", 0) == 0
@@ -335,7 +344,7 @@ def test_web_session_without_refresh_can_create_agent_identity_but_never_bearer_
         },
     )
 
-    assert push_account_to_sub2api(account) is True
+    assert push_account_to_sub2api(account, sync_options=_agent_options()) is True
     assert captured["register_identity"] is True
     assert captured["auth_json"]["auth_mode"] == "agentIdentity"
     assert "access_token" not in captured["auth_json"]
@@ -473,7 +482,7 @@ def test_invalidated_agent_token_marks_local_account_invalid(monkeypatch):
         ),
     )
 
-    assert push_account_to_sub2api(account) is False
+    assert push_account_to_sub2api(account, sync_options=_agent_options()) is False
     account_id = _model_id(email)
     with Session(engine) as session:
         graph = load_account_graphs(session, [account_id])[account_id]
@@ -657,7 +666,7 @@ def test_registry_pending_becomes_ineligible_after_retry_window(monkeypatch):
     )
 
     for _ in range(5):
-        assert push_account_to_sub2api(account) is False
+            assert push_account_to_sub2api(account, sync_options=_agent_options()) is False
 
     state = _legacy_extra(_model_id(email))["sub2api_sync"]
     assert state["status"] == "registry_ineligible"
@@ -715,7 +724,7 @@ def test_imported_remote_401_is_deleted_and_never_marked_active(monkeypatch):
         },
     )
 
-    assert push_account_to_sub2api(account) is False
+    assert push_account_to_sub2api(account, sync_options=_agent_options()) is False
     assert deleted == [181]
     state = _legacy_extra(_model_id(email))["sub2api_sync"]
     assert state["status"] == "invalid"

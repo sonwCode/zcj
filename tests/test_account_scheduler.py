@@ -60,6 +60,8 @@ def test_scheduler_rechecks_retained_invalid_accounts(monkeypatch):
         "platform": "chatgpt",
         "limit": 25,
         "include_inactive": True,
+        "exclude_probation_pending": True,
+        "concurrency": 5,
     }
 
 
@@ -85,3 +87,24 @@ def test_scheduler_runs_first_cycle_after_one_minute(monkeypatch):
     scheduler._loop()
 
     assert waits == [60]
+
+
+def test_scheduler_exposes_last_cycle_heartbeat(monkeypatch):
+    from core.scheduler import Scheduler
+
+    scheduler = Scheduler()
+    monkeypatch.setattr(
+        scheduler,
+        "_run_cycle_impl",
+        lambda: {"validity": {"valid": 3, "invalid": 1, "unknown": 0}},
+    )
+
+    result = scheduler._run_cycle()
+    status = scheduler.get_status()["full_cycle"]
+
+    assert result["validity"]["valid"] == 3
+    assert status["running"] is False
+    assert status["last_started_at"]
+    assert status["last_completed_at"]
+    assert status["last_error"] == ""
+    assert status["last_result"]["validity"]["invalid"] == 1

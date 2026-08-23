@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from sqlmodel import Session, select
 
 from core.account_graph import load_account_graphs, sync_account_graph
@@ -83,3 +85,28 @@ def test_startup_graph_sync_promotes_legacy_web_access_token():
     legacy = dict(refreshed_overview.get_summary().get("legacy_extra") or {})
     assert "web_access_token" not in legacy
     assert legacy["custom_marker"] == "keep-me"
+
+
+def test_concurrent_saves_of_same_identity_create_one_account_row():
+    def _save(index: int) -> int:
+        model = save_account(
+            Account(
+                platform="chatgpt",
+                email="same-identity@example.com",
+                password=f"secret-{index}",
+                extra={"access_token": f"token-{index}"},
+            )
+        )
+        return int(model.id or 0)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        account_ids = list(pool.map(_save, range(16)))
+
+    assert len(set(account_ids)) == 1
+    with Session(engine) as session:
+        rows = session.exec(
+            select(AccountModel)
+            .where(AccountModel.platform == "chatgpt")
+            .where(AccountModel.email == "same-identity@example.com")
+        ).all()
+    assert len(rows) == 1

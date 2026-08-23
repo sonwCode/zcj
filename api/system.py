@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from application.system import SystemService
+from core.scheduler import scheduler
 from core.version import __version__
 
 router = APIRouter(tags=["system"])
@@ -31,3 +32,9 @@ def get_version():
         "latest": None,
         "has_update": False,
     }
+
+
+@router.get("/scheduler/status")
+def scheduler_status():
+    """Expose scheduler heartbeat/results so silent detector death is visible."""
+    return scheduler.get_status()

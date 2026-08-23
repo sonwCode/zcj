@@ -105,6 +105,7 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
     )
     monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
     monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_sub2api", lambda *args, **kwargs: None)
 
     logger = _FakeLogger()
 
@@ -129,6 +130,20 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
         "cannot access local variable 'extra'" in str(event)
         for event in logger.events
     )
+    from sqlmodel import Session, select
+
+    from core.account_graph import load_account_graphs
+    from core.db import AccountModel, engine
+
+    with Session(engine) as session:
+        model = session.exec(
+            select(AccountModel).where(AccountModel.email == "registered@example.com")
+        ).one()
+        graph = load_account_graphs(session, [int(model.id or 0)])[int(model.id or 0)]
+    pipeline = graph["overview"]["registration_pipeline"]
+    assert pipeline["registration_status"] == "registered"
+    assert pipeline["delivery_status"] == "not_configured"
+    assert pipeline["stages"]["persisted"]["status"] == "passed"
 
 
 def test_email_then_phone_keeps_parallel_attempt_window_when_target_is_one(monkeypatch):
@@ -301,6 +316,275 @@ def test_email_then_phone_target_five_keeps_all_five_sms_workers_in_flight(monke
         event[0] == "log" and "接码并发隔离已启用" in str(event[1])
         for event in logger.events
     )
+
+
+def test_email_then_phone_replaces_a_failed_post_registration_check(monkeypatch):
+    """One dead account must not stop replacements for the remaining target."""
+    import threading
+
+    state = {"created": 0}
+    lock = threading.Lock()
+
+    class FakePlatform:
+        def __init__(self):
+            self.number = 0
+            self._overview = {}
+
+        def register(self, email=None, password=None):
+            with lock:
+                state["created"] += 1
+                self.number = state["created"]
+            return Account(
+                platform="chatgpt",
+                email=f"replacement-{self.number}@example.com",
+                password=password or "Secret123!",
+                user_id=f"acct_{self.number}",
+                extra={"access_token": "access-token", "register_mode": "email_then_phone"},
+            )
+
+        def check_valid(self, _account):
+            if self.number == 1:
+                self._overview = {
+                    "validity_status": "invalid",
+                    "validity_reason": "account_deactivated",
+                }
+                return False
+            self._overview = {"validity_status": "valid"}
+            return True
+
+        def get_last_check_overview(self):
+            return self._overview
+
+    monkeypatch.setattr(tasks_module, "get", lambda _platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_complete_required_chatgpt_phone_verification",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(tasks_module, "_upgrade_protocol_codex_credentials", lambda **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_account_has_codex_rt", lambda _account: True)
+    monkeypatch.setattr(tasks_module, "save_account", lambda _account: None)
+    monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_sub2api", lambda *args, **kwargs: None)
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 5,
+            "concurrency": 5,
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "require_phone_verification": True,
+                "post_registration_liveness_delay_seconds": 0,
+                "post_registration_probation_enabled": False,
+                "high_concurrency": {"mode": "custom", "concurrency": 5},
+                "auto_chatgpt_plus_payment": False,
+            },
+        },
+        logger,
+    )
+
+    assert state["created"] == 6
+    assert sum(1 for event in logger.events if event[0] == "success") == 5
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+
+
+def test_fixed_email_is_rejected_for_batch_or_concurrent_registration(monkeypatch):
+    built = []
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: built.append(True),
+    )
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 2,
+            "concurrency": 2,
+            "email": "same@example.com",
+            "password": "Secret123!",
+            "extra": {"high_concurrency": {"mode": "custom", "concurrency": 2}},
+        },
+        logger,
+    )
+
+    assert built == []
+    assert logger.finished[0] == tasks_module.TASK_STATUS_FAILED
+    assert "固定邮箱只能用于单账号" in logger.finished[1]
+
+
+def test_each_registration_worker_receives_an_isolated_payload(monkeypatch):
+    import threading
+
+    seen_payload_ids = []
+    seen_extra_ids = []
+    lock = threading.Lock()
+    counter = {"value": 0}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            with lock:
+                counter["value"] += 1
+                number = counter["value"]
+            return Account(
+                platform="chatgpt",
+                email=f"isolated-{number}@example.com",
+                password="Secret123!",
+                user_id=f"acct_{number}",
+                extra={"access_token": "access-token"},
+            )
+
+    def fake_build(_platform_name, worker_payload, *_args, **_kwargs):
+        with lock:
+            seen_payload_ids.append(id(worker_payload))
+            seen_extra_ids.append(id(worker_payload["extra"]))
+        return FakePlatform()
+
+    monkeypatch.setattr(tasks_module, "get", lambda _platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(tasks_module, "_build_platform_instance", fake_build)
+    monkeypatch.setattr(tasks_module, "save_account", lambda _account: None)
+    monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_sub2api", lambda *args, **kwargs: None)
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 2,
+            "concurrency": 2,
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "high_concurrency": {"mode": "custom", "concurrency": 2},
+            },
+        },
+        logger,
+    )
+
+    assert len(set(seen_payload_ids)) == 2
+    assert len(set(seen_extra_ids)) == 2
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+
+
+def test_explicit_task_sub2_sync_overrides_disabled_global_switch(monkeypatch):
+    account = Account(
+        platform="chatgpt",
+        email="explicit-sub2@example.com",
+        password="secret",
+        extra={"access_token": "access", "refresh_token": "refresh-token-long-enough"},
+    )
+    pushed = []
+    monkeypatch.setattr("core.sub2api_sync.sub2api_auto_sync_enabled", lambda: False)
+    monkeypatch.setattr(
+        "core.sub2api_sync.push_account_to_sub2api",
+        lambda *args, **kwargs: pushed.append(kwargs) or True,
+    )
+    monkeypatch.setattr(tasks_module, "_account_has_codex_rt", lambda _account: True)
+
+    result = tasks_module._auto_push_sub2api(
+        _FakeLogger(),
+        account,
+        options={"sub2api_auto_sync": True},
+    )
+
+    assert result is True
+    assert len(pushed) == 1
+
+
+def test_post_registration_liveness_delay_accepts_observation_window_up_to_ten_minutes():
+    assert tasks_module._post_registration_liveness_delay_seconds(
+        {"post_registration_liveness_delay_seconds": 120}
+    ) == 120
+    assert tasks_module._post_registration_liveness_delay_seconds(
+        {"post_registration_liveness_delay_seconds": 3600}
+    ) == 600
+
+
+def test_shortlink_reuse_continues_through_common_success_and_delivery(monkeypatch):
+    delivered = []
+
+    class Saved:
+        id = 91
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email="shortlink@example.com",
+                password="Secret123!",
+                user_id="acct_shortlink",
+                extra={
+                    "access_token": "access-token",
+                    "_shortlink_checkout": {"ok": True, "status": "paid"},
+                },
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda _platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr(tasks_module, "save_account", lambda _account: Saved())
+    monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        tasks_module,
+        "_auto_push_sub2api",
+        lambda *args, **kwargs: delivered.append(True) or True,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_auto_followup_chatgpt_plus_payment",
+        lambda **kwargs: pytest.fail("shortlink reuse must not open a second checkout"),
+    )
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "auto_chatgpt_plus_payment": True,
+                "chatgpt_payment": {
+                    "use_short_link": True,
+                    "checkout_mode": "camoufox_headed",
+                },
+            },
+        },
+        logger,
+    )
+
+    assert delivered == [True]
+    assert logger.result_data["account_ids"] == [91]
+    assert any(event[0] == "success" for event in logger.events)
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
 
 
 def test_sub2_auto_sync_forces_mailbox_registration_through_phone_verification(monkeypatch):

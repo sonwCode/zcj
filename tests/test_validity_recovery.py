@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
+import time
 from types import SimpleNamespace
 
 from sqlmodel import Session, select
@@ -10,7 +12,11 @@ from application.tasks import _run_single_account_check
 from core.account_graph import load_account_graphs, patch_account_graph
 from core.base_platform import RegisterConfig
 from core.db import AccountModel, AccountOverviewModel, engine
-from core.lifecycle import check_accounts_validity
+from core.lifecycle import (
+    check_accounts_validity,
+    check_due_account_probations,
+    schedule_account_probation,
+)
 from core.proxy_pool import proxy_pool
 from platforms.chatgpt import payment
 from platforms.chatgpt.plugin import ChatGPTPlatform
@@ -213,6 +219,86 @@ def test_lifecycle_validity_check_keeps_transient_failure_unknown(monkeypatch):
     assert overview.validity_status == "unknown"
     assert overview.display_status == "registered"
     assert overview.get_summary()["check_error"] == "curl (7)"
+
+
+def test_validity_batch_uses_bounded_parallel_workers(monkeypatch):
+    state = {"active": 0, "max_active": 0}
+    lock = threading.Lock()
+
+    class _SlowValidPlatform:
+        def __init__(self, config=None):
+            self.config = config
+
+        def check_valid(self, _account):
+            with lock:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+            time.sleep(0.03)
+            with lock:
+                state["active"] -= 1
+            return True
+
+    with Session(engine) as session:
+        for index in range(5):
+            model = AccountModel(
+                platform="chatgpt",
+                email=f"parallel-validity-{index}@example.com",
+                password="secret",
+            )
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            patch_account_graph(session, model, lifecycle_status="registered")
+            session.commit()
+
+    monkeypatch.setattr("core.lifecycle.get", lambda _platform: _SlowValidPlatform)
+    result = check_accounts_validity(
+        platform="chatgpt",
+        limit=10,
+        concurrency=5,
+    )
+
+    assert result["valid"] == 5
+    assert state["max_active"] >= 2
+
+
+def test_probation_checks_are_persisted_and_advance_across_cycles(monkeypatch):
+    account_id = _create_account(lifecycle_status="registered")
+    monkeypatch.setattr("core.lifecycle.get", lambda _platform: _AlwaysValidPlatform)
+
+    state = schedule_account_probation(
+        account_id,
+        offsets_seconds=[300, 900],
+        now_ts=100,
+    )
+    assert state["next_check_at_ts"] == 400
+
+    assert check_due_account_probations(now_ts=399)["due"] == 0
+    first = check_due_account_probations(now_ts=400, concurrency=2)
+    assert first["checked"] == 1
+    assert first["pending"] == 1
+    probation = _overview(account_id).get_summary()["probation"]
+    assert probation["completed_offsets_seconds"] == [300]
+    assert probation["next_check_at_ts"] == 1000
+
+    second = check_due_account_probations(now_ts=1000, concurrency=2)
+    assert second["checked"] == 1
+    assert second["passed"] == 1
+    probation = _overview(account_id).get_summary()["probation"]
+    assert probation["status"] == "passed"
+
+
+def test_probation_marks_newly_deactivated_account_failed(monkeypatch):
+    account_id = _create_account(lifecycle_status="registered")
+    monkeypatch.setattr("core.lifecycle.get", lambda _platform: _AlwaysInvalidPlatform)
+    schedule_account_probation(account_id, offsets_seconds=[300], now_ts=100)
+
+    result = check_due_account_probations(now_ts=400)
+
+    assert result["failed"] == 1
+    overview = _overview(account_id)
+    assert overview.validity_status == "invalid"
+    assert overview.get_summary()["probation"]["status"] == "failed"
 
 
 def test_legacy_invalid_account_preserves_first_known_check_time():
