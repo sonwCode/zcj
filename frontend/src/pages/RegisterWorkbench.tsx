@@ -1350,7 +1350,7 @@ export default function RegisterWorkbench() {
                             ))}
                           </div>
                           <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] leading-4 text-[var(--text-muted)]">
-                            <span>可分配按占用状态计算；OAuth 是否可取码由启动预检另行校验。</span>
+                            <span>可分配只代表未被占用，不代表 OAuth 一定能正常取码。</span>
                             <span>{mailboxInventoryUpdatedAt ? `更新于 ${mailboxInventoryUpdatedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : ''}</span>
                           </div>
                         </>
