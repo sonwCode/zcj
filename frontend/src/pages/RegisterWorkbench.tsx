@@ -19,6 +19,7 @@ import {
   Orbit,
   Play,
   Radio,
+  RefreshCw,
   ScanText,
   Server,
   Settings2,
@@ -60,6 +61,15 @@ import { getTaskStatusText, isTerminalTaskStatus, TASK_STATUS_VARIANTS } from '@
 import { apiFetch } from '@/lib/utils'
 
 type SelectOption = readonly [string | number, string]
+
+type MailboxPoolInventory = {
+  total_count: number
+  available_count: number
+  used_count: number
+  blocked_count: number
+  allow_reuse: boolean
+  truncated: boolean
+}
 
 const EMPTY_CONFIG_OPTIONS: ConfigOptionsResponse = {
   mailbox_providers: [],
@@ -383,8 +393,13 @@ export default function RegisterWorkbench() {
   const [polling, setPolling] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [submitError, setSubmitError] = useState('')
+  const [mailboxInventory, setMailboxInventory] = useState<MailboxPoolInventory | null>(null)
+  const [mailboxInventoryLoading, setMailboxInventoryLoading] = useState(false)
+  const [mailboxInventoryError, setMailboxInventoryError] = useState('')
+  const [mailboxInventoryUpdatedAt, setMailboxInventoryUpdatedAt] = useState<Date | null>(null)
   const handledTerminalTaskIdsRef = useRef<Set<string>>(new Set())
   const openedCashierTaskIdsRef = useRef<Set<string>>(new Set())
+  const mailboxInventoryRequestRef = useRef(0)
 
   const set = useCallback((key: string, value: any) => {
     setForm(current => ({ ...current, [key]: value }))
@@ -670,6 +685,8 @@ export default function RegisterWorkbench() {
   ])
 
   const needsMailbox = ['mailbox', 'phone'].includes(form.identity_provider)
+  const supportsMailboxInventory = currentMailboxProvider?.driver_type === 'local_ms_pool'
+    || ['local_ms_pool', 'local_ms', 'local_gmail_pool'].includes(String(form.mail_provider || ''))
   const needsSms = form.identity_provider === 'phone' || Boolean(
     form.platform === 'chatgpt'
     && form.identity_provider === 'mailbox'
@@ -784,6 +801,85 @@ export default function RegisterWorkbench() {
     || '自动选择'
   const activeTaskId = String(task?.task_id || task?.id || '')
   const taskIsTerminal = Boolean(task?.status && isTerminalTaskStatus(task.status))
+
+  const refreshMailboxInventory = useCallback(async (silent = false) => {
+    if (!needsMailbox || !supportsMailboxInventory || !form.mail_provider) {
+      mailboxInventoryRequestRef.current += 1
+      setMailboxInventory(null)
+      setMailboxInventoryError('')
+      setMailboxInventoryUpdatedAt(null)
+      setMailboxInventoryLoading(false)
+      return
+    }
+
+    const requestId = mailboxInventoryRequestRef.current + 1
+    mailboxInventoryRequestRef.current = requestId
+    if (!silent) setMailboxInventoryLoading(true)
+    setMailboxInventoryError('')
+    try {
+      const data = await apiFetch('/mailbox-pool/inventory', {
+        method: 'POST',
+        body: JSON.stringify({
+          provider_key: form.mail_provider,
+          text: String(form.local_ms_pool_text || ''),
+          pool_file: String(form.local_ms_pool_file || ''),
+          state_file: String(form.local_ms_pool_state_file || ''),
+          alias_enabled: asBoolean(form.mailbox_alias_enabled),
+          alias_count: Math.max(numberOr(form.mailbox_alias_count, 1), 1),
+          limit: 1,
+        }),
+      })
+      if (requestId !== mailboxInventoryRequestRef.current) return
+      setMailboxInventory({
+        total_count: Math.max(numberOr(data?.total_count, 0), 0),
+        available_count: Math.max(numberOr(data?.available_count, 0), 0),
+        used_count: Math.max(numberOr(data?.used_count, 0), 0),
+        blocked_count: Math.max(numberOr(data?.blocked_count, 0), 0),
+        allow_reuse: Boolean(data?.allow_reuse),
+        truncated: Boolean(data?.truncated),
+      })
+      setMailboxInventoryUpdatedAt(new Date())
+    } catch (error) {
+      if (requestId !== mailboxInventoryRequestRef.current) return
+      setMailboxInventory(null)
+      setMailboxInventoryError(error instanceof Error ? error.message : String(error || '邮箱库存读取失败'))
+    } finally {
+      if (requestId === mailboxInventoryRequestRef.current) setMailboxInventoryLoading(false)
+    }
+  }, [
+    form.local_ms_pool_file,
+    form.local_ms_pool_state_file,
+    form.local_ms_pool_text,
+    form.mail_provider,
+    form.mailbox_alias_count,
+    form.mailbox_alias_enabled,
+    needsMailbox,
+    supportsMailboxInventory,
+  ])
+
+  useEffect(() => {
+    if (!needsMailbox || !supportsMailboxInventory || !form.mail_provider) {
+      void refreshMailboxInventory()
+      return
+    }
+    const timer = window.setTimeout(() => {
+      void refreshMailboxInventory()
+    }, 450)
+    return () => window.clearTimeout(timer)
+  }, [form.mail_provider, needsMailbox, refreshMailboxInventory, supportsMailboxInventory])
+
+  useEffect(() => {
+    if (!polling || !needsMailbox || !supportsMailboxInventory) return
+    const timer = window.setInterval(() => {
+      void refreshMailboxInventory(true)
+    }, 30_000)
+    return () => window.clearInterval(timer)
+  }, [needsMailbox, polling, refreshMailboxInventory, supportsMailboxInventory])
+
+  useEffect(() => {
+    if (!taskIsTerminal || !needsMailbox || !supportsMailboxInventory) return
+    void refreshMailboxInventory(true)
+  }, [activeTaskId, needsMailbox, refreshMailboxInventory, supportsMailboxInventory, taskIsTerminal])
 
   const blockingIssues = useMemo(() => {
     const issues: string[] = []
@@ -1220,8 +1316,56 @@ export default function RegisterWorkbench() {
                       <div className="text-sm font-semibold text-[var(--text-primary)]">邮箱资源</div>
                       <div className="mt-1 text-xs text-[var(--text-muted)]">用于创建账号或手机号注册后的邮箱绑定</div>
                     </div>
-                    <Badge variant={form.mail_provider ? 'secondary' : 'danger'}>{form.mail_provider ? '已选择' : '待配置'}</Badge>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {supportsMailboxInventory ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={mailboxInventoryLoading}
+                          onClick={() => void refreshMailboxInventory()}
+                        >
+                          <RefreshCw className={`mr-1.5 h-3.5 w-3.5 ${mailboxInventoryLoading ? 'animate-spin' : ''}`} />
+                          刷新库存
+                        </Button>
+                      ) : null}
+                      <Badge variant={form.mail_provider ? 'secondary' : 'danger'}>{form.mail_provider ? '已选择' : '待配置'}</Badge>
+                    </div>
                   </div>
+                  {supportsMailboxInventory ? (
+                    <div className="mb-4 rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] p-3">
+                      {mailboxInventory ? (
+                        <>
+                          <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
+                            {[
+                              { label: '可分配邮箱', value: mailboxInventory.available_count, tone: 'text-emerald-400' },
+                              { label: '邮箱总数', value: mailboxInventory.total_count, tone: 'text-[var(--text-primary)]' },
+                              { label: '已占用', value: mailboxInventory.used_count, tone: 'text-amber-300' },
+                              { label: '已封禁', value: mailboxInventory.blocked_count, tone: 'text-rose-400' },
+                            ].map(item => (
+                              <div key={item.label} className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/70 px-3 py-2.5">
+                                <div className="text-[11px] text-[var(--text-muted)]">{item.label}</div>
+                                <div className={`mt-1 text-xl font-semibold tabular-nums ${item.tone}`}>{item.value}</div>
+                              </div>
+                            ))}
+                          </div>
+                          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] leading-4 text-[var(--text-muted)]">
+                            <span>可分配按占用状态计算；OAuth 是否可取码由启动预检另行校验。</span>
+                            <span>{mailboxInventoryUpdatedAt ? `更新于 ${mailboxInventoryUpdatedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}` : ''}</span>
+                          </div>
+                        </>
+                      ) : mailboxInventoryLoading ? (
+                        <div className="flex min-h-20 items-center justify-center gap-2 text-xs text-[var(--text-muted)]">
+                          <Loader2 className="h-4 w-4 animate-spin" />正在读取邮箱库存…
+                        </div>
+                      ) : (
+                        <div className="flex min-h-20 items-center gap-2 rounded-lg border border-amber-500/20 bg-amber-500/8 px-3 text-xs leading-5 text-amber-300">
+                          <AlertTriangle className="h-4 w-4 shrink-0" />
+                          <span>{mailboxInventoryError || '暂未读取到邮箱库存，请检查邮箱池配置后刷新。'}</span>
+                        </div>
+                      )}
+                    </div>
+                  ) : null}
                   {mailboxProviderOptions.length > 0 ? (
                     <div className="grid gap-4 md:grid-cols-2">
                       <FieldSelect label={t('register.mailboxService')} value={form.mail_provider} onChange={value => set('mail_provider', value)} options={mailboxProviderOptions} />
