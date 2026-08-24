@@ -130,6 +130,45 @@ def _int_config(value: object, default: int) -> int:
         return default
 
 
+def resolve_local_ms_mailbox_proxy(
+    config: dict | None,
+    registration_proxy: str | None = None,
+) -> str | None:
+    """Resolve the mailbox route independently from the signup route.
+
+    Microsoft token/Graph traffic is not tied to the target site's sticky
+    registration session. Reusing that route made a failed registration proxy
+    consume mailbox rows before an OTP request could reach Microsoft.
+    """
+    values = dict(config or {})
+    explicit = normalize_proxy_url(values.get("local_ms_mailbox_proxy"))
+    if explicit:
+        return explicit
+    if _truthy(values.get("local_ms_use_registration_proxy")):
+        return normalize_proxy_url(registration_proxy or values.get("proxy"))
+    return None
+
+
+class MicrosoftMailboxNetworkError(RuntimeError):
+    """A transport failure that must not be mistaken for an invalid mailbox RT."""
+
+    code = "mailbox_network_error"
+    retryable = True
+
+
+_MAILBOX_NETWORK_HTTP_STATUSES = {407, 502, 503, 504}
+_TRANSIENT_MAILBOX_NETWORK_MARKERS = (
+    "mailbox_network_error",
+    "proxyerror",
+    "unable to connect to proxy",
+    "tunnel connection",
+    "connect tunnel",
+    "max retries exceeded",
+    "connectionpool",
+    "proxy_network_error",
+)
+
+
 def _safe_text(value: object) -> str:
     return str(value or "").strip().strip("\ufeff")
 
@@ -580,6 +619,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         provider_name: str = "local_ms_pool",
         plus_alias_enabled: bool = False,
         plus_alias_count: int = 1,
+        direct_fallback: bool = True,
+        network_attempts: int = 2,
     ):
         self.pool_text = str(pool_text or "")
         self.pool_file = str(pool_file or "").strip()
@@ -592,13 +633,62 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         self.provider_name = str(provider_name or "local_ms_pool").strip() or "local_ms_pool"
         self.plus_alias_enabled = bool(plus_alias_enabled)
         self.plus_alias_count = max(_int_config(plus_alias_count, 1), 1)
+        self.direct_fallback = bool(direct_fallback)
+        self.network_attempts = min(max(_int_config(network_attempts, 2), 1), 3)
         self._expanded_pool_text: str | None = None
+        # A transiently failed row is released from persistent state so a
+        # later task can retry it, but it remains retired inside this task to
+        # prevent a tight loop selecting the same route immediately.
+        self._task_retired: set[str] = set()
 
     def _proxies_for_entry(self, entry: LocalMicrosoftMailboxEntry):
         entry_proxy = normalize_proxy_url(entry.proxy)
         if entry_proxy:
             return {"http": entry_proxy, "https": entry_proxy}
         return self.proxy
+
+    def _request_with_network_fallback(
+        self,
+        method: str,
+        entry: LocalMicrosoftMailboxEntry,
+        url: str,
+        **kwargs,
+    ):
+        request_fn = requests.post if method.strip().lower() == "post" else requests.get
+        primary_proxies = self._proxies_for_entry(entry)
+        routes: list[tuple[str, dict | None]] = [
+            ("proxy" if primary_proxies else "direct", primary_proxies)
+        ]
+        if primary_proxies and self.direct_fallback:
+            routes.append(("direct-fallback", None))
+
+        errors: list[str] = []
+        for attempt in range(1, self.network_attempts + 1):
+            for route_name, proxies in routes:
+                try:
+                    response = request_fn(
+                        url,
+                        proxies=proxies,
+                        **kwargs,
+                    )
+                except requests.exceptions.RequestException as exc:
+                    errors.append(
+                        f"{route_name}/{attempt}: {exc.__class__.__name__}"
+                    )
+                    continue
+                if int(getattr(response, "status_code", 0) or 0) in _MAILBOX_NETWORK_HTTP_STATUSES:
+                    errors.append(
+                        f"{route_name}/{attempt}: HTTP {response.status_code}"
+                    )
+                    continue
+                return response
+            if attempt < self.network_attempts:
+                time.sleep(min(attempt, 2))
+
+        detail = " -> ".join(errors[-6:]) or "transport unavailable"
+        raise MicrosoftMailboxNetworkError(
+            f"mailbox_network_error: Microsoft 邮箱网络请求失败: {detail}"
+        )
 
     @classmethod
     def from_config(cls, config: dict) -> "LocalMicrosoftMailboxPool":
@@ -608,7 +698,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             state_file=config.get("local_ms_pool_state_file", ""),
             graph_scope=config.get("local_ms_graph_scope", ""),
             allow_reuse=_truthy(config.get("local_ms_pool_allow_reuse")),
-            proxy=config.get("proxy") or None,
+            proxy=resolve_local_ms_mailbox_proxy(config, config.get("proxy") or None),
             mailbox_url_timeout=_int_config(config.get("local_ms_mailbox_url_timeout"), 8),
             mailbox_url_poll_interval=_int_config(config.get("local_ms_mailbox_url_poll_interval"), 2),
             provider_name=str(config.get("_provider_key") or config.get("mailbox_provider_key") or "local_ms_pool"),
@@ -618,6 +708,13 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             plus_alias_count=_int_config(
                 config.get("mailbox_alias_count", config.get("gmail_alias_count")),
                 1,
+            ),
+            direct_fallback=_truthy(
+                config.get("local_ms_proxy_direct_fallback", True)
+            ),
+            network_attempts=_int_config(
+                config.get("local_ms_network_attempts"),
+                2,
             ),
         )
 
@@ -728,7 +825,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         }
         for entry in entries:
             base_key = self._base_email_key(entry.login_account or entry.email)
-            if entry.key in blocked or base_key in blocked_bases:
+            if (
+                entry.key in blocked
+                or base_key in blocked_bases
+                or entry.key in self._task_retired
+            ):
                 continue
             if self.allow_reuse or entry.key not in used:
                 return entry
@@ -783,6 +884,72 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         }
         self._merge_state_records(key, {"failures": failure_record})
         return True
+
+    def release_transient_failure(self, account: MailboxAccount, reason: str = "") -> bool:
+        """Release a row after transport failure without retrying it in this task."""
+        key = str(
+            getattr(account, "account_id", "")
+            or getattr(account, "email", "")
+        ).strip().lower()
+        if not key:
+            return False
+        reason_text = str(reason or "mailbox_network_error")[:500]
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._task_retired.add(key)
+            state = self._state()
+            used = dict(state.get("used") or {})
+            used.pop(key, None)
+            failures = dict(state.get("failures") or {})
+            failures[key] = {
+                "email": str(getattr(account, "email", "") or ""),
+                "reason": reason_text,
+                "reason_code": "transient_network",
+                "failed_at": now,
+                "source_id": self._source_id(),
+            }
+            state["used"] = used
+            state["failures"] = failures
+            self._save_state(state)
+        return True
+
+    def recover_transient_failures(self) -> int:
+        """Undo stale reservations caused only by a previous network outage."""
+        recovered = 0
+        with self._lock:
+            state = self._state()
+            used = dict(state.get("used") or {})
+            blocked = dict(state.get("blocked") or {})
+            failures = dict(state.get("failures") or {})
+            now = datetime.now(timezone.utc).isoformat()
+            for raw_key, raw_failure in list(failures.items()):
+                key = str(raw_key or "").strip().lower()
+                failure = dict(raw_failure or {})
+                used_record = dict(used.get(key) or {})
+                reason = str(failure.get("reason") or "").lower()
+                is_transient = (
+                    str(failure.get("reason_code") or "") == "transient_network"
+                    or any(marker in reason for marker in _TRANSIENT_MAILBOX_NETWORK_MARKERS)
+                )
+                if (
+                    not key
+                    or not is_transient
+                    or key in blocked
+                    or not used_record
+                    or used_record.get("completed_at")
+                    or str(used_record.get("outcome") or "").lower() == "success"
+                ):
+                    continue
+                used.pop(key, None)
+                failure["reason_code"] = "transient_network"
+                failure["recovered_at"] = now
+                failures[key] = failure
+                recovered += 1
+            if recovered:
+                state["used"] = used
+                state["failures"] = failures
+                self._save_state(state)
+        return recovered
 
     def mark_registration_success(self, account: MailboxAccount) -> list[str]:
         key = str(getattr(account, "account_id", "") or getattr(account, "email", "")).strip().lower()
@@ -1035,10 +1202,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     def _mailbox_url_snapshot(self, entry: LocalMicrosoftMailboxEntry, pattern: re.Pattern | None = None) -> dict:
         if not entry.url_ready:
             raise RuntimeError(f"邮箱缺少接码 API URL: {entry.email}")
-        response = requests.get(
+        response = self._request_with_network_fallback(
+            "get",
+            entry,
             entry.mailbox_url,
             headers={"accept": "application/json,text/plain,*/*"},
-            proxies=self._proxies_for_entry(entry),
             timeout=self.mailbox_url_timeout,
         )
         raw = response.text or ""
@@ -1078,12 +1246,15 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             }
             data.update({key: value for key, value in extra_data.items() if value})
             try:
-                response = requests.post(
+                response = self._request_with_network_fallback(
+                    "post",
+                    entry,
                     url,
                     data=data,
-                    proxies=self._proxies_for_entry(entry),
                     timeout=25,
                 )
+            except MicrosoftMailboxNetworkError:
+                raise
             except Exception as exc:
                 errors.append(f"{name}: request failed: {str(exc)[:200]}")
                 continue
@@ -1100,7 +1271,9 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
 
     def _graph_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
         token = self._graph_access_token(entry)
-        response = requests.get(
+        response = self._request_with_network_fallback(
+            "get",
+            entry,
             GRAPH_MESSAGES_URL,
             headers={"authorization": f"Bearer {token}", "accept": "application/json"},
             params={
@@ -1108,7 +1281,6 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 "$orderby": "receivedDateTime desc",
                 "$select": "id,subject,bodyPreview,receivedDateTime,from,toRecipients,body",
             },
-            proxies=self._proxies_for_entry(entry),
             timeout=25,
         )
         if response.status_code != 200:

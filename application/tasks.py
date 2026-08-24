@@ -125,6 +125,18 @@ def _is_current_sms_phone_exhausted_error(error: object) -> bool:
     return "SMS_PHONE_EXHAUSTED" in str(error or "")
 
 
+def _is_mailbox_pool_exhausted_error(error: object) -> bool:
+    text = str(error or "")
+    return any(
+        marker in text
+        for marker in (
+            "本地微软邮箱池已用尽",
+            "邮箱列表中没有未使用账号",
+            "MAILBOX_POOL_EXHAUSTED",
+        )
+    )
+
+
 def _register_task_outcome(
     *,
     target_count: int,
@@ -173,22 +185,28 @@ _REGISTRATION_FAILURE_CATEGORIES = (
             "suspicious",
         ),
     ),
-    ("mailbox_auth", "邮箱授权失效", ("invalid_grant", "refresh_token", "unauthorized or expired")),
-    ("mailbox_otp", "邮箱取码失败", ("获取验证码", "等待验证码", "mailbox_otp")),
     (
         "proxy_network",
         "代理或网络异常",
         (
             "proxy",
+            "proxyerror",
             "proxy_network_error",
+            "mailbox_network_error",
             "proxy_or_access_blocked",
             "unsupported_region",
             "connect tunnel",
+            "tunnel connection",
             "tls connect",
+            "unable to connect to proxy",
+            "max retries exceeded",
+            "connectionpool",
             "device id",
             "curl:",
         ),
     ),
+    ("mailbox_auth", "邮箱授权失效", ("invalid_grant", "refresh_token", "unauthorized or expired")),
+    ("mailbox_otp", "邮箱取码失败", ("获取验证码", "等待验证码", "mailbox_otp")),
     (
         "phone_verification",
         "手机号验证失败",
@@ -1796,7 +1814,11 @@ def _int_config(value: Any, default: int) -> int:
         return default
 
 
-def _register_concurrency_cap(platform_name: str, extra: dict[str, Any]) -> int:
+def _register_concurrency_cap(
+    platform_name: str,
+    extra: dict[str, Any],
+    requested_concurrency: int = 1,
+) -> int:
     if str(platform_name or "").strip().lower() != "chatgpt":
         return 5
     cfg = dict((extra or {}).get("high_concurrency") or {})
@@ -1812,7 +1834,10 @@ def _register_concurrency_cap(platform_name: str, extra: dict[str, Any]) -> int:
         return 15
     if mode in {"custom", "???"} and requested > 0:
         return min(max(requested, 1), 20)
-    return 1
+    # API clients written before the profile field existed only send the
+    # top-level concurrency. Honour that value instead of silently reducing a
+    # requested five-worker task to one worker.
+    return min(max(_int_config(requested_concurrency, 1), 1), 20)
 
 def _register_retry_multiplier(extra: dict[str, Any], default: int = 3) -> int:
     identity_provider = str((extra or {}).get("identity_provider") or "").strip().lower()
@@ -2366,8 +2391,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         extra.get("complete_started_attempts"),
         False,
     )
-    concurrency_cap = _register_concurrency_cap(platform_name, extra)
     requested_concurrency = max(int(payload.get("concurrency", 1) or 1), 1)
+    concurrency_cap = _register_concurrency_cap(
+        platform_name,
+        extra,
+        requested_concurrency,
+    )
     # Email + phone registration spends most of its time waiting for SMS. A
     # target of one successful account should still be able to keep a small
     # window of independent mailbox/account attempts in flight. The account
@@ -2512,6 +2541,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     # 当某线程触发 swap 但 extras 为空时置 set —— 整个任务级别立刻停止投新任务，
     # 让正在跑的任务自然失败结束，避免下一批又抢同一条死号继续被拒。
     sms_pool_exhausted = threading.Event()
+    mailbox_pool_exhausted = threading.Event()
     if platform_name == "chatgpt" and _bool_config(
         extra.get("auto_chatgpt_plus_payment"), False
     ):
@@ -2667,13 +2697,23 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         identity_provider = normalize_identity_provider(extra.get("identity_provider", "mailbox"))
         if identity_provider == "mailbox":
             if inline_mailbox_pool_text:
-                from core.local_ms_mailbox import LocalMicrosoftMailboxPool
+                from core.local_ms_mailbox import (
+                    LocalMicrosoftMailboxPool,
+                    resolve_local_ms_mailbox_proxy,
+                )
 
                 shared_mailbox = LocalMicrosoftMailboxPool(
                     pool_text=inline_mailbox_pool_text,
                     state_file=str(extra.get("local_ms_pool_state_file") or ""),
                     allow_reuse=_bool_config(extra.get("local_ms_pool_allow_reuse"), False),
-                    proxy=registration_base_proxy or None,
+                    proxy=resolve_local_ms_mailbox_proxy(
+                        extra,
+                        registration_base_proxy or None,
+                    ),
+                    direct_fallback=_bool_config(
+                        extra.get("local_ms_proxy_direct_fallback"),
+                        True,
+                    ),
                     mailbox_url_timeout=max(_int_config(extra.get("local_ms_mailbox_url_timeout"), 15), 1),
                     mailbox_url_poll_interval=max(_int_config(extra.get("local_ms_mailbox_url_poll_interval"), 2), 1),
                 )
@@ -2686,6 +2726,18 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     extra=extra,
                     proxy=registration_base_proxy or None,
                 )
+            recover_transient = getattr(
+                shared_mailbox,
+                "recover_transient_failures",
+                None,
+            )
+            if callable(recover_transient):
+                recovered_count = int(recover_transient() or 0)
+                if recovered_count:
+                    logger.log(
+                        "邮箱池已恢复 "
+                        f"{recovered_count} 条仅因历史网络异常被占用的记录"
+                    )
     except Exception as exc:
         logger.log(f"邮箱初始化失败: {exc}", level="error")
         logger.finish(TASK_STATUS_FAILED, error=f"邮箱初始化失败: {exc}")
@@ -3195,6 +3247,9 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         except Exception as exc:
             error_code = str(getattr(exc, "code", "") or "").strip()
             error_text = str(exc)
+            failure_category, _failure_label = _registration_failure_category(exc)
+            if _is_mailbox_pool_exhausted_error(exc):
+                mailbox_pool_exhausted.set()
             email_identity_rejected = (
                 error_code in {"email_account_deactivated", "user_already_exists"}
                 or "account already exists for this email" in error_text.lower()
@@ -3202,14 +3257,21 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             mailbox_worker = getattr(platform, "_last_protocol_mailbox_worker", None)
             mailbox_account = getattr(mailbox_worker, "mailbox_account", None)
             if mailbox_account is not None and not email_account_created:
+                mailbox_failure_method = (
+                    "mark_registration_failure"
+                    if email_identity_rejected
+                    else "release_transient_failure"
+                    if failure_category == "proxy_network"
+                    else "mark_attempt_failure"
+                )
                 failure_mailbox = _resolve_mailbox_for_method(
                     shared_mailbox,
                     mailbox_account,
-                    "mark_registration_failure" if email_identity_rejected else "mark_attempt_failure",
+                    mailbox_failure_method,
                 )
                 marker = getattr(
                     failure_mailbox,
-                    "mark_registration_failure" if email_identity_rejected else "mark_attempt_failure",
+                    mailbox_failure_method,
                     None,
                 )
                 if callable(marker):
@@ -3218,6 +3280,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         if email_identity_rejected:
                             logger.log(
                                 f"邮箱身份已被远端拒绝，已淘汰当前子地址并切换下一条: {mailbox_account.email}",
+                                level="warning",
+                            )
+                        elif mailbox_failure_method == "release_transient_failure":
+                            logger.log(
+                                "邮箱取码网络异常：当前任务跳过该邮箱，"
+                                "并已释放其持久占用，下一次任务可重试",
                                 level="warning",
                             )
                     except Exception as mark_exc:
@@ -3438,6 +3506,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             # 继续被拒（用户实战日志 "开始注册第 2/1 个账号" 即此场景）。
             if sms_pool_exhausted.is_set():
                 return False
+            if mailbox_pool_exhausted.is_set():
+                return False
             # 如果配了 sms_pool_slots，slot_queue 实际可用 + 在跑数 < 待补的
             # success 缺口才能再投。slot 全死光了（chatgpt_plus_must_succeed
             # 模式下号码池+备份池全被 PayPal 拒）就不再投，避免 _do_one 的
@@ -3556,6 +3626,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             "consecutive_failures": network_failure_streak,
             "reason": network_circuit_reason,
         },
+        "mailbox_pool_exhausted": mailbox_pool_exhausted.is_set(),
     }
     if herosms_enabled:
         result_data.update({

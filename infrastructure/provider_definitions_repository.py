@@ -347,6 +347,28 @@ _BUILTIN_DEFINITIONS: list[dict] = [
                 "category": "connection",
                 "hint": "测试时可开启；批量注册建议关闭。",
             },
+            {
+                "key": "local_ms_mailbox_proxy",
+                "label": "邮箱取码代理（可选）",
+                "placeholder": "留空则由服务器直连 Microsoft",
+                "category": "connection",
+                "hint": "仅用于 Microsoft Token/Graph 取码；默认不复用 ChatGPT 注册代理。",
+            },
+            {
+                "key": "local_ms_use_registration_proxy",
+                "label": "复用注册代理取码",
+                "type": "toggle",
+                "category": "connection",
+                "hint": "仅当云服务器无法直连 Microsoft 时开启；优先建议单独填写邮箱取码代理。",
+            },
+            {
+                "key": "local_ms_proxy_direct_fallback",
+                "label": "邮箱代理失败后直连",
+                "type": "toggle",
+                "default_value": True,
+                "category": "connection",
+                "hint": "邮箱专用代理出现 407/502/503/504 或连接异常时，自动改用服务器直连。",
+            },
         ],
     },
     {

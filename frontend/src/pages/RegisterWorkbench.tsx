@@ -855,6 +855,13 @@ export default function RegisterWorkbench() {
       const count = Math.min(Math.max(Number(form.count || 1), 1), 100)
       const concurrency = Math.min(Math.max(Number(form.concurrency || 1), 1), 20)
       const extra: Record<string, any> = {
+        // The backend keeps a separate ChatGPT safety cap in `extra`.
+        // Sending only the top-level concurrency made every workbench task
+        // silently fall back to the legacy one-worker profile.
+        high_concurrency: {
+          mode: 'custom',
+          concurrency,
+        },
         identity_provider: form.identity_provider,
         oauth_provider: form.oauth_provider,
         oauth_email_hint: form.oauth_email_hint,

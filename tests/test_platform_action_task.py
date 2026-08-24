@@ -198,6 +198,46 @@ def test_chatgpt_register_task_stops_after_consecutive_network_failures(monkeypa
     )
 
 
+def test_chatgpt_register_task_stops_after_mailbox_pool_is_exhausted(monkeypatch):
+    seen = {"attempts": 0}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            seen["attempts"] += 1
+            raise RuntimeError("本地微软邮箱池已用尽: total=4")
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "require_phone_verification": True,
+                "email_pre_phone_max_attempts": 10,
+            },
+        },
+        logger,
+    )
+
+    assert seen["attempts"] == 1
+    assert logger.finished[0] == tasks_module.TASK_STATUS_FAILED
+    assert logger.result_data["mailbox_pool_exhausted"] is True
+
+
 @pytest.mark.parametrize(
     ("phone_error", "expected_status", "expected_binding", "expected_validity"),
     [
@@ -1391,6 +1431,19 @@ def test_only_typed_proxy_errors_reduce_proxy_score():
     assert tasks_module._registration_error_counts_as_proxy_failure(RuntimeError("wrong otp")) is False
 
 
+def test_microsoft_proxy_error_is_classified_as_network_before_mailbox_auth():
+    error = RuntimeError(
+        "Microsoft refresh_token 换 access_token 失败: "
+        "entra-common-delegated: request failed: ProxyError: "
+        "Tunnel connection failed: 502 Bad Gateway"
+    )
+
+    assert tasks_module._registration_failure_category(error) == (
+        "proxy_network",
+        "代理或网络异常",
+    )
+
+
 def test_chatgpt_high_concurrency_profile_caps_workers():
     assert tasks_module._register_concurrency_cap("chatgpt", {"high_concurrency": {"mode": "high"}}) == 10
     assert tasks_module._register_concurrency_cap("chatgpt", {"high_concurrency": {"mode": "extreme"}}) == 15
@@ -1398,6 +1451,7 @@ def test_chatgpt_high_concurrency_profile_caps_workers():
         "chatgpt",
         {"high_concurrency": {"mode": "custom", "concurrency": 99}},
     ) == 20
+    assert tasks_module._register_concurrency_cap("chatgpt", {}, 5) == 5
     assert tasks_module._register_retry_multiplier(
         {"high_concurrency": {"retry_multiplier": 99}}
     ) == 8

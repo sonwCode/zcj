@@ -116,6 +116,14 @@ class FallbackMailbox(BaseMailbox):
             before_ids=before_ids,
         )
 
+    def recover_transient_failures(self) -> int:
+        recovered = 0
+        for _provider_key, mailbox in self.providers:
+            recover = getattr(mailbox, "recover_transient_failures", None)
+            if callable(recover):
+                recovered += int(recover() or 0)
+        return recovered
+
 
 def _extract_verification_link(text: str, keyword: str = "") -> str | None:
     combined = str(text or "")
@@ -258,7 +266,10 @@ def _create_outlook_email(extra: dict, proxy: str | None) -> 'BaseMailbox':
 
 
 def _create_local_ms_pool(extra: dict, proxy: str | None) -> 'BaseMailbox':
-    from core.local_ms_mailbox import LocalMicrosoftMailboxPool
+    from core.local_ms_mailbox import (
+        LocalMicrosoftMailboxPool,
+        resolve_local_ms_mailbox_proxy,
+    )
 
     return LocalMicrosoftMailboxPool(
         pool_text=extra.get("local_ms_pool_text", ""),
@@ -266,7 +277,7 @@ def _create_local_ms_pool(extra: dict, proxy: str | None) -> 'BaseMailbox':
         state_file=extra.get("local_ms_pool_state_file", ""),
         graph_scope=extra.get("local_ms_graph_scope", ""),
         allow_reuse=str(extra.get("local_ms_pool_allow_reuse", "")).strip().lower() in {"1", "true", "yes", "on"},
-        proxy=proxy,
+        proxy=resolve_local_ms_mailbox_proxy(extra, proxy),
         mailbox_url_timeout=extra.get("local_ms_mailbox_url_timeout", 15),
         mailbox_url_poll_interval=extra.get("local_ms_mailbox_url_poll_interval", 2),
         provider_name=extra.get("_provider_key") or extra.get("mailbox_provider_key") or "local_ms_pool",
@@ -277,6 +288,10 @@ def _create_local_ms_pool(extra: dict, proxy: str | None) -> 'BaseMailbox':
             "mailbox_alias_count",
             extra.get("gmail_alias_count", 1),
         ),
+        direct_fallback=str(
+            extra.get("local_ms_proxy_direct_fallback", "true")
+        ).strip().lower() in {"1", "true", "yes", "on"},
+        network_attempts=extra.get("local_ms_network_attempts", 2),
     )
 
 

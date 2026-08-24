@@ -1,6 +1,7 @@
 import json
 
 import pytest
+import requests
 
 from core.base_mailbox import MailboxAccount
 from core.local_ms_mailbox import (
@@ -43,6 +44,68 @@ def test_local_ms_pool_entry_proxy_overrides_provider_proxy(monkeypatch):
         "http": "http://entry-user:entry-pass@entry.example:9000",
         "https": "http://entry-user:entry-pass@entry.example:9000",
     }]
+
+
+def test_local_ms_pool_proxy_failure_falls_back_to_direct(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"access_token":"token"}'
+
+        def json(self):
+            return {"access_token": "token"}
+
+    def fake_post(url, data, proxies=None, timeout=None):
+        calls.append(proxies)
+        if proxies:
+            raise requests.exceptions.ProxyError("tunnel failed")
+        return FakeResponse()
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.post", fake_post)
+    pool = LocalMicrosoftMailboxPool(proxy="http://mailbox-proxy.example:8000")
+    entry = LocalMicrosoftMailboxEntry(
+        email="user@example.com",
+        client_id="client-id",
+        refresh_token="refresh-token",
+    )
+
+    assert pool._graph_access_token(entry) == "token"
+    assert calls == [
+        {
+            "http": "http://mailbox-proxy.example:8000",
+            "https": "http://mailbox-proxy.example:8000",
+        },
+        None,
+    ]
+
+
+def test_local_ms_pool_factory_does_not_reuse_registration_proxy_by_default():
+    from core.base_mailbox import _create_local_ms_pool
+
+    pool = _create_local_ms_pool(
+        {"local_ms_pool_text": "user@example.com----pass----client----refresh"},
+        "http://registration-proxy.example:9000",
+    )
+
+    assert pool.proxy is None
+
+
+def test_local_ms_pool_factory_can_explicitly_reuse_registration_proxy():
+    from core.base_mailbox import _create_local_ms_pool
+
+    pool = _create_local_ms_pool(
+        {
+            "local_ms_pool_text": "user@example.com----pass----client----refresh",
+            "local_ms_use_registration_proxy": True,
+        },
+        "http://registration-proxy.example:9000",
+    )
+
+    assert pool.proxy == {
+        "http": "http://registration-proxy.example:9000",
+        "https": "http://registration-proxy.example:9000",
+    }
 
 
 def test_split_unused_local_ms_pool_rows_filters_used_and_duplicates(tmp_path):
@@ -457,6 +520,77 @@ def test_local_ms_pool_inventory_records_failure_and_success(tmp_path):
     assert "invalid_grant" in first_item["reason"]
     assert second_item["status"] == "used"
     assert second_item["completed_at"]
+
+
+def test_transient_network_failure_is_released_but_retired_for_current_task(tmp_path):
+    state_file = tmp_path / "state.json"
+    pool_text = (
+        "first@hotmail.com----https://example.test/first\n"
+        "second@hotmail.com----https://example.test/second"
+    )
+    pool = LocalMicrosoftMailboxPool(
+        pool_text=pool_text,
+        state_file=str(state_file),
+    )
+
+    first = pool.get_email()
+    assert first.email == "first@hotmail.com"
+    assert pool.release_transient_failure(
+        first,
+        "mailbox_network_error: ProxyError",
+    ) is True
+    assert pool.get_email().email == "second@hotmail.com"
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert "first@hotmail.com" not in state["used"]
+    assert state["failures"]["first@hotmail.com"]["reason_code"] == "transient_network"
+
+    next_task_pool = LocalMicrosoftMailboxPool(
+        pool_text=pool_text,
+        state_file=str(state_file),
+    )
+    assert next_task_pool.get_email().email == "first@hotmail.com"
+
+
+def test_recover_transient_failures_releases_stale_network_reservation(tmp_path):
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "used": {
+                    "first@hotmail.com": {
+                        "email": "first@hotmail.com",
+                        "reserved_at": "2026-08-24T00:00:00Z",
+                    },
+                    "successful@hotmail.com": {
+                        "email": "successful@hotmail.com",
+                        "outcome": "success",
+                        "completed_at": "2026-08-24T00:01:00Z",
+                    },
+                },
+                "blocked": {},
+                "failures": {
+                    "first@hotmail.com": {
+                        "reason": "Microsoft refresh_token failed: ProxyError: tunnel connection failed",
+                        "reason_code": "registration_failed",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    pool = LocalMicrosoftMailboxPool(
+        pool_text=(
+            "first@hotmail.com----https://example.test/first\n"
+            "successful@hotmail.com----https://example.test/success"
+        ),
+        state_file=str(state_file),
+    )
+
+    assert pool.recover_transient_failures() == 1
+    assert pool.get_email().email == "first@hotmail.com"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["used"]["successful@hotmail.com"]["outcome"] == "success"
 
 
 def test_graph_access_token_tries_fallback_endpoint(monkeypatch):
