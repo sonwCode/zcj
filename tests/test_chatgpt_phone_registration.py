@@ -1003,6 +1003,133 @@ def test_email_phone_worker_restores_account_scoped_cookie_context():
     )
 
 
+def test_email_phone_worker_continues_account_chooser_with_exact_account(monkeypatch):
+    account_id = "account-current"
+    selected = []
+    cookie_payload = protocol_phone_module.base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "workspaces": [
+                    {"id": "workspace-other", "account_id": "account-other"},
+                    {"id": "workspace-current", "account_id": account_id},
+                ]
+            }
+        ).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+
+    class Response:
+        def __init__(self, status_code, *, url="", payload=None, headers=None):
+            self.status_code = status_code
+            self.url = url
+            self._payload = payload or {}
+            self.headers = headers or {}
+
+        def json(self):
+            return self._payload
+
+    class Session:
+        def __init__(self):
+            self.cookies = _CookieJar()
+            self.cookies.set("oai-did", "did-current")
+            self.cookies.set("oai-client-auth-session", cookie_payload + ".signature")
+
+        def get(self, url, **kwargs):
+            assert "client_auth_session_dump" not in url
+            return Response(200, url="https://auth.openai.com/choose-an-account")
+
+        def post(self, url, **kwargs):
+            selected.append(json.loads(kwargs["data"])["workspace_id"])
+            return Response(
+                200,
+                url=url,
+                payload={
+                    "continue_url": "/add-phone",
+                    "page": {"type": "add_phone", "payload": {"channel": "sms"}},
+                },
+            )
+
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            self.session = Session()
+            self._device_id = ""
+            self._authorize_final_url = ""
+            self._otp_page_type = ""
+            self._otp_continue_url = ""
+
+        def _init_session(self):
+            return True
+
+    monkeypatch.setattr(protocol_phone_module, "RegistrationEngine", FakeEngine)
+    monkeypatch.setattr(
+        protocol_phone_module,
+        "generate_oauth_url",
+        lambda **kwargs: SimpleNamespace(
+            auth_url="https://auth.openai.com/oauth/authorize",
+            state="STATE",
+            code_verifier="VERIFIER",
+        ),
+    )
+    worker = ChatGPTProtocolEmailThenPhoneWorker(
+        email_service=SimpleNamespace(),
+        phone_callback=lambda: (_ for _ in ()).throw(
+            AssertionError("chooser continuation must not rent a phone")
+        ),
+        existing_account_id=account_id,
+        log_fn=lambda message: None,
+    )
+
+    engine, add_phone_url, payload = worker._open_phone_challenge(
+        email="user@example.com",
+        password="Secret123!",
+    )
+
+    assert selected == ["workspace-current"]
+    assert add_phone_url == "https://auth.openai.com/add-phone"
+    assert payload == {"channel": "sms"}
+    assert engine._otp_page_type == "add_phone"
+    assert engine._otp_continue_url == add_phone_url
+
+
+def test_email_phone_worker_rejects_ambiguous_account_chooser():
+    candidates = [
+        {"id": "workspace-one", "account_id": "account-one"},
+        {"id": "workspace-two", "account_id": "account-two"},
+    ]
+    post_calls = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"workspaces": candidates}
+
+    class Session:
+        cookies = _CookieJar()
+
+        def get(self, url, **kwargs):
+            assert url.endswith("/api/accounts/client_auth_session_dump")
+            return Response()
+
+        def post(self, url, **kwargs):
+            post_calls.append((url, kwargs))
+            raise AssertionError("ambiguous chooser must not select an account")
+
+    worker = ChatGPTProtocolEmailThenPhoneWorker(
+        email_service=SimpleNamespace(),
+        phone_callback=lambda: "",
+        existing_account_id="account-missing",
+        log_fn=lambda message: None,
+    )
+
+    with pytest.raises(RuntimeError, match="多个账号.*未找到当前账号"):
+        worker._select_authorization_workspace(
+            SimpleNamespace(session=Session()),
+            "https://auth.openai.com/choose-an-account",
+        )
+
+    assert post_calls == []
+
+
 def test_email_phone_worker_stops_on_account_deactivated_without_changing_number(monkeypatch):
     class Callback:
         def __init__(self):

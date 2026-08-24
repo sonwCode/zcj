@@ -901,6 +901,7 @@ class ChatGPTPlatform(BasePlatform):
             cancel_check=self.is_cancel_requested,
             max_phone_attempts=1,
             require_codex_refresh_token=True,
+            existing_account_id=str(getattr(account, "user_id", "") or ""),
             existing_device_id=str(
                 getattr(mailbox_worker.engine, "_device_id", "")
                 or (getattr(account, "extra", {}) or {}).get("oai_device_id")
@@ -998,6 +999,7 @@ class ChatGPTPlatform(BasePlatform):
             cancel_check=self.is_cancel_requested,
             max_phone_attempts=min(max(int(max_phone_attempts or 3), 1), 20),
             require_codex_refresh_token=require_rt,
+            existing_account_id=str(getattr(account, "user_id", "") or ""),
             existing_device_id=str(
                 getattr(mailbox_worker.engine, "_device_id", "")
                 or (getattr(account, "extra", {}) or {}).get("oai_device_id")
@@ -2024,6 +2026,17 @@ class ChatGPTPlatform(BasePlatform):
                         log_fn=log_fn,
                         cancel_check=cancel_fn,
                         max_phone_attempts=1,
+                        existing_account_id=str(account.user_id or ""),
+                        existing_device_id=str(
+                            (getattr(account, "extra", {}) or {}).get("oai_device_id")
+                            or ""
+                        ),
+                        existing_auth_cookies=(
+                            (getattr(account, "extra", {}) or {}).get("auth_cookies")
+                            or (getattr(account, "extra", {}) or {}).get("cookies")
+                            or ""
+                        ),
+                        proxy_country=str(getattr(account, "region", "") or ""),
                     ).run_for_account(email=account.email, password=account.password)
                     protocol_refresh_token = str(protocol_result.get("refresh_token") or "")
                     if protocol_refresh_token:

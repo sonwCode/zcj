@@ -926,6 +926,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
         cancel_check=None,
         max_phone_attempts: int = 3,
         require_codex_refresh_token: bool = True,
+        existing_account_id: str = "",
         existing_device_id: str = "",
         existing_auth_cookies=None,
         proxy_country: str = "",
@@ -941,6 +942,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
         )
         self.email_service = email_service
         self.require_codex_refresh_token = bool(require_codex_refresh_token)
+        self.existing_account_id = str(existing_account_id or "").strip()
         self.existing_device_id = str(existing_device_id or "").strip()
         self.existing_auth_cookies = _parse_cookie_records(existing_auth_cookies)
         self._auth_generation = 0
@@ -1054,6 +1056,201 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
             )
         }
 
+    @staticmethod
+    def _workspace_identifiers(workspace: dict) -> set[str]:
+        """Return account/workspace identifiers without trusting display labels."""
+        identifiers: set[str] = set()
+        if not isinstance(workspace, dict):
+            return identifiers
+        for key in (
+            "id",
+            "workspace_id",
+            "workspaceId",
+            "account_id",
+            "accountId",
+            "user_id",
+            "userId",
+        ):
+            value = workspace.get(key)
+            if value is not None and str(value).strip():
+                identifiers.add(str(value).strip())
+        for key in ("workspace", "account", "user"):
+            nested = workspace.get(key)
+            if isinstance(nested, dict):
+                identifiers.update(
+                    ChatGPTProtocolEmailThenPhoneWorker._workspace_identifiers(nested)
+                )
+        return identifiers
+
+    @staticmethod
+    def _workspace_id(workspace: dict) -> str:
+        if not isinstance(workspace, dict):
+            return ""
+        return str(
+            workspace.get("id")
+            or workspace.get("workspace_id")
+            or workspace.get("workspaceId")
+            or ""
+        ).strip()
+
+    def _authorization_workspaces(
+        self,
+        engine: RegistrationEngine,
+        referer: str,
+    ) -> list[dict]:
+        """Read the server-side chooser candidates for the current OAuth session."""
+        session_cookie = _cookie_value(engine.session, "oai-client-auth-session")
+        session_data = _decode_client_auth_session(session_cookie)
+        workspaces = [
+            dict(item)
+            for item in list(session_data.get("workspaces") or [])
+            if isinstance(item, dict) and self._workspace_id(item)
+        ]
+
+        # The cookie can lag behind the server-side transaction. Read the dump
+        # whenever it is empty or cannot uniquely identify the persisted account.
+        exact_cookie_match = bool(
+            self.existing_account_id
+            and any(
+                self.existing_account_id in self._workspace_identifiers(item)
+                for item in workspaces
+            )
+        )
+        if not workspaces or (len(workspaces) > 1 and not exact_cookie_match):
+            dump_response = engine.session.get(
+                f"{OPENAI_AUTH}/api/accounts/client_auth_session_dump",
+                headers={"accept": "application/json", "referer": referer},
+                timeout=20,
+            )
+            self._log(f"OAuth 账号选择会话读取状态: {dump_response.status_code}")
+            if dump_response.status_code < 400:
+                try:
+                    dump_data = dump_response.json() or {}
+                except Exception:
+                    dump_data = {}
+                dump_payload = (
+                    dump_data.get("data")
+                    if isinstance(dump_data.get("data"), dict)
+                    else {}
+                )
+                dumped = dump_data.get("workspaces") or dump_payload.get("workspaces") or []
+                parsed_dump = [
+                    dict(item)
+                    for item in list(dumped)
+                    if isinstance(item, dict) and self._workspace_id(item)
+                ]
+                if parsed_dump:
+                    workspaces = parsed_dump
+
+        deduplicated: list[dict] = []
+        seen: set[str] = set()
+        for workspace in workspaces:
+            workspace_id = self._workspace_id(workspace)
+            if not workspace_id or workspace_id in seen:
+                continue
+            seen.add(workspace_id)
+            deduplicated.append(workspace)
+        return deduplicated
+
+    def _select_authorization_workspace(
+        self,
+        engine: RegistrationEngine,
+        referer: str,
+    ) -> tuple[str, str, dict]:
+        """Select only the current persisted account on an OAuth chooser page.
+
+        A single candidate is safe because the restored cookie jar belongs to
+        the account being completed. With multiple candidates we require an
+        exact account-id match so concurrent registrations cannot cross-link.
+        """
+        workspaces = self._authorization_workspaces(engine, referer)
+        if not workspaces:
+            raise RuntimeError("OAuth 账号选择页没有可选择的账号")
+
+        selected: dict | None = None
+        selection_mode = "single_session_candidate"
+        if self.existing_account_id:
+            matches = [
+                item
+                for item in workspaces
+                if self.existing_account_id in self._workspace_identifiers(item)
+            ]
+            if len(matches) == 1:
+                selected = matches[0]
+                selection_mode = "exact_account_id"
+            elif len(matches) > 1:
+                raise RuntimeError("OAuth 账号选择页出现重复的当前账号，已停止以避免串号")
+        if selected is None:
+            if len(workspaces) != 1:
+                raise RuntimeError(
+                    "OAuth 账号选择页包含多个账号，但未找到当前账号，已停止以避免串号"
+                )
+            selected = workspaces[0]
+
+        workspace_id = self._workspace_id(selected)
+        select_response = engine.session.post(
+            OPENAI_API_ENDPOINTS["select_workspace"],
+            headers={
+                "accept": "application/json",
+                "content-type": "application/json",
+                "origin": OPENAI_AUTH,
+                "referer": referer,
+            },
+            data=json.dumps({"workspace_id": workspace_id}),
+            allow_redirects=False,
+            timeout=20,
+        )
+        self._log(
+            "OAuth 当前账号自动选择状态: "
+            f"{select_response.status_code} mode={selection_mode} candidates={len(workspaces)}"
+        )
+        if select_response.status_code >= 400:
+            code, message = _response_error(select_response)
+            raise RuntimeError(
+                message
+                or code
+                or f"OAuth 当前账号选择失败: HTTP {select_response.status_code}"
+            )
+
+        try:
+            select_data = select_response.json() or {}
+        except Exception:
+            select_data = {}
+        page_type, continue_url, page_payload = self._page_state(select_response)
+        headers = getattr(select_response, "headers", {}) or {}
+        location = str(headers.get("Location") or headers.get("location") or "").strip()
+        next_url = location or continue_url or _find_callback_url(select_data)
+        if not next_url and page_type == "add_phone":
+            next_url = "/add-phone"
+        if not next_url:
+            raise RuntimeError("OAuth 当前账号选择成功，但响应缺少后续地址")
+        return urljoin(referer, next_url), page_type, page_payload
+
+    def _continue_account_chooser(
+        self,
+        engine: RegistrationEngine,
+        chooser_url: str,
+    ) -> tuple[str, str, dict]:
+        """Select the account and resolve one server redirect into a flow page."""
+        next_url, page_type, page_payload = self._select_authorization_workspace(
+            engine,
+            chooser_url,
+        )
+        if (
+            page_type == "add_phone"
+            or "/add-phone" in next_url
+            or "code=" in next_url
+            or "consent" in next_url
+        ):
+            return next_url, page_type, page_payload
+
+        response = engine.session.get(next_url, allow_redirects=True, timeout=30)
+        final_url = str(getattr(response, "url", "") or next_url)
+        resolved_type, resolved_url, resolved_payload = self._page_state(response)
+        if resolved_url:
+            final_url = urljoin(final_url, resolved_url)
+        return final_url, resolved_type, resolved_payload
+
     def _open_phone_challenge(self, *, email: str, password: str) -> tuple[RegistrationEngine, str, dict]:
         self._auth_generation += 1
         engine = RegistrationEngine(
@@ -1094,6 +1291,25 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
             f"generation={self._auth_generation} "
             f"proxy_country={self.proxy_country or 'unknown'}"
         )
+
+        page_type = ""
+        page_payload: dict = {}
+        if "/choose-an-account" in final_url:
+            self._log("手机号授权进入账号选择页，正在续接当前注册账号")
+            final_url, page_type, page_payload = self._continue_account_chooser(
+                engine,
+                final_url,
+            )
+            engine._authorize_final_url = final_url
+            if page_type:
+                engine._otp_page_type = page_type
+            if page_type == "add_phone" or "/add-phone" in final_url:
+                engine._otp_continue_url = final_url
+                return engine, final_url, page_payload
+            if "code=" in final_url or "consent" in final_url:
+                return engine, "", {"already_verified": True, **page_payload}
+            if "/choose-an-account" in final_url:
+                raise RuntimeError("OAuth 当前账号选择后仍停留在账号选择页")
 
         if "/add-phone" in final_url:
             return engine, final_url, {}
@@ -1276,58 +1492,10 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                 "consent" in consent_url
                 or str(page.get("type") or "") in {"consent", "sign_in_with_chatgpt_codex_consent"}
             ):
-                session_cookie = str(engine.session.cookies.get("oai-client-auth-session") or "")
-                session_data = _decode_client_auth_session(session_cookie)
-                workspaces = list(session_data.get("workspaces") or [])
-                if not workspaces:
-                    dump_response = engine.session.get(
-                        f"{OPENAI_AUTH}/api/accounts/client_auth_session_dump",
-                        headers={"accept": "application/json", "referer": consent_url},
-                        timeout=20,
-                    )
-                    self._log(f"Codex OAuth 授权会话读取状态: {dump_response.status_code}")
-                    if dump_response.status_code < 400:
-                        try:
-                            dump_data = dump_response.json() or {}
-                        except Exception:
-                            dump_data = {}
-                        workspaces = list(dump_data.get("workspaces") or [])
-                workspace_id = str((workspaces[0] or {}).get("id") or "").strip() if workspaces else ""
-                if workspace_id:
-                    select_response = engine.session.post(
-                        f"{OPENAI_AUTH}/api/accounts/workspace/select",
-                        headers={
-                            "accept": "application/json",
-                            "content-type": "application/json",
-                            "origin": OPENAI_AUTH,
-                            "referer": consent_url,
-                        },
-                        data=json.dumps({"workspace_id": workspace_id}),
-                        allow_redirects=False,
-                        timeout=20,
-                    )
-                    self._log(f"Codex OAuth 授权账户选择状态: {select_response.status_code}")
-                    select_location = str(
-                        select_response.headers.get("Location")
-                        or select_response.headers.get("location")
-                        or ""
-                    ).strip()
-                    if not select_location:
-                        try:
-                            select_data = select_response.json() or {}
-                        except Exception:
-                            select_data = {}
-                        select_page = select_data.get("page") if isinstance(select_data.get("page"), dict) else {}
-                        select_payload = select_page.get("payload") if isinstance(select_page.get("payload"), dict) else {}
-                        select_location = str(
-                            select_data.get("continue_url")
-                            or select_payload.get("continue_url")
-                            or select_payload.get("url")
-                            or ""
-                        ).strip()
-                    if select_location:
-                        current_url = urljoin(consent_url, select_location)
-                        continue
+                current_url, _selected_type, _selected_payload = (
+                    self._select_authorization_workspace(engine, consent_url)
+                )
+                continue
             break
 
         self._log("Codex OAuth 未找到有效 callback", "warning")
