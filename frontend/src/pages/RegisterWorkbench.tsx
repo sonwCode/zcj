@@ -486,6 +486,35 @@ export default function RegisterWorkbench() {
     () => buildRegistrationOptions(currentPlatform, language),
     [currentPlatform, language],
   )
+  const registrationFlowOptions = useMemo(() => registrationOptions.flatMap((option) => {
+    if (form.platform === 'chatgpt' && option.identityProvider === 'mailbox') {
+      return [
+        {
+          ...option,
+          key: `${option.key}:email`,
+          label: '系统邮箱',
+          description: '只使用系统邮箱和邮箱验证码完成注册，不租用手机号',
+          requiresPhoneVerification: false as boolean | null,
+        },
+        {
+          ...option,
+          key: `${option.key}:email_then_phone`,
+          label: '邮箱 + 手机验证',
+          description: '先用系统邮箱注册，再接码完成手机验证并获取 Codex RT',
+          requiresPhoneVerification: true as boolean | null,
+        },
+      ]
+    }
+    if (form.platform === 'chatgpt' && option.identityProvider === 'phone') {
+      return [{
+        ...option,
+        label: '手机号注册',
+        description: '先接码完成手机号注册，可在完成后继续绑定邮箱',
+        requiresPhoneVerification: null as boolean | null,
+      }]
+    }
+    return [{ ...option, requiresPhoneVerification: null as boolean | null }]
+  }), [form.platform, registrationOptions])
   const reusableOAuthBrowser = hasReusableOAuthBrowser({
     chrome_user_data_dir: form.chrome_user_data_dir,
     chrome_cdp_url: form.chrome_cdp_url,
@@ -1076,23 +1105,40 @@ export default function RegisterWorkbench() {
               {optionsError ? (
                 <div className="mb-4 rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-300">{optionsError}</div>
               ) : null}
-              <div className="grid gap-3 md:grid-cols-2">
-                {registrationOptions.map(option => {
-                  const active = form.identity_provider === option.identityProvider && form.oauth_provider === option.oauthProvider
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                {registrationFlowOptions.map(option => {
+                  const phoneVerificationActive = Boolean(form.require_phone_verification || form.sub2api_auto_sync)
+                  const active = form.identity_provider === option.identityProvider
+                    && form.oauth_provider === option.oauthProvider
+                    && (option.requiresPhoneVerification === null
+                      || option.requiresPhoneVerification === phoneVerificationActive)
                   const IdentityIcon = option.identityProvider === 'phone'
                     ? Smartphone
                     : option.identityProvider === 'mailbox'
-                      ? Mail
+                      ? option.requiresPhoneVerification
+                        ? MailCheck
+                        : Mail
                       : ShieldCheck
                   return (
                     <button
                       key={option.key}
                       type="button"
-                      onClick={() => setForm(current => ({
-                        ...current,
-                        identity_provider: option.identityProvider,
-                        oauth_provider: option.oauthProvider,
-                      }))}
+                      aria-pressed={active}
+                      onClick={() => setForm(current => {
+                        const controlsPhoneVerification = option.requiresPhoneVerification !== null
+                        const requiresPhoneVerification = option.requiresPhoneVerification === true
+                        return {
+                          ...current,
+                          identity_provider: option.identityProvider,
+                          oauth_provider: option.oauthProvider,
+                          require_phone_verification: controlsPhoneVerification
+                            ? requiresPhoneVerification
+                            : false,
+                          sub2api_auto_sync: controlsPhoneVerification && requiresPhoneVerification
+                            ? current.sub2api_auto_sync
+                            : false,
+                        }
+                      })}
                       className={`rounded-xl border p-4 text-left transition-colors ${
                         active
                           ? 'border-[var(--accent-edge)] bg-[var(--accent-soft)]'
@@ -1103,8 +1149,11 @@ export default function RegisterWorkbench() {
                         <span className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${active ? 'bg-[var(--bg-pane)] text-[var(--text-accent)]' : 'bg-[var(--bg-hover)] text-[var(--text-secondary)]'}`}>
                           <IdentityIcon className="h-4 w-4" />
                         </span>
-                        <span>
-                          <span className="block text-sm font-medium text-[var(--text-primary)]">{option.label}</span>
+                        <span className="min-w-0">
+                          <span className="flex flex-wrap items-center gap-2 text-sm font-medium text-[var(--text-primary)]">
+                            {option.label}
+                            {option.requiresPhoneVerification === true ? <Badge variant="success">Codex RT</Badge> : null}
+                          </span>
                           <span className="mt-1 block text-xs leading-5 text-[var(--text-muted)]">{option.description}</span>
                         </span>
                       </div>
@@ -1113,7 +1162,28 @@ export default function RegisterWorkbench() {
                 })}
               </div>
 
-              {form.identity_provider === 'phone' ? (
+              {form.identity_provider === 'mailbox' ? (
+                <div className="mt-4 flex flex-wrap items-center justify-center gap-2 rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] px-3 py-3 text-center text-xs text-[var(--text-secondary)]">
+                  <span className="flex items-center gap-1.5"><Mail className="h-4 w-4" />系统邮箱</span>
+                  <ArrowRight className="h-4 w-4 text-[var(--text-muted)]" />
+                  <span>邮箱 OTP</span>
+                  {needsSms ? (
+                    <>
+                      <ArrowRight className="h-4 w-4 text-[var(--text-muted)]" />
+                      <span className="flex items-center gap-1.5"><Smartphone className="h-4 w-4" />手机号</span>
+                      <ArrowRight className="h-4 w-4 text-[var(--text-muted)]" />
+                      <span>短信 OTP</span>
+                      <ArrowRight className="h-4 w-4 text-[var(--text-muted)]" />
+                      <span className="flex items-center gap-1.5"><ShieldCheck className="h-4 w-4" />Codex RT</span>
+                    </>
+                  ) : (
+                    <>
+                      <ArrowRight className="h-4 w-4 text-[var(--text-muted)]" />
+                      <span className="flex items-center gap-1.5"><CheckCircle className="h-4 w-4" />完成注册</span>
+                    </>
+                  )}
+                </div>
+              ) : form.identity_provider === 'phone' ? (
                 <div className="mt-4 grid grid-cols-[1fr_auto_1fr_auto_1fr] items-center gap-2 rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] px-3 py-3 text-center text-xs text-[var(--text-secondary)]">
                   <span className="flex items-center justify-center gap-1.5"><Smartphone className="h-4 w-4" />手机号</span>
                   <ArrowRight className="h-4 w-4 text-[var(--text-muted)]" />
@@ -1143,19 +1213,6 @@ export default function RegisterWorkbench() {
                     <div className="text-sm text-amber-300">没有可用邮箱服务，请先到设置中启用 Provider。</div>
                   )}
                   {currentMailboxProvider?.description ? <p className="mt-3 text-xs leading-5 text-[var(--text-muted)]">{currentMailboxProvider.description}</p> : null}
-                  {form.platform === 'chatgpt' && form.identity_provider === 'mailbox' ? (
-                    <div className="mt-4">
-                      <ToggleRow
-                        label="注册完成后继续手机号验证"
-                        description={form.sub2api_auto_sync
-                          ? 'Sub2 自动交付已开启，此步骤为必需流程；关闭 Sub2 后可单独关闭'
-                          : '开启后才会租用号码，并显示实时国家、价格和 Provider 档位选择'}
-                        checked={Boolean(form.require_phone_verification || form.sub2api_auto_sync)}
-                        onChange={checked => set('require_phone_verification', checked)}
-                        disabled={Boolean(form.sub2api_auto_sync)}
-                      />
-                    </div>
-                  ) : null}
                   {form.identity_provider === 'phone' ? (
                     <div className="mt-4 grid gap-4 md:grid-cols-2">
                       <ToggleRow
