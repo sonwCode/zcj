@@ -107,6 +107,7 @@ const DEFAULT_FORM: Record<string, any> = {
   sms_country: '',
   sms_countries: '',
   sms_max_price: '',
+  sms_bulk_price_cny: '',
   smsbower_provider_ids_by_country: {},
   smsbower_auto_country_min_stock: 1,
   sms_usd_cny_rate: 7.2,
@@ -702,6 +703,7 @@ export default function RegisterWorkbench() {
     country: selectedSmsCountry(form) || smsCountries[0] || '187',
     countries: smsCountries,
     maxPriceUsd: String(form.sms_max_price || form.smsbower_max_price || '0.13'),
+    bulkPriceCny: String(form.sms_bulk_price_cny || ''),
     providerIdsByCountry: smsBowerProviderIdsByCountry,
     minStock: Math.max(numberOr(form.smsbower_auto_country_min_stock, 1), 0),
     usdCnyRate: Math.max(numberOr(form.sms_usd_cny_rate, 7.2), 0.01),
@@ -720,6 +722,7 @@ export default function RegisterWorkbench() {
         next.sms_max_price = patch.maxPriceUsd
         next.smsbower_max_price = patch.maxPriceUsd
       }
+      if (patch.bulkPriceCny !== undefined) next.sms_bulk_price_cny = patch.bulkPriceCny
       if (patch.providerIdsByCountry !== undefined) {
         next.smsbower_provider_ids_by_country = patch.providerIdsByCountry
       }
@@ -738,11 +741,18 @@ export default function RegisterWorkbench() {
     : registrationOptions.find(option => (
       option.identityProvider === form.identity_provider && option.oauthProvider === form.oauth_provider
     ))?.label || '-'
+  const smsBowerProviderTierCount = Object.values(smsBowerProviderIdsByCountry)
+    .reduce((total, ids) => total + ids.length, 0)
   const summarySms = !needsSms
     ? ''
     : isSmsBower
-      ? `SMSBower · ${smsCountries.length} 国 · ${Number(smsBowerSelection.maxPriceUsd || 0) > 0 ? `≤ $${smsBowerSelection.maxPriceUsd}` : '不限价'}`
+      ? `SMSBower · ${smsCountries.length} 国${smsBowerProviderTierCount > 0 ? ` / ${smsBowerProviderTierCount} 档` : ''}`
       : currentSmsProvider?.label || form.sms_provider || '-'
+  const summarySmsPrice = Number(smsBowerSelection.bulkPriceCny || 0) > 0
+    ? `人民币筛选 ≤ ¥${smsBowerSelection.bulkPriceCny} · 下单上限 $${smsBowerSelection.maxPriceUsd}`
+    : Number(smsBowerSelection.maxPriceUsd || 0) > 0
+      ? `下单上限 $${smsBowerSelection.maxPriceUsd}`
+      : '不限价'
   const summaryExecutor = executorOptions.find(option => option.value === form.executor_type)?.label || '-'
   const summaryVerification = getCaptchaStrategyLabel(
     form.executor_type,
@@ -918,11 +928,14 @@ export default function RegisterWorkbench() {
             .filter(([, ids]) => ids.length > 0),
         )
         const maxPrice = String(form.sms_max_price || form.smsbower_max_price || '0.13').trim()
+        const bulkPriceCny = String(form.sms_bulk_price_cny || '').trim()
         extra.sms_service = 'dr'
         extra.sms_country = selectedCountryIds[0]
         extra.sms_countries = selectedCountryIds.join(',')
         extra.sms_max_price = maxPrice
         extra.smsbower_max_price = maxPrice
+        if (Number(bulkPriceCny) > 0) extra.sms_bulk_price_cny = bulkPriceCny
+        else delete extra.sms_bulk_price_cny
         extra.smsbower_provider_ids_by_country = selectedProviderIdsByCountry
         extra.smsbower_allow_virtual = false
         extra.smsbower_auto_country = false
@@ -1512,6 +1525,7 @@ export default function RegisterWorkbench() {
                     ['目标', `${Math.max(Number(form.count || 0), 0)} 个 · 并发 ${Math.max(Number(form.concurrency || 1), 1)}`],
                     ['身份', summaryRegistration],
                     ...(needsSms ? [['接码', summarySms]] : []),
+                    ...(needsSms && isSmsBower ? [['价格', summarySmsPrice]] : []),
                     ['执行', summaryExecutor],
                     ['线路', form.proxy ? '手动代理' : form.proxy_strategy === 'direct' ? '直连' : `${form.proxy_strategy} · ${requiredProxyRegion || '自动地区'}`],
                     ['首次质检', `${Number(form.post_registration_liveness_delay_seconds || 0)} 秒后`],

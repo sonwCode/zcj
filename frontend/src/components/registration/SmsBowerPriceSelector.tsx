@@ -41,6 +41,7 @@ export type SmsBowerSelectionValue = {
   country: string
   countries: string[]
   maxPriceUsd: string
+  bulkPriceCny: string
   providerIdsByCountry: Record<string, string[]>
   minStock: number
   usdCnyRate: number
@@ -102,6 +103,14 @@ function formatUsd(value: number) {
   return Number(value || 0).toFixed(4).replace(/0+$/, '').replace(/\.$/, '') || '0'
 }
 
+function formatCny(value: number) {
+  return Number(value || 0).toLocaleString('zh-CN', {
+    useGrouping: false,
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4,
+  })
+}
+
 function uniqueStrings(values: unknown[]) {
   return Array.from(new Set(values.map(value => String(value || '').trim()).filter(Boolean)))
 }
@@ -117,7 +126,7 @@ export function SmsBowerPriceSelector({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [bulkPriceCny, setBulkPriceCny] = useState('1')
+  const [bulkPriceCny, setBulkPriceCny] = useState(value.bulkPriceCny || '1')
   const [search, setSearch] = useState('')
   const [countryFilter, setCountryFilter] = useState<'all' | 'within_price' | 'selected'>('all')
   const [countrySort, setCountrySort] = useState<CountrySortKey>('recommended')
@@ -244,6 +253,10 @@ export function SmsBowerPriceSelector({
   }, [countryFilter, countrySort, deferredSearch, priceRows])
 
   useEffect(() => {
+    if (value.bulkPriceCny) setBulkPriceCny(value.bulkPriceCny)
+  }, [value.bulkPriceCny])
+
+  useEffect(() => {
     const virtualCountries = new Set(priceRows.filter(isVirtualCountry).map(row => String(row.country)))
     if (virtualCountries.size === 0 || !value.countries.some(country => virtualCountries.has(country))) return
     const countries = value.countries.filter(country => !virtualCountries.has(country))
@@ -273,6 +286,7 @@ export function SmsBowerPriceSelector({
       country: selecting ? country : countries[0] || '',
       countries,
       providerIdsByCountry,
+      bulkPriceCny: '',
     }
     if (selecting && Number(row.price || 0) > Number(value.maxPriceUsd || 0)) {
       patch.maxPriceUsd = formatUsd(Number(row.price || 0))
@@ -304,6 +318,7 @@ export function SmsBowerPriceSelector({
       country,
       countries: uniqueStrings([...value.countries, country]),
       providerIdsByCountry,
+      bulkPriceCny: '',
     }
     if (selecting && Number(provider.price || 0) > Number(value.maxPriceUsd || 0)) {
       patch.maxPriceUsd = formatUsd(Number(provider.price || 0))
@@ -334,7 +349,11 @@ export function SmsBowerPriceSelector({
         const stock = providerStock(provider)
         if (!id || priceCny <= 0 || priceCny > limit || stock <= 0) return
         ids.push(id)
-        highestUsd = Math.max(highestUsd, Number(provider.price || 0))
+        const explicitUsd = Number(provider.price)
+        const providerUsd = Number.isFinite(explicitUsd) && explicitUsd > 0
+          ? explicitUsd
+          : priceCny / rate
+        highestUsd = Math.max(highestUsd, providerUsd)
       })
       const uniqueIds = uniqueStrings(ids)
       if (uniqueIds.length === 0) return
@@ -353,11 +372,12 @@ export function SmsBowerPriceSelector({
       country: countries[0],
       countries,
       providerIdsByCountry,
+      bulkPriceCny: formatCny(limit),
+      maxPriceUsd: formatUsd(highestUsd),
     }
-    if (highestUsd > Number(value.maxPriceUsd || 0)) patch.maxPriceUsd = formatUsd(highestUsd)
     setExpandedCountry(countries[0])
     setError('')
-    setNotice(`已按 ¥${limit.toFixed(2)} 上限选择 ${countries.length} 个国家、${providerCount} 个有库存档位`)
+    setNotice(`已按 ¥${formatCny(limit)} 上限选择 ${countries.length} 个国家、${providerCount} 个有库存档位；下单硬上限已同步为 $${formatUsd(highestUsd)}`)
     onChange(patch)
   }
 
@@ -407,6 +427,7 @@ export function SmsBowerPriceSelector({
                 onChange({
                   country,
                   countries: uniqueStrings([...value.countries, country]),
+                  bulkPriceCny: '',
                 })
                 setExpandedCountry(country)
               }}
@@ -429,7 +450,10 @@ export function SmsBowerPriceSelector({
             <span className="mb-1.5 block text-xs font-medium text-[var(--text-secondary)]">单号最高价格（USD）</span>
             <input
               value={value.maxPriceUsd}
-              onChange={(event) => onChange({ maxPriceUsd: event.target.value.replace(/[^0-9.]/g, '').slice(0, 8) })}
+              onChange={(event) => onChange({
+                maxPriceUsd: event.target.value.replace(/[^0-9.]/g, '').slice(0, 8),
+                bulkPriceCny: '',
+              })}
               inputMode="decimal"
               className="control-surface font-mono"
               placeholder="0.13"
@@ -484,7 +508,10 @@ export function SmsBowerPriceSelector({
               USD/CNY 汇率
               <input
                 value={value.usdCnyRate}
-                onChange={(event) => onChange({ usdCnyRate: Math.max(Number(event.target.value || 0), 0.01) })}
+                onChange={(event) => onChange({
+                  usdCnyRate: Math.max(Number(event.target.value || 0), 0.01),
+                  bulkPriceCny: '',
+                })}
                 inputMode="decimal"
                 className="control-surface mt-1"
               />
@@ -545,6 +572,7 @@ export function SmsBowerPriceSelector({
                     onClick={() => row ? selectCountry(row) : onChange({
                       countries: value.countries.filter(item => item !== country),
                       country: value.countries.find(item => item !== country) || '',
+                      bulkPriceCny: '',
                     })}
                     className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2 py-1 text-[11px] text-cyan-200"
                     title="点击移除"
