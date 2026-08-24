@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import base64
+import html as html_lib
+import re
 import secrets
 import time
 from datetime import datetime, timezone
 from typing import Callable
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from core.proxy_utils import infer_proxy_region, pin_711proxy_session
 from platforms.chatgpt.constants import (
@@ -1093,12 +1095,164 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
             or ""
         ).strip()
 
+    @staticmethod
+    def _normalized_chooser_document(value: object) -> str:
+        """Normalize the escaped React-router document without logging it.
+
+        The chooser is server-rendered and its ``unified_sessions`` payload can
+        appear as HTML, JSON embedded in ``streamController.enqueue``, or a
+        JSON-escaped string.  Session ids survive all three forms, while this
+        small normalization also makes exact email/account matching reliable.
+        """
+        text = html_lib.unescape(str(value or ""))
+        for _ in range(2):
+            text = (
+                text.replace(r"\u0040", "@")
+                .replace(r"\u002E", ".")
+                .replace(r"\u002e", ".")
+                .replace(r"\/", "/")
+                .replace(r'\"', '"')
+            )
+        return text
+
+    def _authorization_session_id(self, document: object, email: str) -> tuple[str, str, int]:
+        """Choose the current account's ``us_*`` session without cross-linking.
+
+        A single candidate belongs to the restored cookie jar and is safe.  If
+        several signed-in accounts are present, the selected session must be
+        the unique candidate nearest to an exact email or persisted account-id
+        occurrence in the chooser's SSR payload.  Ambiguous pages fail closed.
+        """
+        normalized = self._normalized_chooser_document(document)
+        raw_matches = list(re.finditer(r"us_[A-Za-z0-9_-]{12,}", normalized))
+        matches = []
+        seen: set[str] = set()
+        for match in raw_matches:
+            session_id = match.group(0)
+            if session_id in seen:
+                continue
+            seen.add(session_id)
+            matches.append(match)
+        if not matches:
+            raise RuntimeError(
+                "OAUTH_SESSION_SELECTION_FAILED: 账号选择页缺少 unified session"
+            )
+        if len(matches) == 1:
+            return matches[0].group(0), "single_session_candidate", 1
+
+        targets = [
+            str(email or "").strip().lower(),
+            str(self.existing_account_id or "").strip().lower(),
+        ]
+        target_positions: list[int] = []
+        lowered = normalized.lower()
+        for target in targets:
+            if not target:
+                continue
+            start = 0
+            while True:
+                index = lowered.find(target, start)
+                if index < 0:
+                    break
+                target_positions.append(index)
+                start = index + max(len(target), 1)
+
+        ranked: list[tuple[int, int, str]] = []
+        for match in matches:
+            if not target_positions:
+                break
+            distance = min(abs(match.start() - position) for position in target_positions)
+            # Session records are compact JSON objects.  A distant occurrence
+            # can be a page heading or unrelated serialized state, so it must
+            # never be used to pick between multiple accounts.
+            if distance <= 4096:
+                ranked.append((distance, match.start(), match.group(0)))
+        ranked.sort()
+        if ranked and (len(ranked) == 1 or ranked[0][0] < ranked[1][0]):
+            return ranked[0][2], "exact_identity_nearest_session", len(matches)
+        raise RuntimeError(
+            "OAUTH_SESSION_SELECTION_FAILED: 账号选择页包含多个会话，"
+            "但无法唯一匹配当前邮箱账号，已停止以避免串号"
+        )
+
+    def _select_authorization_session(
+        self,
+        engine: RegistrationEngine,
+        chooser_response,
+        chooser_url: str,
+        email: str,
+    ) -> tuple[str, str, dict]:
+        """Select a unified login session before workspace/consent handling."""
+        session_id, selection_mode, candidate_count = self._authorization_session_id(
+            getattr(chooser_response, "text", ""),
+            email,
+        )
+        attempts = (
+            (
+                f"{OPENAI_AUTH}/api/accounts/session/select",
+                "application/json",
+                json.dumps({"session_id": session_id}, separators=(",", ":")),
+            ),
+            (
+                f"{OPENAI_AUTH}/choose-an-account",
+                "application/x-www-form-urlencoded",
+                urlencode({"intent": "select", "session_id": session_id}),
+            ),
+        )
+        failures: list[str] = []
+        for endpoint, content_type, body in attempts:
+            response = engine.session.post(
+                endpoint,
+                headers={
+                    "accept": "application/json, text/html;q=0.9",
+                    "content-type": content_type,
+                    "origin": OPENAI_AUTH,
+                    "referer": chooser_url,
+                },
+                data=body,
+                allow_redirects=False,
+                timeout=20,
+            )
+            self._log(
+                "OAuth 当前登录会话自动选择状态: "
+                f"{response.status_code} mode={selection_mode} "
+                f"candidates={candidate_count} endpoint={urlsplit(endpoint).path}"
+            )
+            if response.status_code not in {200, 201, 302, 303, 307, 308}:
+                code, message = _response_error(response)
+                failures.append(
+                    str(message or code or f"HTTP {response.status_code}")[:160]
+                )
+                continue
+
+            try:
+                data = response.json() or {}
+            except Exception:
+                data = {}
+            page_type, continue_url, page_payload = self._page_state(response)
+            headers = getattr(response, "headers", {}) or {}
+            location = str(headers.get("Location") or headers.get("location") or "").strip()
+            next_url = location or continue_url or _find_callback_url(data)
+            if not next_url and page_type == "add_phone":
+                next_url = "/add-phone"
+            if next_url:
+                return urljoin(chooser_url, next_url), page_type, page_payload
+            # The direct endpoint can commit the selected session solely via
+            # Set-Cookie.  Re-reading the chooser lets the caller observe the
+            # server-side continuation without reposting or renting a number.
+            return chooser_url, page_type, page_payload
+
+        detail = failures[-1] if failures else "unknown response"
+        raise RuntimeError(
+            "OAUTH_SESSION_SELECTION_FAILED: 当前登录会话选择失败: " + detail
+        )
+
     def _authorization_workspaces(
         self,
         engine: RegistrationEngine,
         referer: str,
     ) -> list[dict]:
-        """Read the server-side chooser candidates for the current OAuth session."""
+        """Read workspace candidates for the current OAuth consent session."""
         session_cookie = _cookie_value(engine.session, "oai-client-auth-session")
         session_data = _decode_client_auth_session(session_cookie)
         workspaces = [
@@ -1122,7 +1276,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                 headers={"accept": "application/json", "referer": referer},
                 timeout=20,
             )
-            self._log(f"OAuth 账号选择会话读取状态: {dump_response.status_code}")
+            self._log(f"OAuth workspace 会话读取状态: {dump_response.status_code}")
             if dump_response.status_code < 400:
                 try:
                     dump_data = dump_response.json() or {}
@@ -1157,7 +1311,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
         engine: RegistrationEngine,
         referer: str,
     ) -> tuple[str, str, dict]:
-        """Select only the current persisted account on an OAuth chooser page.
+        """Select only the current persisted account on workspace/consent pages.
 
         A single candidate is safe because the restored cookie jar belongs to
         the account being completed. With multiple candidates we require an
@@ -1165,7 +1319,18 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
         """
         workspaces = self._authorization_workspaces(engine, referer)
         if not workspaces:
-            raise RuntimeError("OAuth 账号选择页没有可选择的账号")
+            # Personal accounts can omit ``workspaces`` from the auth-session
+            # dump.  The persisted account id is the same safe fallback used by
+            # the standalone Codex credential flow for personal workspaces.
+            if self.existing_account_id:
+                workspaces = [
+                    {
+                        "id": self.existing_account_id,
+                        "account_id": self.existing_account_id,
+                    }
+                ]
+            else:
+                raise RuntimeError("OAuth workspace 选择页没有可选择的账号")
 
         selected: dict | None = None
         selection_mode = "single_session_candidate"
@@ -1201,7 +1366,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
             timeout=20,
         )
         self._log(
-            "OAuth 当前账号自动选择状态: "
+            "OAuth 当前 workspace 自动选择状态: "
             f"{select_response.status_code} mode={selection_mode} candidates={len(workspaces)}"
         )
         if select_response.status_code >= 400:
@@ -1229,12 +1394,16 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
     def _continue_account_chooser(
         self,
         engine: RegistrationEngine,
+        chooser_response,
         chooser_url: str,
+        email: str,
     ) -> tuple[str, str, dict]:
-        """Select the account and resolve one server redirect into a flow page."""
-        next_url, page_type, page_payload = self._select_authorization_workspace(
+        """Select a unified account session, then resolve its next flow page."""
+        next_url, page_type, page_payload = self._select_authorization_session(
             engine,
+            chooser_response,
             chooser_url,
+            email,
         )
         if (
             page_type == "add_phone"
@@ -1298,7 +1467,9 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
             self._log("手机号授权进入账号选择页，正在续接当前注册账号")
             final_url, page_type, page_payload = self._continue_account_chooser(
                 engine,
+                response,
                 final_url,
+                email,
             )
             engine._authorize_final_url = final_url
             if page_type:
@@ -1309,7 +1480,10 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
             if "code=" in final_url or "consent" in final_url:
                 return engine, "", {"already_verified": True, **page_payload}
             if "/choose-an-account" in final_url:
-                raise RuntimeError("OAuth 当前账号选择后仍停留在账号选择页")
+                raise RuntimeError(
+                    "OAUTH_SESSION_SELECTION_FAILED: "
+                    "当前登录会话选择后仍停留在账号选择页"
+                )
 
         if "/add-phone" in final_url:
             return engine, final_url, {}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 
+import json
 import pytest
 from types import SimpleNamespace
 
@@ -294,6 +295,44 @@ def test_protocol_mailbox_mapper_preserves_protocol_metadata():
     assert mapped.extra["profile"] == {"email": "new@example.com"}
 
     assert mapped.extra["expires_at"] == "2026-05-20T00:00:00Z"
+
+
+def test_protocol_mailbox_mapper_persists_followup_auth_context():
+    from platforms.chatgpt.plugin import ChatGPTPlatform
+
+    class Ctx:
+        password = "Secret123!"
+
+    class Cookies:
+        jar = None
+
+        @staticmethod
+        def items():
+            return [("oai-did", "device-cookie"), ("login_session", "login-cookie")]
+
+    platform = ChatGPTPlatform()
+    platform._last_protocol_mailbox_worker = SimpleNamespace(
+        engine=SimpleNamespace(
+            session=SimpleNamespace(cookies=Cookies()),
+            _device_id="stable-device-id",
+        )
+    )
+    result = ProtocolRegistrationResult(
+        success=True,
+        email="new@example.com",
+        password="Secret123!",
+        account_id="acct_123",
+        access_token="access-token",
+        session_token="session-token",
+        metadata={},
+    )
+
+    mapped = platform.build_protocol_mailbox_adapter().result_mapper(Ctx(), result)
+
+    records = json.loads(mapped.extra["auth_cookies"])
+    assert {item["name"] for item in records} == {"oai-did", "login_session"}
+    assert mapped.extra["oai_device_id"] == "stable-device-id"
+    assert "login_session=login-cookie" in mapped.extra["cookies"]
 
 
 def test_mailbox_service_resets_message_baseline_for_post_registration_otp():

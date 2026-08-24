@@ -170,6 +170,11 @@ def _register_task_outcome(
 
 
 _REGISTRATION_FAILURE_CATEGORIES = (
+    (
+        "protocol_flow",
+        "注册协议流程结构异常",
+        ("oauth_session_selection_failed",),
+    ),
     ("email_already_registered", "邮箱已注册", ("user_already_exists", "account already exists")),
     (
         "account_rejected",
@@ -233,6 +238,12 @@ def _registration_failure_category(error: object) -> tuple[str, str]:
         if any(marker in lowered for marker in markers):
             return code, label
     return "other", "其他错误"
+
+
+def _is_systemic_registration_flow_error(error: object) -> bool:
+    """Detect explicit protocol-shape failures that should stop new attempts."""
+    lowered = str(error or "").strip().lower()
+    return lowered.startswith("oauth_session_selection_failed:")
 
 
 def _registration_failure_summary(errors: list[str]) -> list[dict[str, Any]]:
@@ -2680,6 +2691,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     network_failure_streak = 0
     network_circuit_open = False
     network_circuit_reason = ""
+    protocol_circuit_open = False
+    protocol_circuit_reason = ""
     if platform_name == "chatgpt" and network_circuit_break_threshold > 0:
         logger.log(
             "注册网络熔断已启用: "
@@ -3448,7 +3461,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             logger.log(
                 "邮箱 + 手机流程: "
                 f"目标成功 {count} 个，每个目标最多 {email_identity_attempts} 次"
-                f"（邮箱建号后手机失败会释放号码并换邮箱继续；并发窗口={concurrency}）"
+                f"（普通手机失败会释放号码并换邮箱；OAuth 页面结构异常会立即熔断；"
+                f"并发窗口={concurrency}）"
             )
         elif inline_mailbox_no_reuse:
             retry_multiplier = _register_retry_multiplier(extra)
@@ -3498,6 +3512,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if submitted >= max_attempts or logger.is_cancel_requested():
                 return False
             if network_circuit_open:
+                return False
+            if protocol_circuit_open:
                 return False
             if failure_policy in {"stop", "stop_on_failure", "fail_fast"} and errors:
                 return False
@@ -3574,6 +3590,18 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         failure_code, _failure_label = _registration_failure_category(result_error)
                         if (
                             platform_name == "chatgpt"
+                            and _is_systemic_registration_flow_error(result_error)
+                            and not protocol_circuit_open
+                        ):
+                            protocol_circuit_open = True
+                            protocol_circuit_reason = result_error[:500]
+                            logger.log(
+                                "注册协议熔断已触发: 检测到 OAuth 页面结构/会话选择异常，"
+                                "停止投放新邮箱；已在运行的 worker 将自然收尾",
+                                level="error",
+                            )
+                        if (
+                            platform_name == "chatgpt"
                             and network_circuit_break_threshold > 0
                             and failure_code == "proxy_network"
                         ):
@@ -3625,6 +3653,11 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             "open": network_circuit_open,
             "consecutive_failures": network_failure_streak,
             "reason": network_circuit_reason,
+        },
+        "protocol_circuit_breaker": {
+            "enabled": platform_name == "chatgpt",
+            "open": protocol_circuit_open,
+            "reason": protocol_circuit_reason,
         },
         "mailbox_pool_exhausted": mailbox_pool_exhausted.is_set(),
     }

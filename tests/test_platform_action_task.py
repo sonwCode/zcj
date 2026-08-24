@@ -198,6 +198,64 @@ def test_chatgpt_register_task_stops_after_consecutive_network_failures(monkeypa
     )
 
 
+def test_chatgpt_register_task_stops_after_systemic_oauth_session_failure(monkeypatch):
+    seen = {"attempts": 0}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            seen["attempts"] += 1
+            raise RuntimeError(
+                "OAUTH_SESSION_SELECTION_FAILED: 账号选择页缺少 unified session"
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "require_phone_verification": True,
+                "email_pre_phone_max_attempts": 10,
+            },
+        },
+        logger,
+    )
+
+    assert seen["attempts"] == 1
+    assert logger.finished[0] == tasks_module.TASK_STATUS_FAILED
+    assert logger.result_data["protocol_circuit_breaker"] == {
+        "enabled": True,
+        "open": True,
+        "reason": "OAUTH_SESSION_SELECTION_FAILED: 账号选择页缺少 unified session",
+    }
+    assert logger.result_data["failure_summary"] == [
+        {
+            "code": "protocol_flow",
+            "label": "注册协议流程结构异常",
+            "count": 1,
+            "sample": "OAUTH_SESSION_SELECTION_FAILED: 账号选择页缺少 unified session",
+        }
+    ]
+    assert any(
+        event[0] == "log" and "注册协议熔断已触发" in event[1]
+        for event in logger.events
+    )
+
+
 def test_chatgpt_register_task_stops_after_mailbox_pool_is_exhausted(monkeypatch):
     seen = {"attempts": 0}
 

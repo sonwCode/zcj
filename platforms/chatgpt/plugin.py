@@ -834,6 +834,24 @@ class ChatGPTPlatform(BasePlatform):
             session_token = result.session_token or ""
             metadata = getattr(result, "metadata", None) or {}
             oauth_credential_type = "codex_oauth" if refresh_token else "chatgpt_web"
+            auth_cookies: list[dict[str, str]] = []
+            oai_device_id = ""
+            mailbox_worker = getattr(self, "_last_protocol_mailbox_worker", None)
+            mailbox_engine = getattr(mailbox_worker, "engine", None)
+            if mailbox_engine is not None:
+                from platforms.chatgpt.protocol_phone import _export_session_cookies
+
+                auth_cookies = _export_session_cookies(mailbox_engine.session)
+                oai_device_id = str(
+                    getattr(mailbox_engine, "_device_id", "") or ""
+                ).strip()
+            cookie_header = str(metadata.get("cookies") or "").strip()
+            if not cookie_header and auth_cookies:
+                cookie_header = "; ".join(
+                    f"{item['name']}={item['value']}"
+                    for item in auth_cookies
+                    if item.get("name") and item.get("value")
+                )
 
             return RegistrationResult(
                 email=result.email,
@@ -858,7 +876,13 @@ class ChatGPTPlatform(BasePlatform):
                     "session_token": session_token,
                     "session_token_present": bool(session_token),
                     "workspace_id": result.workspace_id,
-                    "cookies": metadata.get("cookies", ""),
+                    "cookies": cookie_header,
+                    "auth_cookies": json.dumps(
+                        auth_cookies,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    "oai_device_id": oai_device_id,
                     "profile": metadata.get("profile", {}),
                     "expires_at": metadata.get("expires_at", ""),
                     "session": metadata.get("session", {}),

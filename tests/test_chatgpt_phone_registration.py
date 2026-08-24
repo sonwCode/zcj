@@ -1006,23 +1006,30 @@ def test_email_phone_worker_restores_account_scoped_cookie_context():
 def test_email_phone_worker_continues_account_chooser_with_exact_account(monkeypatch):
     account_id = "account-current"
     selected = []
-    cookie_payload = protocol_phone_module.base64.urlsafe_b64encode(
-        json.dumps(
-            {
-                "workspaces": [
-                    {"id": "workspace-other", "account_id": "account-other"},
-                    {"id": "workspace-current", "account_id": account_id},
-                ]
-            }
-        ).encode("utf-8")
-    ).decode("ascii").rstrip("=")
+    chooser_html = json.dumps(
+        {
+            "unified_sessions": [
+                {
+                    "id": "us_other_session_1234567890",
+                    "email": "other@example.com",
+                    "account_id": "account-other",
+                },
+                {
+                    "id": "us_current_session_12345678",
+                    "email": "user@example.com",
+                    "account_id": account_id,
+                },
+            ]
+        }
+    )
 
     class Response:
-        def __init__(self, status_code, *, url="", payload=None, headers=None):
+        def __init__(self, status_code, *, url="", payload=None, headers=None, text=""):
             self.status_code = status_code
             self.url = url
             self._payload = payload or {}
             self.headers = headers or {}
+            self.text = text
 
         def json(self):
             return self._payload
@@ -1031,14 +1038,17 @@ def test_email_phone_worker_continues_account_chooser_with_exact_account(monkeyp
         def __init__(self):
             self.cookies = _CookieJar()
             self.cookies.set("oai-did", "did-current")
-            self.cookies.set("oai-client-auth-session", cookie_payload + ".signature")
 
         def get(self, url, **kwargs):
-            assert "client_auth_session_dump" not in url
-            return Response(200, url="https://auth.openai.com/choose-an-account")
+            return Response(
+                200,
+                url="https://auth.openai.com/choose-an-account",
+                text=chooser_html,
+            )
 
         def post(self, url, **kwargs):
-            selected.append(json.loads(kwargs["data"])["workspace_id"])
+            assert url.endswith("/api/accounts/session/select")
+            selected.append(json.loads(kwargs["data"])["session_id"])
             return Response(
                 200,
                 url=url,
@@ -1083,11 +1093,94 @@ def test_email_phone_worker_continues_account_chooser_with_exact_account(monkeyp
         password="Secret123!",
     )
 
-    assert selected == ["workspace-current"]
+    assert selected == ["us_current_session_12345678"]
     assert add_phone_url == "https://auth.openai.com/add-phone"
     assert payload == {"channel": "sms"}
     assert engine._otp_page_type == "add_phone"
     assert engine._otp_continue_url == add_phone_url
+
+
+def test_email_phone_worker_rejects_ambiguous_unified_session_chooser():
+    post_calls = []
+
+    class Response:
+        status_code = 200
+        text = json.dumps(
+            {
+                "unified_sessions": [
+                    {"id": "us_first_session_123456789", "email": "first@example.com"},
+                    {"id": "us_second_session_12345678", "email": "second@example.com"},
+                ]
+            }
+        )
+
+    class Session:
+        def post(self, url, **kwargs):
+            post_calls.append((url, kwargs))
+            raise AssertionError("ambiguous chooser must not select a session")
+
+    worker = ChatGPTProtocolEmailThenPhoneWorker(
+        email_service=SimpleNamespace(),
+        phone_callback=lambda: "",
+        existing_account_id="account-missing",
+        log_fn=lambda message: None,
+    )
+
+    with pytest.raises(RuntimeError, match="OAUTH_SESSION_SELECTION_FAILED.*多个会话"):
+        worker._select_authorization_session(
+            SimpleNamespace(session=Session()),
+            Response(),
+            "https://auth.openai.com/choose-an-account",
+            "missing@example.com",
+        )
+
+    assert post_calls == []
+
+
+def test_email_phone_worker_falls_back_to_router_session_select():
+    calls = []
+
+    class Response:
+        def __init__(self, status_code, *, payload=None, headers=None, text=""):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.headers = headers or {}
+            self.text = text
+            self.url = "https://auth.openai.com/choose-an-account"
+
+        def json(self):
+            return self._payload
+
+    class Session:
+        def post(self, url, **kwargs):
+            calls.append((url, kwargs["data"], kwargs["headers"]["content-type"]))
+            if url.endswith("/api/accounts/session/select"):
+                return Response(500, payload={"error": "router_required"})
+            return Response(302, headers={"Location": "/add-phone"})
+
+    worker = ChatGPTProtocolEmailThenPhoneWorker(
+        email_service=SimpleNamespace(),
+        phone_callback=lambda: "",
+        log_fn=lambda message: None,
+    )
+    chooser = Response(
+        200,
+        text='{"unified_sessions":[{"id":"us_single_session_123456789"}]}',
+    )
+
+    next_url, _page_type, _payload = worker._select_authorization_session(
+        SimpleNamespace(session=Session()),
+        chooser,
+        chooser.url,
+        "user@example.com",
+    )
+
+    assert len(calls) == 2
+    assert calls[0][0].endswith("/api/accounts/session/select")
+    assert json.loads(calls[0][1])["session_id"] == "us_single_session_123456789"
+    assert calls[1][0].endswith("/choose-an-account")
+    assert "intent=select" in calls[1][1]
+    assert next_url == "https://auth.openai.com/add-phone"
 
 
 def test_email_phone_worker_rejects_ambiguous_account_chooser():
@@ -1128,6 +1221,52 @@ def test_email_phone_worker_rejects_ambiguous_account_chooser():
         )
 
     assert post_calls == []
+
+
+def test_email_phone_worker_uses_account_id_for_personal_workspace_fallback():
+    selected = []
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def json(self):
+            return {}
+
+    class Session:
+        cookies = _CookieJar()
+
+        def get(self, url, **kwargs):
+            assert url.endswith("/api/accounts/client_auth_session_dump")
+            return Response()
+
+        def post(self, url, **kwargs):
+            selected.append(json.loads(kwargs["data"])["workspace_id"])
+            return type(
+                "SelectResponse",
+                (),
+                {
+                    "status_code": 200,
+                    "headers": {},
+                    "url": url,
+                    "json": lambda self: {"continue_url": "/oauth/callback?code=X&state=Y"},
+                },
+            )()
+
+    worker = ChatGPTProtocolEmailThenPhoneWorker(
+        email_service=SimpleNamespace(),
+        phone_callback=lambda: "",
+        existing_account_id="account-current",
+        log_fn=lambda message: None,
+    )
+
+    next_url, _page_type, _payload = worker._select_authorization_workspace(
+        SimpleNamespace(session=Session()),
+        "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+    )
+
+    assert selected == ["account-current"]
+    assert next_url.endswith("/oauth/callback?code=X&state=Y")
 
 
 def test_email_phone_worker_stops_on_account_deactivated_without_changing_number(monkeypatch):
