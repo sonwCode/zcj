@@ -383,6 +383,9 @@ def test_local_ms_pool_records_gujumpgate_source_metadata(tmp_path):
     assert provider_account["credentials"]["client_id"] == "client-id-123"
     assert provider_account["credentials"]["refresh_token"] == "refresh-token-456"
     assert provider_account["metadata"]["source"] == "gujumpgate_hotmail"
+    assert provider_account["metadata"]["credential_purpose"] == "otp_mailbox"
+    assert provider_account["metadata"]["refresh_token_role"] == "microsoft_mailbox_oauth"
+    assert provider_account["metadata"]["not_platform_refresh_token"] is True
     assert provider_resource["metadata"]["source"] == "gujumpgate_hotmail"
 
 

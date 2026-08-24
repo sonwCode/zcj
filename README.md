@@ -86,6 +86,9 @@ python scripts/smoke.py http://127.0.0.1:8001/api
 - 持续复检默认 5 并发，调度器每 5 秒扫描到期队列；已有的有效 ChatGPT 账号会自动迁入持续监控。较慢的全量检测使用独立周期。`GET /api/system/scheduler/status` 可查看调度线程、最近开始/完成时间、调度延迟、结果和错误，避免后台检测静默失效；旧的 `/api/scheduler/status` 地址仍兼容。
 - 注册任务和启动日志会输出 `version@git_sha`；`GET /api/system/version` 返回提交、构建时间和进程启动时间，用于确认当前实例是否已部署到新代码。
 - 可在任务 `extra` 中通过 `post_registration_liveness_delay_seconds`（0–600）、`post_registration_probation_enabled` 和 `post_registration_probation_interval_seconds`（默认 60）调整新号检测；全量与持续检测并发读取配置项 `account_check_concurrency`（1–20）。
+- ChatGPT 核心注册门槛固定为“邮箱建号 → 手机验证（启用时）→ Codex PKCE 凭据 → 首次存活质检 → 入库”。任一核心阶段未通过都不会计入目标成功数，也不会自动上传 CPA；前端或 API 也不能把未完成流水线的账号手动提升成可交付状态。
+- Microsoft/Outlook Provider Account 中的 `refresh_token` 只用于读取验证码邮箱；平台凭据中的 `refresh_token` 才是 Codex/OpenAI RT。两者分表存储并在详情页分区显示，邮箱 RT 不能通过 Codex RT 成功门槛。
+- 远端明确返回账号不存在、已删除/停用或认证身份已作废时，账号立即保存为 `invalid` 并记录首次失效时间；普通接码超时、临时 OAuth 或网络错误仍保留为可诊断的待验证状态。
 - 注册成功与外部交付分开记录：账号落库后即保留 `registration_status=registered`；Sub2API 未完成会记录 `delivery_status=pending`，等待后台补传，不再把两种状态混为一个“失败”。
 - CPA 连接检测使用只读的 Management API `GET /v0/management/auth-files`；只有 2xx 才判定连接成功，401/403 会分别提示管理密钥无效或远程管理未开启。
 
@@ -94,6 +97,7 @@ python scripts/smoke.py http://127.0.0.1:8001/api
 - `.env`、数据库、日志、账号文本、HAR、Token 导出和本地备份不得提交。
 - `tools/`、私有指纹模板及带有真实账号、手机号、支付资料或访问参数的操作素材不进入公开仓库。
 - API Key、账号密码和代理认证信息应通过 `.env`、Provider 设置或部署 Secret 注入。
+- 高频账号列表接口只返回脱敏摘要；密码、邮箱凭据和平台 Token 仅在账号详情、显式复制或导出操作时按需读取。管理端默认隐藏所有敏感值，必须手动点击“显示”才能查看。
 - 公网部署必须设置 `APP_PASSWORD`，并在反向代理层配置 TLS 与访问控制。
 - 提交前请检查 `git status`，确认没有运行数据或临时诊断文件进入暂存区。
 

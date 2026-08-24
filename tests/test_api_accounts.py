@@ -52,6 +52,69 @@ def test_list_accounts_after_create(client):
     assert data["items"][0]["email"] == "test@example.com"
 
 
+def test_account_list_redacts_secrets_while_detail_keeps_on_demand_values(client):
+    create_resp = _create_account(
+        client,
+        email="secret-summary@example.com",
+        password="MailboxPassword!",
+        primary_token="platform-primary-token",
+        overview={
+            "registration_pipeline": {
+                "registration_status": "registered",
+                "current_stage": "persisted",
+            },
+            "workspace_statuses": {
+                "ws_1": {
+                    "credentials": {
+                        "access_token": "workspace-access-token",
+                        "account_id": "acct_workspace",
+                    }
+                }
+            },
+        },
+        credentials={
+            "access_token": "platform-access-token",
+            "refresh_token": "platform-refresh-token",
+        },
+        provider_accounts=[
+            {
+                "provider_type": "mailbox",
+                "provider_name": "local_ms_pool",
+                "login_identifier": "mailbox@example.com",
+                "credentials": {
+                    "password": "ProviderPassword!",
+                    "client_id": "public-client-id",
+                    "refresh_token": "mailbox-refresh-token",
+                },
+            }
+        ],
+    )
+    assert create_resp.status_code == 200
+    account_id = create_resp.json()["id"]
+
+    summary = client.get("/api/accounts", params={"email": "secret-summary"}).json()["items"][0]
+    assert summary["password"] == ""
+    assert summary["password_present"] is True
+    assert summary["primary_token"] == ""
+    assert summary["primary_token_present"] is True
+    assert all(item["value"] == "" for item in summary["credentials"])
+    assert all(item["has_value"] is True for item in summary["credentials"])
+    provider = summary["provider_accounts"][0]
+    assert provider["credentials"] == {}
+    assert provider["credential_keys"] == ["client_id", "password", "refresh_token"]
+    assert (
+        summary["overview"]["workspace_statuses"]["ws_1"]["credentials"]["access_token"]
+        == ""
+    )
+    assert summary["overview"]["workspace_statuses"]["ws_1"]["credentials"]["account_id"] == "acct_workspace"
+
+    detail = client.get(f"/api/accounts/{account_id}").json()
+    assert detail["password"] == "MailboxPassword!"
+    assert detail["primary_token"] == "platform-primary-token"
+    assert any(item["value"] == "platform-refresh-token" for item in detail["credentials"])
+    assert detail["provider_accounts"][0]["credentials"]["refresh_token"] == "mailbox-refresh-token"
+
+
 def test_get_account_by_id(client):
     create_resp = _create_account(client)
     account_id = create_resp.json()["id"]
@@ -84,6 +147,44 @@ def test_update_account(client):
         json={"password": "NewPass456!"},
     )
     assert patch_resp.status_code == 200
+
+
+def test_incomplete_registration_cannot_be_manually_promoted_or_exported_to_cpa(client):
+    create_resp = _create_account(
+        client,
+        email="incomplete@example.com",
+        lifecycle_status="pending_verification",
+        overview={
+            "registration_pipeline": {
+                "registration_status": "failed",
+                "current_stage": "credentials_ready",
+                "stages": {
+                    "account_created": {"status": "passed"},
+                    "phone_verified": {"status": "passed"},
+                    "credentials_ready": {"status": "failed", "error": "CODEX_RT_MISSING"},
+                },
+            }
+        },
+        credentials={
+            "access_token": "codex-access",
+            "refresh_token": "codex-refresh",
+        },
+    )
+    account_id = create_resp.json()["id"]
+
+    promote_resp = client.patch(
+        f"/api/accounts/{account_id}",
+        json={"lifecycle_status": "registered"},
+    )
+    assert promote_resp.status_code == 400
+    assert "注册流水线尚未完成" in promote_resp.json()["detail"]
+
+    export_resp = client.post(
+        "/api/accounts/export/cpa",
+        json={"platform": "chatgpt", "ids": [account_id]},
+    )
+    assert export_resp.status_code == 400
+    assert "不能导出 CPA" in export_resp.json()["detail"]
 
 
 def test_filter_accounts_by_platform(client):

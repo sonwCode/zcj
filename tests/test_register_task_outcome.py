@@ -1,9 +1,12 @@
 from application.tasks import (
     TASK_STATUS_FAILED,
     TASK_STATUS_SUCCEEDED,
+    _account_has_codex_rt,
     _registration_failure_summary,
+    _is_terminal_registration_account_error,
     _register_task_outcome,
 )
+from core.base_platform import Account
 
 
 def test_retry_failures_are_not_reported_as_multiple_failed_accounts():
@@ -92,3 +95,54 @@ def test_registration_failure_summary_prioritizes_phone_errors_over_oauth_marker
             "sample": "手机号验证失败: code=invalid_auth_step Invalid authorization step.",
         }
     ]
+
+
+def test_terminal_account_errors_are_not_treated_as_generic_phone_or_oauth_failures():
+    summary = _registration_failure_summary(
+        ["手机号验证会话重建失败: You do not have an account"]
+    )
+
+    assert summary[0]["code"] == "account_rejected"
+    assert summary[0]["label"] == "账号被远端停用"
+    assert _is_terminal_registration_account_error(
+        "401 Your authentication token has been invalidated. Please try signing in again."
+    ) is True
+    assert _is_terminal_registration_account_error("401 temporary OAuth session error") is False
+
+
+def test_codex_rt_gate_rejects_mailbox_or_web_refresh_tokens():
+    mailbox_only = Account(
+        platform="chatgpt",
+        email="mailbox-only@example.com",
+        password="password",
+        extra={
+            "access_token": "web-access",
+            "provider_accounts": [
+                {"credentials": {"refresh_token": "microsoft-mailbox-refresh"}}
+            ],
+        },
+    )
+    explicit_web = Account(
+        platform="chatgpt",
+        email="web@example.com",
+        password="password",
+        extra={
+            "access_token": "web-access",
+            "refresh_token": "web-refresh",
+            "oauth_credential_type": "chatgpt_web",
+        },
+    )
+    codex = Account(
+        platform="chatgpt",
+        email="codex@example.com",
+        password="password",
+        extra={
+            "access_token": "codex-access",
+            "refresh_token": "codex-refresh",
+            "oauth_credential_type": "codex_oauth",
+        },
+    )
+
+    assert _account_has_codex_rt(mailbox_only) is False
+    assert _account_has_codex_rt(explicit_web) is False
+    assert _account_has_codex_rt(codex) is True

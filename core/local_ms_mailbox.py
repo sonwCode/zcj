@@ -870,6 +870,9 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     "metadata": {
                         "source": entry.source_format,
                         "source_format": entry.source_format,
+                        "credential_purpose": "otp_mailbox",
+                        "refresh_token_role": "microsoft_mailbox_oauth",
+                        "not_platform_refresh_token": True,
                         "has_graph_refresh_token": bool(entry.graph_ready),
                         "has_imap_config": bool(entry.imap_ready),
                         "has_mailbox_url": bool(entry.url_ready),

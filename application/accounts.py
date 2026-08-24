@@ -4,6 +4,7 @@ import ast
 import csv
 import json
 import re
+from typing import Any
 
 from core.datetime_utils import serialize_datetime
 from domain.accounts import (
@@ -39,6 +40,69 @@ def _parse_csv_row(raw: str) -> list[str]:
     return next(csv.reader([raw]))
 
 
+_LIST_SECRET_FIELDS = {
+    "access_token",
+    "admin_token",
+    "api_key",
+    "apikey",
+    "auth_cookies",
+    "authorization",
+    "callback_url",
+    "client_secret",
+    "cookie",
+    "cookies",
+    "id_token",
+    "legacy_token",
+    "mailbox_url",
+    "password",
+    "primary_token",
+    "proxy",
+    "proxy_url",
+    "auth_proxy_url",
+    "recovery_password",
+    "refresh_token",
+    "session_token",
+    "totp_secret",
+}
+
+
+def _redact_list_secret_tree(value: Any, *, field: str = "") -> Any:
+    """Remove runtime secrets from the frequently-polled account list payload."""
+    normalized_field = str(field or "").strip().lower()
+    if normalized_field in _LIST_SECRET_FIELDS:
+        return ""
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_list_secret_tree(item, field=str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_list_secret_tree(item) for item in value]
+    return value
+
+
+def _redact_list_credential(item: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(item or {})
+    has_value = payload.get("value") not in (None, "")
+    payload["value"] = ""
+    payload["preview"] = "••••••••" if has_value else ""
+    payload["has_value"] = bool(has_value)
+    payload["metadata"] = _redact_list_secret_tree(payload.get("metadata") or {})
+    return payload
+
+
+def _redact_list_provider_account(item: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(item or {})
+    credentials = dict(payload.get("credentials") or {})
+    payload["credentials"] = {}
+    payload["credential_keys"] = sorted(str(key) for key in credentials)
+    payload["credential_previews"] = {
+        str(key): "••••••••" for key, secret in credentials.items() if secret not in (None, "")
+    }
+    payload["metadata"] = _redact_list_secret_tree(payload.get("metadata") or {})
+    return payload
+
+
 class AccountsService:
     def __init__(self, repository: AccountsRepository | None = None):
         self.repository = repository or AccountsRepository()
@@ -48,7 +112,7 @@ class AccountsService:
         return {
             "total": total,
             "page": query.page,
-            "items": [self._serialize(item) for item in items],
+            "items": [self._serialize(item, include_secrets=False) for item in items],
         }
 
     def get_account(self, account_id: int) -> dict | None:
@@ -59,6 +123,21 @@ class AccountsService:
         return self._serialize(self.repository.create(command))
 
     def update_account(self, account_id: int, command: AccountUpdateCommand) -> dict | None:
+        requested_lifecycle = str(command.lifecycle_status or "").strip().lower()
+        if requested_lifecycle in {"registered", "trial", "subscribed"}:
+            current = self.repository.get(account_id)
+            pipeline = (
+                dict((current.overview or {}).get("registration_pipeline") or {})
+                if current
+                else {}
+            )
+            registration_status = str(pipeline.get("registration_status") or "").strip().lower()
+            if pipeline and registration_status != "registered":
+                current_stage = str(pipeline.get("current_stage") or "registration")
+                raise ValueError(
+                    f"注册流水线尚未完成（当前阶段: {current_stage}），"
+                    "不能手动改成可交付状态"
+                )
         item = self.repository.update(account_id, command)
         return self._serialize(item) if item else None
 
@@ -134,14 +213,29 @@ class AccountsService:
         }
 
     @staticmethod
-    def _serialize(item: AccountRecord) -> dict:
+    def _serialize(item: AccountRecord, *, include_secrets: bool = True) -> dict:
+        credentials = list(item.credentials or [])
+        provider_accounts = list(item.provider_accounts or [])
+        overview = dict(item.overview or {})
+        password = item.password
+        primary_token = item.primary_token
+        if not include_secrets:
+            credentials = [_redact_list_credential(entry) for entry in credentials]
+            provider_accounts = [
+                _redact_list_provider_account(entry) for entry in provider_accounts
+            ]
+            overview = _redact_list_secret_tree(overview)
+            password = ""
+            primary_token = ""
         return {
             "id": item.id,
             "platform": item.platform,
             "email": item.email,
-            "password": item.password,
+            "password": password,
+            "password_present": bool(item.password),
             "user_id": item.user_id,
-            "primary_token": item.primary_token,
+            "primary_token": primary_token,
+            "primary_token_present": bool(item.primary_token),
             "trial_end_time": item.trial_end_time,
             "cashier_url": item.cashier_url,
             "lifecycle_status": item.lifecycle_status,
@@ -149,10 +243,10 @@ class AccountsService:
             "plan_state": item.plan_state,
             "plan_name": item.plan_name,
             "display_status": item.display_status,
-            "overview": item.overview,
+            "overview": overview,
             "display_summary": item.display_summary,
-            "credentials": item.credentials,
-            "provider_accounts": item.provider_accounts,
+            "credentials": credentials,
+            "provider_accounts": provider_accounts,
             "provider_resources": item.provider_resources,
             "created_at": serialize_datetime(item.created_at),
             "updated_at": serialize_datetime(item.updated_at),

@@ -460,8 +460,43 @@ def _sub2api_from_payloads(payloads: list[dict]) -> dict:
     return {"proxies": [], "accounts": accounts}
 
 
+def _ensure_cpa_registration_complete(item: AccountRecord) -> None:
+    overview = dict(item.overview or {})
+    pipeline = dict(overview.get("registration_pipeline") or {})
+    registration_status = str(pipeline.get("registration_status") or "").strip().lower()
+    lifecycle_status = str(item.lifecycle_status or "").strip().lower()
+    validity_status = str(item.validity_status or "").strip().lower()
+    if lifecycle_status in {
+        "pending_verification",
+        "manual_phone_required",
+        "invalid",
+        "disabled",
+        "banned",
+        "deactivated",
+    }:
+        raise ValueError(f"账号 {item.email} 注册未完成或已失效，不能导出 CPA")
+    if validity_status == "invalid":
+        raise ValueError(f"账号 {item.email} 已检测失效，不能导出 CPA")
+    if pipeline and registration_status != "registered":
+        current_stage = str(pipeline.get("current_stage") or "registration")
+        raise ValueError(
+            f"账号 {item.email} 注册流水线未完成（当前阶段: {current_stage}），不能导出 CPA"
+        )
+
+
 def _to_cpa_account(item: AccountRecord) -> SimpleNamespace:
+    _ensure_cpa_registration_complete(item)
     payload = _chatgpt_export_payload(item)
+    overview = dict(item.overview or {})
+    oauth_credential_type = str(
+        overview.get("oauth_credential_type")
+        or dict(overview.get("legacy_extra") or {}).get("oauth_credential_type")
+        or ""
+    ).strip().lower()
+    if oauth_credential_type == "chatgpt_web":
+        raise ValueError(f"账号 {item.email} 只有 ChatGPT Web 会话，没有 Codex RT，不能导出 CPA")
+    if not str(payload.get("access_token") or "").strip() or not str(payload.get("refresh_token") or "").strip():
+        raise ValueError(f"账号 {item.email} 缺少 Codex access_token/refresh_token，不能导出 CPA")
     _ensure_workspace_exportable(payload)
     return SimpleNamespace(
         email=payload["email"],
@@ -804,6 +839,7 @@ class AccountExportsService:
         items = self._load_chatgpt_items(selection)
         cpa_tokens: list[tuple[AccountRecord, str, dict, bool]] = []
         for item in items:
+            _ensure_cpa_registration_complete(item)
             workspace_tokens = _chatgpt_workspace_cpa_jsons(item)
             if workspace_tokens:
                 cpa_tokens.extend((item, workspace_id, token, workspace_unit) for workspace_id, token, workspace_unit in workspace_tokens)

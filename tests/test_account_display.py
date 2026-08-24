@@ -53,3 +53,36 @@ def test_paid_quota_keeps_weekly_labels_when_weekly_windows_are_returned():
         ("周限额", "剩余 75%"),
         ("代码审查周限额", "剩余 75%"),
     ]
+
+
+def test_registration_pipeline_exposes_specific_failed_stage_in_display_summary():
+    summary = build_account_display_summary(
+        platform="chatgpt",
+        email="pending@example.com",
+        lifecycle_status="pending_verification",
+        validity_status="valid",
+        plan_state="free",
+        plan_name="free",
+        display_status="pending_verification",
+        overview={
+            "registration_pipeline": {
+                "registration_status": "failed",
+                "current_stage": "credentials_ready",
+                "stages": {
+                    "account_created": {"status": "passed"},
+                    "phone_verified": {"status": "passed"},
+                    "credentials_ready": {
+                        "status": "failed",
+                        "error": "CODEX_RT_MISSING",
+                    },
+                },
+            }
+        },
+        provider_resources=[],
+    )
+
+    assert summary["registration"]["state"] == "failed"
+    assert summary["registration"]["label"] == "Codex RT 获取失败"
+    assert summary["registration"]["completed_stages"] == 2
+    assert summary["registration"]["error"] == "CODEX_RT_MISSING"
+    assert any(item["key"] == "registration_pipeline" for item in summary["warnings"])

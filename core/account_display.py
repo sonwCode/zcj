@@ -228,6 +228,82 @@ def _build_generic_usage_metrics(overview: dict[str, Any]) -> tuple[list[dict[st
     return primary, secondary, sections
 
 
+_REGISTRATION_STAGE_LABELS = {
+    "account_created": "邮箱建号",
+    "phone_verified": "手机验证",
+    "credentials_ready": "Codex RT 获取",
+    "liveness": "首次存活质检",
+    "persisted": "账号入库",
+}
+
+
+def _build_registration_summary(
+    overview: dict[str, Any],
+    *,
+    lifecycle_status: str,
+    validity_status: str,
+) -> dict[str, Any]:
+    pipeline = _safe_dict(overview.get("registration_pipeline"))
+    if not pipeline:
+        return {}
+    stages = _safe_dict(pipeline.get("stages"))
+    current_stage = _text(pipeline.get("current_stage"))
+    current = _safe_dict(stages.get(current_stage))
+    stage_status = _text(current.get("status") or "unknown").lower()
+    registration_status = _text(pipeline.get("registration_status") or "pending").lower()
+    stage_label = _REGISTRATION_STAGE_LABELS.get(current_stage, current_stage or "注册流程")
+    error = _text(current.get("error"))
+
+    terminal = validity_status == "invalid" or lifecycle_status in {
+        "invalid",
+        "disabled",
+        "banned",
+        "deactivated",
+    }
+    if terminal:
+        state = "invalid"
+        label = "注册账号已失效"
+    elif registration_status == "registered":
+        state = "complete"
+        label = "注册完成"
+    elif stage_status == "failed" or registration_status == "failed":
+        state = "failed"
+        label = f"{stage_label}失败"
+    elif stage_status == "in_progress":
+        state = "pending"
+        label = f"正在{stage_label}"
+    else:
+        state = "pending"
+        label = f"等待{stage_label}"
+
+    core_stages = tuple(_REGISTRATION_STAGE_LABELS)
+    completed = sum(
+        1
+        for stage in core_stages
+        if _text(_safe_dict(stages.get(stage)).get("status")).lower()
+        in {"passed", "not_required"}
+    )
+    return {
+        "state": state,
+        "label": label,
+        "registration_status": registration_status,
+        "current_stage": current_stage,
+        "current_stage_label": stage_label,
+        "current_stage_status": stage_status,
+        "error": error,
+        "completed_stages": completed,
+        "total_stages": len(core_stages),
+        "stages": {
+            stage: {
+                "label": label_value,
+                "status": _text(_safe_dict(stages.get(stage)).get("status") or "waiting"),
+                "error": _text(_safe_dict(stages.get(stage)).get("error")),
+            }
+            for stage, label_value in _REGISTRATION_STAGE_LABELS.items()
+        },
+    }
+
+
 def build_account_display_summary(
     *,
     platform: str,
@@ -274,6 +350,11 @@ def build_account_display_summary(
     sections.extend(generic_sections)
 
     warnings: list[dict[str, Any]] = []
+    registration = _build_registration_summary(
+        overview,
+        lifecycle_status=lifecycle_status,
+        validity_status=validity_status,
+    )
     if validity_status == "invalid" or lifecycle_status == "invalid":
         warnings.append({
             "key": "invalid",
@@ -290,6 +371,13 @@ def build_account_display_summary(
         warnings.append({"key": "quota_note", "tone": "warning", "message": _text(overview.get("quota_note"))})
     if overview.get("check_error"):
         warnings.append({"key": "check_error", "tone": "danger", "message": _text(overview.get("check_error"))})
+    if registration and registration.get("state") in {"failed", "pending"}:
+        registration_message = _text(registration.get("error")) or _text(registration.get("label"))
+        warnings.append({
+            "key": "registration_pipeline",
+            "tone": "danger" if registration.get("state") == "failed" else "warning",
+            "message": registration_message,
+        })
 
     badges = [
         {"label": _text(chip), "tone": "muted"}
@@ -320,4 +408,5 @@ def build_account_display_summary(
         "badges": badges,
         "warnings": warnings,
         "sections": sections,
+        "registration": registration,
     }

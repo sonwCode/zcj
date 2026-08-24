@@ -11,7 +11,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
-import { RefreshCw, Copy, ExternalLink, Download, Upload, Plus, X, Trash2, Zap, Loader2, ShieldCheck, Users, Ban, AlertTriangle, Gauge } from 'lucide-react'
+import { RefreshCw, Copy, ExternalLink, Download, Upload, Plus, X, Trash2, Zap, Loader2, ShieldCheck, Users, Ban, AlertTriangle, Gauge, Eye, EyeOff } from 'lucide-react'
 
 const STATUS_VARIANT: Record<string, any> = {
   registered: 'default', trial: 'success', subscribed: 'success',
@@ -58,6 +58,106 @@ function getLifecycleStatus(acc: any) {
 
 function getDisplayStatus(acc: any) {
   return getDisplaySummary(acc)?.status?.display || acc?.display_status || acc?.plan_state || getLifecycleStatus(acc)
+}
+
+const REGISTRATION_STAGE_LABELS: Record<string, string> = {
+  account_created: '邮箱建号',
+  phone_verified: '手机验证',
+  credentials_ready: 'Codex RT 获取',
+  liveness: '首次存活质检',
+  persisted: '账号入库',
+}
+
+function getRegistrationInfo(acc: any) {
+  const supplied = getDisplaySummary(acc)?.registration
+  if (supplied && typeof supplied === 'object' && supplied.state) return supplied
+
+  const pipeline = getAccountOverview(acc)?.registration_pipeline
+  const lifecycle = String(getLifecycleStatus(acc) || '').toLowerCase()
+  const validity = String(getValidityStatus(acc) || '').toLowerCase()
+  if (!pipeline || typeof pipeline !== 'object') {
+    const incomplete = ['pending_verification', 'manual_phone_required'].includes(lifecycle)
+    return {
+      state: validity === 'invalid' || lifecycle === 'invalid' ? 'invalid' : incomplete ? 'pending' : 'unknown',
+      label: validity === 'invalid' || lifecycle === 'invalid' ? '账号已失效' : incomplete ? '注册未完成' : '状态未记录',
+      current_stage: '',
+      current_stage_label: '',
+      current_stage_status: '',
+      error: '',
+      completed_stages: 0,
+      total_stages: Object.keys(REGISTRATION_STAGE_LABELS).length,
+      stages: {},
+    }
+  }
+
+  const stages = pipeline.stages && typeof pipeline.stages === 'object' ? pipeline.stages : {}
+  const currentStage = String(pipeline.current_stage || '')
+  const current = stages[currentStage] && typeof stages[currentStage] === 'object' ? stages[currentStage] : {}
+  const currentStatus = String(current.status || 'unknown').toLowerCase()
+  const registrationStatus = String(pipeline.registration_status || 'pending').toLowerCase()
+  const stageLabel = REGISTRATION_STAGE_LABELS[currentStage] || currentStage || '注册流程'
+  const terminal = validity === 'invalid' || ['invalid', 'disabled', 'banned', 'deactivated'].includes(lifecycle)
+  const state = terminal
+    ? 'invalid'
+    : registrationStatus === 'registered'
+      ? 'complete'
+      : currentStatus === 'failed' || registrationStatus === 'failed'
+        ? 'failed'
+        : 'pending'
+  const label = state === 'invalid'
+    ? '注册账号已失效'
+    : state === 'complete'
+      ? '注册完成'
+      : state === 'failed'
+        ? `${stageLabel}失败`
+        : currentStatus === 'in_progress'
+          ? `正在${stageLabel}`
+          : `等待${stageLabel}`
+  const normalizedStages = Object.fromEntries(
+    Object.entries(REGISTRATION_STAGE_LABELS).map(([key, stageName]) => {
+      const stage = stages[key] && typeof stages[key] === 'object' ? stages[key] : {}
+      return [key, {
+        label: stageName,
+        status: String(stage.status || 'waiting'),
+        error: String(stage.error || ''),
+      }]
+    }),
+  )
+  const completedStages = Object.values(normalizedStages).filter((stage: any) => (
+    ['passed', 'not_required'].includes(String(stage.status).toLowerCase())
+  )).length
+  return {
+    state,
+    label,
+    registration_status: registrationStatus,
+    current_stage: currentStage,
+    current_stage_label: stageLabel,
+    current_stage_status: currentStatus,
+    error: String(current.error || ''),
+    completed_stages: completedStages,
+    total_stages: Object.keys(REGISTRATION_STAGE_LABELS).length,
+    stages: normalizedStages,
+  }
+}
+
+function getRegistrationVariant(info: any): 'success' | 'danger' | 'warning' | 'secondary' {
+  if (info?.state === 'complete') return 'success'
+  if (info?.state === 'invalid' || info?.state === 'failed') return 'danger'
+  if (info?.state === 'pending') return 'warning'
+  return 'secondary'
+}
+
+function getRegistrationStageStatusLabel(statusValue: unknown) {
+  const status = String(statusValue || 'waiting').toLowerCase()
+  const labels: Record<string, string> = {
+    passed: '通过',
+    not_required: '无需执行',
+    in_progress: '执行中',
+    failed: '失败',
+    unknown: '待确认',
+    waiting: '等待',
+  }
+  return labels[status] || status
 }
 
 function getPlanState(acc: any) {
@@ -137,6 +237,7 @@ function getSurvivalInfo(acc: any, nowMs: number) {
   const status = getDisplaySummary(acc)?.status || {}
   const validity = String(getValidityStatus(acc) || '').toLowerCase()
   const lifecycle = String(getLifecycleStatus(acc) || '').toLowerCase()
+  const registration = getRegistrationInfo(acc)
   const invalid = validity === 'invalid' || ['invalid', 'disabled', 'banned', 'deactivated'].includes(lifecycle)
   const checkedAt = parseAccountTime(
     monitor?.first_invalid_at
@@ -148,8 +249,9 @@ function getSurvivalInfo(acc: any, nowMs: number) {
   )
   const endedAt = invalid && checkedAt !== null ? checkedAt : nowMs
   const duration = formatSurvivalDuration(Math.max(endedAt - startedAt, 0))
-  const state = invalid ? 'invalid' : validity === 'valid' ? 'valid' : 'unknown'
-  const label = invalid ? '存活时长' : validity === 'valid' ? '已存活' : '注册至今'
+  const registrationComplete = registration.state === 'complete'
+  const state = invalid ? 'invalid' : validity === 'valid' && registrationComplete ? 'valid' : validity === 'valid' ? 'pending' : 'unknown'
+  const label = invalid ? '存活时长' : validity === 'valid' && registrationComplete ? '已存活' : validity === 'valid' ? '基础会话有效' : '注册至今'
   return {
     state,
     label,
@@ -1360,6 +1462,109 @@ function ActionMenu({
   )
 }
 
+const NON_SECRET_CREDENTIAL_KEYS = new Set([
+  'account_id',
+  'client_id',
+  'email',
+  'imap_account_type',
+  'imap_host',
+  'imap_port',
+  'imap_security',
+  'login_account',
+  'username',
+])
+
+function getCredentialDescriptor(scope: 'provider' | 'platform', keyValue: string) {
+  const key = String(keyValue || '').trim().toLowerCase()
+  const providerLabels: Record<string, [string, string]> = {
+    email: ['邮箱地址', '验证码邮箱地址'],
+    password: ['邮箱登录密码', '仅用于登录验证码邮箱'],
+    login_account: ['邮箱登录账号', 'Microsoft 邮箱实际登录身份'],
+    client_id: ['Microsoft OAuth Client ID', '验证码邮箱 OAuth 客户端标识'],
+    refresh_token: ['邮箱 OAuth Refresh Token', '仅用于读取 Outlook 验证码，不是 Codex RT'],
+    recovery_email: ['邮箱恢复地址', '验证码邮箱的恢复邮箱'],
+    recovery_password: ['恢复邮箱密码', '验证码邮箱的恢复凭据'],
+    totp_secret: ['邮箱 TOTP Secret', '验证码邮箱的两步验证密钥'],
+    mailbox_url: ['邮箱接码 URL', '可能包含邮箱访问密钥'],
+    imap_host: ['IMAP Host', '验证码邮箱 IMAP 地址'],
+    imap_port: ['IMAP Port', '验证码邮箱 IMAP 端口'],
+    imap_security: ['IMAP 安全模式', '验证码邮箱连接配置'],
+    imap_account_type: ['IMAP 账号类型', '验证码邮箱连接配置'],
+  }
+  const platformLabels: Record<string, [string, string]> = {
+    access_token: ['Codex/OpenAI Access Token', '平台访问令牌'],
+    refresh_token: ['Codex/OpenAI Refresh Token (RT)', '最终平台 RT；交付 CPA 使用的是这一项'],
+    id_token: ['Codex/OpenAI ID Token', '平台身份令牌'],
+    session_token: ['ChatGPT Session Token', '平台 Web 会话令牌'],
+    legacy_token: ['平台 Legacy Token', '兼容旧流程的平台令牌'],
+    web_access_token: ['ChatGPT Web Access Token', '平台 Web 会话访问令牌'],
+    account_id: ['OpenAI Account ID', '平台账号标识'],
+  }
+  const fallback: [string, string] = [keyValue, scope === 'provider' ? '验证码邮箱凭据' : '平台凭据']
+  const [label, description] = (scope === 'provider' ? providerLabels[key] : platformLabels[key]) || fallback
+  return {
+    label,
+    description,
+    sensitive: !NON_SECRET_CREDENTIAL_KEYS.has(key),
+  }
+}
+
+function SecretCredentialField({
+  label,
+  description,
+  value,
+  sensitive,
+}: {
+  label: string
+  description: string
+  value: unknown
+  sensitive: boolean
+}) {
+  const [visible, setVisible] = useState(!sensitive)
+  const textValue = String(value || '')
+  const shownValue = sensitive && !visible ? (textValue ? '••••••••••••' : '-') : (textValue || '-')
+  const copyValue = async () => {
+    if (!textValue) return
+    await navigator.clipboard.writeText(textValue)
+  }
+
+  return (
+    <div>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-[11px] text-[var(--text-muted)]">{label}</div>
+        <div className="text-[10px] text-[var(--text-muted)]/70">{description}</div>
+      </div>
+      <div className="mt-1 flex items-start gap-1">
+        <div className="flex-1 rounded-md border border-[var(--border)] bg-black/20 px-2 py-1.5 text-xs font-mono text-[var(--text-secondary)] break-all max-h-40 overflow-y-auto">
+          {shownValue}
+        </div>
+        {sensitive && textValue ? (
+          <button
+            type="button"
+            onClick={() => setVisible(current => !current)}
+            className="mt-1 shrink-0 text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+            title={visible ? '隐藏敏感值' : '显示敏感值'}
+            aria-label={visible ? `隐藏 ${label}` : `显示 ${label}`}
+          >
+            {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+          </button>
+        ) : null}
+        {textValue ? (
+          <button
+            type="button"
+            onClick={copyValue}
+            className="mt-1 shrink-0 text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+            title={`复制 ${label}`}
+            aria-label={`复制 ${label}`}
+          >
+            <Copy className="h-3 w-3" />
+          </button>
+        ) : null}
+      </div>
+    </div>
+  )
+}
+
 // ── 账号详情弹框 ───────────────────────────────────────────
 function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; onSave: () => void }) {
   const [form, setForm] = useState({
@@ -1368,6 +1573,7 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
     cashier_url: getCashierUrl(acc),
   })
   const [saving, setSaving] = useState(false)
+  const [showPrimaryToken, setShowPrimaryToken] = useState(false)
   const overview = getAccountOverview(acc)
   const verificationMailbox = getVerificationMailbox(acc)
   const providerAccounts = getProviderAccounts(acc)
@@ -1381,8 +1587,29 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
     ? overview.probation
     : {}
   const monitorInfo = getContinuousMonitorInfo(acc, Date.now())
-  const copyText = (text: string) => navigator.clipboard.writeText(text)
   const platformCredentials = credentials.filter((item: any) => item.scope === 'platform')
+  const registrationInfo = getRegistrationInfo(acc)
+  const registrationVariant = getRegistrationVariant(registrationInfo)
+  const coreStatusLabel = ['invalid', 'failed', 'pending'].includes(String(registrationInfo.state))
+    ? registrationInfo.label
+    : getDisplayStatus(acc)
+  const coreStatusVariant = registrationInfo.state && registrationInfo.state !== 'unknown'
+    ? registrationVariant
+    : (STATUS_VARIANT[getDisplayStatus(acc)] || 'secondary')
+  const oauthCredentialType = String(
+    overview?.oauth_credential_type
+      || overview?.legacy_extra?.oauth_credential_type
+      || '',
+  ).toLowerCase()
+  const credentialsStageStatus = String(
+    registrationInfo?.stages?.credentials_ready?.status || '',
+  ).toLowerCase()
+  const hasCodexRt = platformCredentials.some((item: any) => (
+    String(item?.key || '').toLowerCase() === 'refresh_token' && String(item?.value || '').trim()
+  )) && oauthCredentialType !== 'chatgpt_web' && (
+    !credentialsStageStatus || ['passed', 'not_required'].includes(credentialsStageStatus)
+  )
+  const lifecycleLocked = ['pending', 'failed', 'invalid'].includes(String(registrationInfo.state))
 
   const save = async () => {
     setSaving(true)
@@ -1411,7 +1638,7 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
               <div>
                 <div className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">核心状态</div>
                 <div className="mt-2 flex flex-wrap items-center gap-2">
-                  <Badge variant={STATUS_VARIANT[getDisplayStatus(acc)] || 'secondary'}>{getDisplayStatus(acc)}</Badge>
+                  <Badge variant={coreStatusVariant}>{coreStatusLabel}</Badge>
                   <span className="text-lg font-semibold tracking-[-0.03em] text-[var(--text-primary)]">{acc.plan_name || overview.plan_name || overview.plan || getPlanState(acc)}</span>
                 </div>
               </div>
@@ -1437,6 +1664,45 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
                 ))}
               </div>
             )}
+          </div>
+
+          <div className={`rounded-xl border p-3 ${registrationVariant === 'success'
+            ? 'border-emerald-500/20 bg-emerald-500/10'
+            : registrationVariant === 'danger'
+              ? 'border-red-500/25 bg-red-500/10'
+              : 'border-amber-500/20 bg-amber-500/10'}`}>
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <div className="text-xs font-semibold text-[var(--text-primary)]">注册交付流水线</div>
+                <div className="mt-1 text-[11px] text-[var(--text-muted)]">
+                  完成 {Number(registrationInfo.completed_stages || 0)}/{Number(registrationInfo.total_stages || 5)} 个核心阶段
+                </div>
+              </div>
+              <Badge variant={registrationVariant}>{registrationInfo.label}</Badge>
+            </div>
+            <div className="mt-3 grid gap-2 sm:grid-cols-5">
+              {Object.entries(registrationInfo.stages || {}).map(([key, stage]: [string, any]) => {
+                const status = String(stage?.status || 'waiting').toLowerCase()
+                const tone = status === 'failed'
+                  ? 'border-red-500/25 bg-red-500/10 text-red-300'
+                  : ['passed', 'not_required'].includes(status)
+                    ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300'
+                    : status === 'in_progress'
+                      ? 'border-blue-500/20 bg-blue-500/10 text-blue-300'
+                      : 'border-[var(--border-soft)] bg-black/10 text-[var(--text-muted)]'
+                return (
+                  <div key={key} className={`rounded-lg border px-2 py-2 text-[10px] ${tone}`} title={String(stage?.error || '') || undefined}>
+                    <div className="font-medium">{stage?.label || REGISTRATION_STAGE_LABELS[key] || key}</div>
+                    <div className="mt-1 opacity-80">{getRegistrationStageStatusLabel(status)}</div>
+                  </div>
+                )
+              })}
+            </div>
+            {registrationInfo.error ? (
+              <div className="mt-2 break-words text-[10px] leading-4 text-red-300" title={registrationInfo.error}>
+                {registrationInfo.error}
+              </div>
+            ) : null}
           </div>
 
           {primaryMetrics.length > 0 && (
@@ -1583,67 +1849,112 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
           })()}
           {providerAccounts.length > 0 && (
             <div className="space-y-2">
-              <label className="text-xs text-[var(--text-muted)] block">Provider Accounts</label>
+              <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 px-3 py-2">
+                <div className="text-xs font-semibold text-blue-200">验证码邮箱凭据（Microsoft / Outlook）</div>
+                <div className="mt-1 text-[11px] leading-4 text-blue-200/70">
+                  这里的 refresh_token 只负责读取邮箱验证码，不是 Codex/OpenAI RT，也不会作为 CPA 平台凭据交付。
+                </div>
+              </div>
               {providerAccounts.map((item: any, index: number) => (
                 <div key={`${item.provider_name || 'provider'}-${item.login_identifier || index}`} className="rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] p-3">
-                  <div className="text-xs font-semibold text-[var(--text-primary)]">
-                    {item.provider_name || item.provider_type || 'provider'}
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-xs font-semibold text-[var(--text-primary)]">
+                      {item.provider_name || item.provider_type || 'provider'}
+                    </div>
+                    <Badge variant="secondary">仅用于邮箱接码</Badge>
                   </div>
                   <div className="mt-1 text-xs text-[var(--text-secondary)] break-all">
                     登录标识: {item.login_identifier || '-'}
                   </div>
                   {item.credentials && Object.keys(item.credentials).length > 0 && (
                     <div className="mt-2 grid gap-2">
-                      {Object.entries(item.credentials).map(([key, value]: [string, any]) => (
-                        <div key={key}>
-                          <div className="text-[11px] text-[var(--text-muted)]">{key}</div>
-                          <div className="flex items-start gap-1">
-                            <div className="flex-1 rounded-md border border-[var(--border)] bg-black/20 px-2 py-1.5 text-xs font-mono text-[var(--text-secondary)] break-all max-h-40 overflow-y-auto">
-                              {String(value || '-')}
-                            </div>
-                            {value ? (
-                              <button onClick={() => copyText(String(value))} className="mt-1 shrink-0 text-[var(--text-muted)] hover:text-[var(--text-secondary)]">
-                                <Copy className="h-3 w-3" />
-                              </button>
-                            ) : null}
-                          </div>
-                        </div>
-                      ))}
+                      {Object.entries(item.credentials).map(([key, value]: [string, any]) => {
+                        const descriptor = getCredentialDescriptor('provider', key)
+                        return (
+                          <SecretCredentialField
+                            key={key}
+                            label={descriptor.label}
+                            description={descriptor.description}
+                            value={value}
+                            sensitive={descriptor.sensitive}
+                          />
+                        )
+                      })}
                     </div>
                   )}
                 </div>
               ))}
             </div>
           )}
-          {platformCredentials.length > 0 && (
+          {(platformCredentials.length > 0 || String(acc.platform).toLowerCase() === 'chatgpt') && (
             <div className="space-y-2">
-              <label className="text-xs text-[var(--text-muted)] block">Platform Credentials</label>
-              {platformCredentials.map((item: any) => (
-                <div key={`${item.scope}-${item.key}`} className="rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] p-3">
-                  <div className="text-[11px] text-[var(--text-muted)]">{item.key}</div>
-                  <div className="mt-1 flex items-start gap-1">
-                    <div className="flex-1 rounded-md border border-[var(--border)] bg-black/20 px-2 py-1.5 text-xs font-mono text-[var(--text-secondary)] break-all max-h-40 overflow-y-auto">
-                      {item.value}
+              <div className={`rounded-xl border px-3 py-2 ${hasCodexRt
+                ? 'border-emerald-500/20 bg-emerald-500/10'
+                : 'border-amber-500/25 bg-amber-500/10'}`}>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="text-xs font-semibold text-[var(--text-primary)]">平台凭据（Codex / OpenAI）</div>
+                    <div className="mt-1 text-[11px] text-[var(--text-muted)]">
+                      只有这里的 Codex/OpenAI Refresh Token 才是最终 RT。
                     </div>
-                    <button onClick={() => copyText(String(item.value || ''))} className="mt-1 shrink-0 text-[var(--text-muted)] hover:text-[var(--text-secondary)]">
-                      <Copy className="h-3 w-3" />
-                    </button>
                   </div>
+                  <Badge variant={hasCodexRt ? 'success' : 'warning'}>{hasCodexRt ? 'Codex RT 已获取' : 'Codex RT 缺失'}</Badge>
                 </div>
+              </div>
+              {platformCredentials.map((item: any) => (
+                (() => {
+                  const descriptor = getCredentialDescriptor('platform', String(item.key || 'credential'))
+                  return (
+                    <div key={`${item.scope}-${item.key}`} className="rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] p-3">
+                      <SecretCredentialField
+                        label={descriptor.label}
+                        description={descriptor.description}
+                        value={item.value}
+                        sensitive={descriptor.sensitive}
+                      />
+                    </div>
+                  )
+                })()
               ))}
+              {platformCredentials.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-amber-500/25 px-3 py-3 text-xs text-amber-200/80">
+                  当前账号尚未拿到 Codex 平台凭据，不能计为完整注册成功，也不能上传 CPA。
+                </div>
+              ) : null}
             </div>
           )}
           <div>
             <label className="text-xs text-[var(--text-muted)] block mb-1">生命周期状态</label>
             <select value={form.lifecycle_status} onChange={e => setForm(f => ({ ...f, lifecycle_status: e.target.value }))}
-              className="control-surface appearance-none">
-              {['registered','trial','subscribed','expired','invalid'].map(s => <option key={s} value={s}>{s}</option>)}
+              disabled={lifecycleLocked}
+              className="control-surface appearance-none disabled:cursor-not-allowed disabled:opacity-60">
+              {['pending_verification','manual_phone_required','registered','trial','subscribed','expired','invalid'].map(s => <option key={s} value={s}>{s}</option>)}
             </select>
+            {lifecycleLocked ? (
+              <div className="mt-1 text-[10px] leading-4 text-amber-300/80">
+                注册未完成或账号已失效时，生命周期由流水线自动维护，不能手动改成“已注册”。
+              </div>
+            ) : null}
           </div>
           <div>
-            <label className="text-xs text-[var(--text-muted)] block mb-1">主凭证</label>
-            <textarea value={form.primary_token} onChange={e => setForm(f => ({ ...f, primary_token: e.target.value }))}
-              rows={2} className="control-surface control-surface-mono resize-none" />
+            <label className="text-xs text-[var(--text-muted)] block mb-1">主凭证（兼容字段）</label>
+            <div className="flex items-center gap-1">
+              <input
+                type={showPrimaryToken ? 'text' : 'password'}
+                value={form.primary_token}
+                onChange={e => setForm(f => ({ ...f, primary_token: e.target.value }))}
+                className="control-surface control-surface-mono"
+                autoComplete="off"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPrimaryToken(current => !current)}
+                className="shrink-0 rounded-md border border-[var(--border)] p-2 text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+                title={showPrimaryToken ? '隐藏主凭证' : '显示主凭证'}
+              >
+                {showPrimaryToken ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              </button>
+            </div>
           </div>
           <div>
             <label className="text-xs text-[var(--text-muted)] block mb-1">试用链接</label>
@@ -1872,6 +2183,7 @@ export default function Accounts() {
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
   const [detail, setDetail] = useState<any | null>(null)
+  const [detailLoadingId, setDetailLoadingId] = useState(0)
   const [showImport, setShowImport] = useState(false)
   const [showAdd, setShowAdd] = useState(false)
   const [platformsMap, setPlatformsMap] = useState<Record<string, any>>({})
@@ -1975,21 +2287,27 @@ export default function Accounts() {
   }, [accounts])
 
   
-  const exportCsv = () => {
-    const header = 'email,password,display_status,lifecycle_status,plan_state,validity_status,cashier_url,created_at'
-    const rowsSource = selectedIds.size > 0 ? accounts.filter(a => selectedIds.has(a.id)) : accounts
-    const rows = rowsSource.map(a => [
-      a.email,
-      a.password,
-      getDisplayStatus(a),
-      getLifecycleStatus(a),
-      getPlanState(a),
-      getValidityStatus(a),
-      getCashierUrl(a),
-      a.created_at,
-    ].map(escapeCsvField).join(','))
-    const blob = new Blob([[header, ...rows].join('\n')], { type: 'text/csv' })
-    triggerBrowserDownload(blob, `${tab}_accounts.csv`)
+  const exportCsv = async () => {
+    setError('')
+    try {
+      const summaries = selectedIds.size > 0 ? accounts.filter(a => selectedIds.has(a.id)) : accounts
+      const rowsSource = await Promise.all(summaries.map(account => apiFetch(`/accounts/${account.id}`)))
+      const header = 'email,password,display_status,lifecycle_status,plan_state,validity_status,cashier_url,created_at'
+      const rows = rowsSource.map(a => [
+        a.email,
+        a.password,
+        getDisplayStatus(a),
+        getLifecycleStatus(a),
+        getPlanState(a),
+        getValidityStatus(a),
+        getCashierUrl(a),
+        a.created_at,
+      ].map(escapeCsvField).join(','))
+      const blob = new Blob([[header, ...rows].join('\n')], { type: 'text/csv' })
+      triggerBrowserDownload(blob, `${tab}_accounts.csv`)
+    } catch (exportError: any) {
+      setError(exportError?.message || '导出账号失败')
+    }
   }
 
   const pageIds = accounts.map(acc => acc.id)
@@ -2017,6 +2335,29 @@ export default function Accounts() {
   const copy = (text: string) => {
     if (navigator.clipboard) { navigator.clipboard.writeText(text) }
     else { const el = document.createElement('textarea'); el.value = text; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el) }
+  }
+  const openAccountDetail = async (account: any) => {
+    const accountId = Number(account?.id || 0)
+    if (!accountId || detailLoadingId === accountId) return
+    setDetailLoadingId(accountId)
+    setError('')
+    try {
+      const fullAccount = await apiFetch(`/accounts/${accountId}`)
+      setDetail(fullAccount)
+    } catch (detailError: any) {
+      setError(detailError?.message || '读取账号详情失败')
+    } finally {
+      setDetailLoadingId(0)
+    }
+  }
+  const copyAccountPassword = async (account: any) => {
+    setError('')
+    try {
+      const fullAccount = await apiFetch(`/accounts/${account.id}`)
+      copy(String(fullAccount?.password || ''))
+    } catch (passwordError: any) {
+      setError(passwordError?.message || '读取密码失败')
+    }
   }
   const emailApiLine = (email: string) =>
     email
@@ -2145,6 +2486,14 @@ export default function Accounts() {
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
+      {detailLoadingId > 0 && !detail && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/15 pointer-events-none">
+          <div className="inline-flex items-center gap-2 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] px-4 py-3 text-xs text-[var(--text-secondary)] shadow-xl">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            正在安全读取账号详情…
+          </div>
+        </div>
+      )}
       {detail && <DetailModal acc={detail} onClose={() => setDetail(null)} onSave={() => { setDetail(null); load() }} />}
       {showImport && <ImportModal platform={tab} onClose={() => setShowImport(false)} onDone={() => { setShowImport(false); load() }} />}
       {showAdd && <AddModal platform={tab} onClose={() => setShowAdd(false)} onDone={() => { setShowAdd(false); load() }} />}
@@ -2919,7 +3268,7 @@ export default function Accounts() {
                 const sub2SyncInfo = getSub2SyncInfo(acc)
                 return (
               <tr key={acc.id} className="group border-b border-[var(--border)]/30 hover:bg-[var(--text-primary)]/[0.02] transition-colors cursor-pointer"
-                  onClick={() => setDetail(acc)}>
+                  onClick={() => void openAccountDetail(acc)}>
                 <td className="px-3 py-2.5" onClick={e => e.stopPropagation()}>
                   <input
                     type="checkbox"
@@ -2960,14 +3309,21 @@ export default function Accounts() {
                 <td className="px-3 py-2.5 font-mono text-[13px] text-[var(--text-muted)] align-top">
                   <div className="flex min-w-0 items-center gap-1.5">
                     <span className="truncate select-none tracking-[0.18em] text-[var(--text-muted)]" title="点击复制按钮复制密码">••••••••</span>
-                    <button onClick={e => { e.stopPropagation(); copy(acc.password) }} className="text-[var(--text-muted)] hover:text-[var(--text-primary)] opacity-0 group-hover:opacity-100 transition-opacity"><Copy className="h-3 w-3" /></button>
+                    <button onClick={e => { e.stopPropagation(); void copyAccountPassword(acc) }} className="text-[var(--text-muted)] hover:text-[var(--text-primary)] opacity-0 group-hover:opacity-100 transition-opacity" title="按需读取并复制密码"><Copy className="h-3 w-3" /></button>
                   </div>
                 </td>
                 <td className="px-3 py-2.5 align-top">
                   <div className="min-w-0 flex flex-col items-start gap-1.5">
                     {(() => {
                       const status = getDisplayStatus(acc);
-                      const variant = String(STATUS_VARIANT[status] || 'secondary');
+                      const registration = getRegistrationInfo(acc);
+                      const showRegistrationStatus = ['invalid', 'failed', 'pending'].includes(String(registration.state));
+                      const variant = String(showRegistrationStatus
+                        ? getRegistrationVariant(registration)
+                        : STATUS_VARIANT[status] || 'secondary');
+                      const statusLabel = showRegistrationStatus
+                        ? String(registration.label || status)
+                        : translateAccountStatus(status, language);
                       const styles = (({
                         success: "bg-emerald-500/10 text-emerald-500 ring-emerald-500/20",
                         warning: "bg-amber-500/10 text-amber-500 ring-amber-500/20",
@@ -2979,10 +3335,10 @@ export default function Accounts() {
                       return (
                         <span
                           className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${styles}`}
-                          title={getValidityReason(acc) || undefined}
+                          title={String(registration.error || getValidityReason(acc) || '') || undefined}
                         >
                           <span className={`mr-1 h-1 w-1 rounded-full ${variant === 'success' ? 'bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.6)]' : variant === 'warning' ? 'bg-amber-500 shadow-[0_0_4px_rgba(245,158,11,0.6)]' : variant === 'danger' ? 'bg-red-500 shadow-[0_0_4px_rgba(239,68,68,0.6)]' : variant === 'default' ? 'bg-blue-500' : 'bg-gray-400'}`}></span>
-                          {translateAccountStatus(status, language)}
+                          {statusLabel}
                         </span>
                       );
                     })()}
@@ -3059,7 +3415,7 @@ export default function Accounts() {
                   <div className="flex items-center justify-end opacity-60 group-hover:opacity-100 transition-opacity">
                     <ActionMenu
                       acc={acc}
-                      onDetail={() => setDetail(acc)}
+                      onDetail={() => void openAccountDetail(acc)}
                       onDelete={() => load()}
                       onResult={(title, payload) => setActionResult({ title, payload })}
                       onChanged={() => load()}

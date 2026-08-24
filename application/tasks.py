@@ -159,6 +159,20 @@ def _register_task_outcome(
 
 _REGISTRATION_FAILURE_CATEGORIES = (
     ("email_already_registered", "邮箱已注册", ("user_already_exists", "account already exists")),
+    (
+        "account_rejected",
+        "账号被远端停用",
+        (
+            "account_deactivated",
+            "deleted or deactivated",
+            "you do not have an account",
+            "authentication token has been invalidated",
+            "authentication token is invalidated",
+            "account has been deactivated",
+            "account has been deleted",
+            "suspicious",
+        ),
+    ),
     ("mailbox_auth", "邮箱授权失效", ("invalid_grant", "refresh_token", "unauthorized or expired")),
     ("mailbox_otp", "邮箱取码失败", ("获取验证码", "等待验证码", "mailbox_otp")),
     (
@@ -175,7 +189,6 @@ _REGISTRATION_FAILURE_CATEGORIES = (
             "curl:",
         ),
     ),
-    ("account_rejected", "账号被远端拒绝", ("deactivated", "deleted", "suspicious")),
     (
         "phone_verification",
         "手机号验证失败",
@@ -215,6 +228,62 @@ def _registration_failure_summary(errors: list[str]) -> list[dict[str, Any]]:
         )
         item["count"] += 1
     return sorted(grouped.values(), key=lambda item: (-int(item["count"]), str(item["code"])))
+
+
+_TERMINAL_REGISTRATION_ACCOUNT_ERROR_MARKERS = (
+    "account_deactivated",
+    "deleted or deactivated",
+    "you do not have an account",
+    "authentication token has been invalidated",
+    "authentication token is invalidated",
+    "account has been deactivated",
+    "account has been deleted",
+)
+
+
+def _is_terminal_registration_account_error(error: object) -> bool:
+    """Return True only for explicit remote account terminal states.
+
+    Generic 401/OAuth/timeout errors remain retryable or pending because they
+    can be caused by a transient session. These markers are intentionally
+    narrow: the remote side has explicitly said that the account no longer
+    exists or that its authentication identity was invalidated.
+    """
+    lowered = str(error or "").strip().lower()
+    return any(marker in lowered for marker in _TERMINAL_REGISTRATION_ACCOUNT_ERROR_MARKERS)
+
+
+def _mark_terminal_registration_account(
+    account,
+    *,
+    stage: str,
+    error: object,
+) -> None:
+    """Persist a terminal registration failure as invalid, never pending."""
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    error_text = str(error or "远端账号已失效").strip()
+    account.status = AccountStatus.INVALID
+    _registration_pipeline_update(
+        account,
+        stage,
+        "failed",
+        error=error_text,
+        detail={"terminal": True, "account_status": AccountStatus.INVALID.value},
+    )
+    account_extra = dict(getattr(account, "extra", {}) or {})
+    overview = dict(account_extra.get("account_overview") or {})
+    overview.update(
+        {
+            "validity_status": "invalid",
+            "validity_reason": error_text[:500],
+            "validity_error_code": "registration_account_deactivated",
+            "checked_at": now,
+        }
+    )
+    overview.setdefault("invalid_detected_at", now)
+    overview.setdefault("deactivated_at", now)
+    account_extra["account_overview"] = overview
+    account.extra = account_extra
 
 
 def _task_lock(task_id: str) -> threading.Lock:
@@ -1491,6 +1560,9 @@ def _bool_config(value: Any, default: bool) -> bool:
 
 def _account_has_codex_rt(account) -> bool:
     extra = dict(getattr(account, "extra", {}) or {})
+    credential_type = str(extra.get("oauth_credential_type") or "").strip().lower()
+    if credential_type and credential_type != "codex_oauth":
+        return False
     refresh = str(extra.get("refresh_token") or "").strip()
     access = str(extra.get("access_token") or getattr(account, "token", "") or "").strip()
     return bool(refresh and access)
@@ -2835,17 +2907,25 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     )
                     _registration_pipeline_update(account, "phone_verified", "passed")
                 except Exception as phone_exc:
-                    account.status = AccountStatus.PENDING_VERIFICATION
-                    _registration_pipeline_update(
-                        account,
-                        "phone_verified",
-                        "failed",
-                        error=str(phone_exc),
-                    )
+                    terminal_account_failure = _is_terminal_registration_account_error(phone_exc)
+                    if terminal_account_failure:
+                        _mark_terminal_registration_account(
+                            account,
+                            stage="phone_verified",
+                            error=phone_exc,
+                        )
+                    else:
+                        account.status = AccountStatus.PENDING_VERIFICATION
+                        _registration_pipeline_update(
+                            account,
+                            "phone_verified",
+                            "failed",
+                            error=str(phone_exc),
+                        )
                     account_extra = dict(getattr(account, "extra", {}) or {})
                     overview = dict(account_extra.get("account_overview") or {})
                     overview["phone_binding"] = {
-                        "status": "failed",
+                        "status": "account_invalid" if terminal_account_failure else "failed",
                         "provider": str(extra.get("sms_provider") or ""),
                         "error": str(phone_exc),
                         "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -2873,13 +2953,20 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 )
             except Exception as codex_exc:
                 if require_phone_verification or require_codex_rt:
-                    account.status = AccountStatus.PENDING_VERIFICATION
-                    _registration_pipeline_update(
-                        account,
-                        "credentials_ready",
-                        "failed",
-                        error=str(codex_exc),
-                    )
+                    if _is_terminal_registration_account_error(codex_exc):
+                        _mark_terminal_registration_account(
+                            account,
+                            stage="credentials_ready",
+                            error=codex_exc,
+                        )
+                    else:
+                        account.status = AccountStatus.PENDING_VERIFICATION
+                        _registration_pipeline_update(
+                            account,
+                            "credentials_ready",
+                            "failed",
+                            error=str(codex_exc),
+                        )
                     account_extra = dict(getattr(account, "extra", {}) or {})
                     account_extra["codex_credential_status"] = {
                         "status": "failed",
@@ -3140,11 +3227,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             # related so we can rotate Indonesia (or other) numbers until success.
             if email_account_created and _bool_config(extra.get("require_phone_verification"), False):
                 err_text = str(exc or "")
-                account_deactivated = (
-                    "account_deactivated" in err_text.lower()
-                    or "deleted or deactivated" in err_text.lower()
-                    or "you do not have an account" in err_text.lower()
-                )
+                account_deactivated = _is_terminal_registration_account_error(err_text)
                 if account_deactivated:
                     logger.log(
                         "当前邮箱账号已被目标服务停用，已释放号码并停止该账号流程；"
@@ -3193,12 +3276,19 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         (account_overview.get("registration_pipeline") or {}).get("current_stage")
                         or "registration"
                     )
-                    _registration_pipeline_update(
-                        account,
-                        current_stage,
-                        "failed",
-                        error=error,
-                    )
+                    if _is_terminal_registration_account_error(error):
+                        _mark_terminal_registration_account(
+                            account,
+                            stage=current_stage,
+                            error=error,
+                        )
+                    else:
+                        _registration_pipeline_update(
+                            account,
+                            current_stage,
+                            "failed",
+                            error=error,
+                        )
                     save_account(account)
                 except Exception as pipeline_exc:
                     logger.log(

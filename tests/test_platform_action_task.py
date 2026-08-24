@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
 
 import pytest
 
 from application import tasks as tasks_module
-from core.base_platform import Account
+from core.base_platform import Account, AccountStatus
 from domain.actions import ActionExecutionResult
 from domain.actions import ActionExecutionCommand
 from infrastructure import platform_runtime as runtime_module
@@ -195,6 +196,94 @@ def test_chatgpt_register_task_stops_after_consecutive_network_failures(monkeypa
         event[0] == "log" and "注册网络熔断已触发" in event[1]
         for event in logger.events
     )
+
+
+@pytest.mark.parametrize(
+    ("phone_error", "expected_status", "expected_binding", "expected_validity"),
+    [
+        (
+            "手机号验证会话重建失败: You do not have an account",
+            AccountStatus.INVALID,
+            "account_invalid",
+            "invalid",
+        ),
+        (
+            "手机号验证失败: 等待短信验证码超时",
+            AccountStatus.PENDING_VERIFICATION,
+            "failed",
+            "",
+        ),
+    ],
+)
+def test_phone_registration_failure_distinguishes_terminal_account_from_retryable_sms(
+    monkeypatch,
+    phone_error,
+    expected_status,
+    expected_binding,
+    expected_validity,
+):
+    saved_accounts = []
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email=email or "phone-state@example.com",
+                password=password or "Secret123!",
+                user_id="acct_phone_state",
+                extra={"access_token": "web-access-token"},
+            )
+
+    def fail_phone_verification(**_kwargs):
+        raise RuntimeError(phone_error)
+
+    def capture_account(account):
+        saved_accounts.append(copy.deepcopy(account))
+        return None
+
+    monkeypatch.setattr(tasks_module, "get", lambda _platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(tasks_module, "_build_platform_instance", lambda *args, **kwargs: FakePlatform())
+    monkeypatch.setattr(tasks_module, "_complete_required_chatgpt_phone_verification", fail_phone_verification)
+    monkeypatch.setattr(tasks_module, "save_account", capture_account)
+    monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_sub2api", lambda *args, **kwargs: None)
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "email": "phone-state@example.com",
+            "password": "Secret123!",
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "require_phone_verification": True,
+                "email_pre_phone_max_attempts": 1,
+                "post_registration_probation_enabled": False,
+            },
+        },
+        logger,
+    )
+
+    assert logger.finished[0] == tasks_module.TASK_STATUS_FAILED
+    assert saved_accounts
+    account = saved_accounts[-1]
+    overview = account.extra["account_overview"]
+    assert account.status == expected_status
+    assert overview["phone_binding"]["status"] == expected_binding
+    assert overview.get("validity_status", "") == expected_validity
+    assert overview["registration_pipeline"]["stages"]["phone_verified"]["status"] == "failed"
+    if expected_status == AccountStatus.INVALID:
+        assert overview["invalid_detected_at"]
+        assert overview["validity_error_code"] == "registration_account_deactivated"
+        assert overview["registration_pipeline"]["stages"]["phone_verified"]["detail"]["terminal"] is True
 
 
 def test_email_then_phone_keeps_parallel_attempt_window_when_target_is_one(monkeypatch):
