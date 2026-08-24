@@ -30,6 +30,10 @@ import {
 } from 'lucide-react'
 
 import { TaskLogPanel } from '@/components/tasks/TaskLogPanel'
+import {
+  SmsBowerPriceSelector,
+  type SmsBowerSelectionValue,
+} from '@/components/registration/SmsBowerPriceSelector'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -86,6 +90,7 @@ const DEFAULT_FORM: Record<string, any> = {
   chrome_cdp_url: '',
   mail_provider: '',
   sms_provider: '',
+  require_phone_verification: false,
   phone_bind_email_after_registration: true,
   email_otp_timeout_seconds: 300,
   sub2api_auto_sync: false,
@@ -99,7 +104,25 @@ const DEFAULT_FORM: Record<string, any> = {
   post_registration_probation_enabled: true,
   post_registration_probation_interval_seconds: 60,
   network_circuit_break_threshold: 3,
+  sms_country: '',
+  sms_countries: '',
+  sms_max_price: '',
+  smsbower_provider_ids_by_country: {},
+  smsbower_auto_country_min_stock: 1,
+  sms_usd_cny_rate: 7.2,
+  smsbower_provider_reject_threshold: 2,
+  sms_code_timeout_seconds: 180,
+  sms_phone_max_attempts: 8,
+  sms_no_numbers_wait_seconds: 120,
+  sms_tier_cooldown_minutes: 45,
 }
+
+const SMSBOWER_MANAGED_FIELD_KEYS = new Set([
+  'smsbower_default_service',
+  'smsbower_default_country',
+  'smsbower_max_price',
+  'smsbower_auto_country',
+])
 
 const SMS_COUNTRY_PROXY_REGIONS: Record<string, { code: string; label: string }> = {
   '187': { code: 'US', label: '美国' },
@@ -199,14 +222,16 @@ function ToggleRow({
   description,
   checked,
   onChange,
+  disabled = false,
 }: {
   label: string
   description?: string
   checked: boolean
   onChange: (checked: boolean) => void
+  disabled?: boolean
 }) {
   return (
-    <label className="flex min-h-12 cursor-pointer items-center justify-between gap-4 rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] px-4 py-3 transition-colors hover:border-[var(--accent-edge)]">
+    <label className={`flex min-h-12 items-center justify-between gap-4 rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] px-4 py-3 transition-colors ${disabled ? 'cursor-not-allowed opacity-65' : 'cursor-pointer hover:border-[var(--accent-edge)]'}`}>
       <span className="min-w-0">
         <span className="block text-sm font-medium text-[var(--text-primary)]">{label}</span>
         {description ? <span className="mt-0.5 block text-[11px] leading-4 text-[var(--text-muted)]">{description}</span> : null}
@@ -215,6 +240,7 @@ function ToggleRow({
         type="checkbox"
         checked={checked}
         onChange={(event) => onChange(event.target.checked)}
+        disabled={disabled}
         className="checkbox-accent h-4 w-4 shrink-0"
       />
     </label>
@@ -298,13 +324,26 @@ function SectionHeading({
 
 function selectedSmsCountry(form: Record<string, any>) {
   const value = [
-    form.smsbower_default_country,
     form.sms_country,
+    form.smsbower_default_country,
     form.herosms_country,
     form.herosms_default_country,
     form.sms_activate_default_country,
   ].find(item => String(item || '').trim())
   return String(value || '').trim()
+}
+
+function normalizeSmsCountryIds(value: unknown, fallback = '') {
+  const raw = Array.isArray(value) ? value : String(value || '').split(/[\s,;]+/)
+  const countries = Array.from(new Set(raw.map(item => String(item || '').trim()).filter(Boolean)))
+  const normalizedFallback = String(fallback || '').trim()
+  if (countries.length === 0 && normalizedFallback) countries.push(normalizedFallback)
+  return countries
+}
+
+function numberOr(value: unknown, fallback: number) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : fallback
 }
 
 function infer711ProxyRegion(proxy: string) {
@@ -397,6 +436,10 @@ export default function RegisterWorkbench() {
             chrome_cdp_url: cfg.chrome_cdp_url || current.chrome_cdp_url,
             mail_provider: getDefaultProviderKey(loadedOptions.mailbox_settings || []) || current.mail_provider,
             sms_provider: getDefaultProviderKey(loadedOptions.sms_settings || []) || current.sms_provider,
+            require_phone_verification: asBoolean(
+              cfg.require_phone_verification,
+              current.require_phone_verification,
+            ),
             sub2api_auto_sync: asBoolean(cfg.sub2api_auto_sync, current.sub2api_auto_sync),
             sub2api_proxy_id: Number(cfg.sub2api_proxy_id ?? current.sub2api_proxy_id ?? 0),
             sub2api_agent_identity_region: String(cfg.sub2api_agent_identity_region || current.sub2api_agent_identity_region || 'CO').toUpperCase(),
@@ -477,6 +520,7 @@ export default function RegisterWorkbench() {
   const currentSmsProvider = (configOptions.sms_providers || [])
     .find(provider => provider.value === form.sms_provider) || null
   const currentSmsSetting = getProviderSetting(configOptions.sms_settings || [], form.sms_provider)
+  const isSmsBower = form.sms_provider === 'smsbower_api' || form.sms_provider === 'smsbower'
   const allProviderFieldKeys = useMemo(
     () => listProviderFieldKeys([
       ...(configOptions.mailbox_providers || []),
@@ -528,6 +572,31 @@ export default function RegisterWorkbench() {
           changed = true
         }
       })
+      if (currentSmsProvider.value === 'smsbower_api' || currentSmsProvider.value === 'smsbower') {
+        const configuredCountry = String(
+          values.sms_country
+          || values.smsbower_country
+          || values.smsbower_default_country
+          || '',
+        ).trim()
+        const configuredMaxPrice = String(
+          values.sms_max_price
+          || values.smsbower_max_price
+          || '',
+        ).trim()
+        if (!String(current.sms_country || '').trim()) {
+          const initialCountry = configuredCountry || '187'
+          next.sms_country = initialCountry
+          next.sms_countries = initialCountry
+          changed = true
+        }
+        if (!String(current.sms_max_price || '').trim() && configuredMaxPrice) {
+          const normalizedPrice = configuredMaxPrice === '-1' ? '0' : configuredMaxPrice
+          next.sms_max_price = normalizedPrice
+          next.smsbower_max_price = normalizedPrice
+          changed = true
+        }
+      }
       return changed ? next : current
     })
   }, [currentSmsProvider, currentSmsSetting, form.sms_provider])
@@ -572,13 +641,79 @@ export default function RegisterWorkbench() {
 
   const needsMailbox = ['mailbox', 'phone'].includes(form.identity_provider)
   const needsSms = form.identity_provider === 'phone' || Boolean(
-    form.platform === 'chatgpt' && form.sub2api_auto_sync && form.identity_provider === 'mailbox',
+    form.platform === 'chatgpt'
+    && form.identity_provider === 'mailbox'
+    && (form.require_phone_verification || form.sub2api_auto_sync),
   )
+  const smsCountries = useMemo(
+    () => normalizeSmsCountryIds(form.sms_countries, selectedSmsCountry(form)),
+    [form],
+  )
+  const smsBowerProviderIdsByCountry = useMemo(() => {
+    const raw = form.smsbower_provider_ids_by_country
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+    return Object.fromEntries(
+      Object.entries(raw)
+        .map(([country, ids]) => [
+          String(country).trim(),
+          Array.from(new Set(
+            (Array.isArray(ids) ? ids : String(ids || '').split(/[\s,;]+/))
+              .map(item => String(item || '').trim())
+              .filter(Boolean),
+          )),
+        ] as const)
+        .filter(([country, ids]) => country && ids.length > 0),
+    )
+  }, [form.smsbower_provider_ids_by_country])
+  const smsBowerCredentialsConfigured = Boolean(
+    Object.values(currentSmsSetting?.auth_preview || {}).some(value => String(value || '').trim())
+    || Object.values(currentSmsSetting?.auth || {}).some(value => String(value || '').trim()),
+  )
+  const smsBowerSelection: SmsBowerSelectionValue = {
+    country: selectedSmsCountry(form) || smsCountries[0] || '187',
+    countries: smsCountries,
+    maxPriceUsd: String(form.sms_max_price || form.smsbower_max_price || '0.13'),
+    providerIdsByCountry: smsBowerProviderIdsByCountry,
+    minStock: Math.max(numberOr(form.smsbower_auto_country_min_stock, 1), 0),
+    usdCnyRate: Math.max(numberOr(form.sms_usd_cny_rate, 7.2), 0.01),
+    providerRejectThreshold: Math.max(numberOr(form.smsbower_provider_reject_threshold, 2), 1),
+    codeTimeoutSeconds: Math.min(Math.max(numberOr(form.sms_code_timeout_seconds, 180), 180), 300),
+    phoneMaxAttempts: Math.min(Math.max(numberOr(form.sms_phone_max_attempts, 8), 1), 20),
+    noNumbersWaitSeconds: Math.min(Math.max(numberOr(form.sms_no_numbers_wait_seconds, 120), 0), 600),
+    tierCooldownMinutes: Math.min(Math.max(numberOr(form.sms_tier_cooldown_minutes, 45), 30), 60),
+  }
+  const applySmsBowerSelection = useCallback((patch: Partial<SmsBowerSelectionValue>) => {
+    setForm(current => {
+      const next = { ...current }
+      if (patch.country !== undefined) next.sms_country = patch.country
+      if (patch.countries !== undefined) next.sms_countries = patch.countries.join(',')
+      if (patch.maxPriceUsd !== undefined) {
+        next.sms_max_price = patch.maxPriceUsd
+        next.smsbower_max_price = patch.maxPriceUsd
+      }
+      if (patch.providerIdsByCountry !== undefined) {
+        next.smsbower_provider_ids_by_country = patch.providerIdsByCountry
+      }
+      if (patch.minStock !== undefined) next.smsbower_auto_country_min_stock = patch.minStock
+      if (patch.usdCnyRate !== undefined) next.sms_usd_cny_rate = patch.usdCnyRate
+      if (patch.providerRejectThreshold !== undefined) next.smsbower_provider_reject_threshold = patch.providerRejectThreshold
+      if (patch.codeTimeoutSeconds !== undefined) next.sms_code_timeout_seconds = patch.codeTimeoutSeconds
+      if (patch.phoneMaxAttempts !== undefined) next.sms_phone_max_attempts = patch.phoneMaxAttempts
+      if (patch.noNumbersWaitSeconds !== undefined) next.sms_no_numbers_wait_seconds = patch.noNumbersWaitSeconds
+      if (patch.tierCooldownMinutes !== undefined) next.sms_tier_cooldown_minutes = patch.tierCooldownMinutes
+      return next
+    })
+  }, [])
   const summaryRegistration = needsSms && form.identity_provider === 'mailbox'
     ? '邮箱注册 + 手机验证'
     : registrationOptions.find(option => (
       option.identityProvider === form.identity_provider && option.oauthProvider === form.oauth_provider
     ))?.label || '-'
+  const summarySms = !needsSms
+    ? ''
+    : isSmsBower
+      ? `SMSBower · ${smsCountries.length} 国 · ${Number(smsBowerSelection.maxPriceUsd || 0) > 0 ? `≤ $${smsBowerSelection.maxPriceUsd}` : '不限价'}`
+      : currentSmsProvider?.label || form.sms_provider || '-'
   const summaryExecutor = executorOptions.find(option => option.value === form.executor_type)?.label || '-'
   const summaryVerification = getCaptchaStrategyLabel(
     form.executor_type,
@@ -621,6 +756,12 @@ export default function RegisterWorkbench() {
     }
     if (needsMailbox && !form.mail_provider) issues.push('请选择邮箱服务')
     if (needsSms && !form.sms_provider) issues.push('请选择短信服务')
+    if (needsSms && isSmsBower) {
+      const maxPrice = Number(smsBowerSelection.maxPriceUsd)
+      if (smsCountries.length === 0) issues.push('请至少选择一个 SMSBower 候选国家')
+      if (smsCountries.includes('12')) issues.push('SMSBower 虚拟/VOIP 国家不能用于 ChatGPT 手机号注册')
+      if (!Number.isFinite(maxPrice) || maxPrice < 0) issues.push('SMSBower 单号最高价格必须是大于等于 0 的数字')
+    }
     if (sub2ProxyMissing) issues.push('Sub2 自动上传需要有效代理 ID')
     if (registrationProxyMismatch || sub2ProxyMismatch) issues.push('注册代理、短信国家和 Sub2 地区需要保持一致')
     if (Number(form.count || 0) < 1) issues.push('注册数量至少为 1')
@@ -632,11 +773,14 @@ export default function RegisterWorkbench() {
     form.executor_type,
     form.mail_provider,
     form.sms_provider,
+    isSmsBower,
     loadingOptions,
     needsMailbox,
     needsSms,
     registrationOptions.length,
     registrationProxyMismatch,
+    smsBowerSelection.maxPriceUsd,
+    smsCountries,
     sub2ProxyMismatch,
     sub2ProxyMissing,
   ])
@@ -695,8 +839,8 @@ export default function RegisterWorkbench() {
           : undefined,
         require_phone_verification: Boolean(
           form.platform === 'chatgpt'
-          && form.sub2api_auto_sync
           && form.identity_provider === 'mailbox'
+          && (form.require_phone_verification || form.sub2api_auto_sync)
         ),
         register_mode: form.identity_provider === 'phone'
           ? 'phone'
@@ -727,6 +871,39 @@ export default function RegisterWorkbench() {
       allProviderFieldKeys.forEach(fieldKey => {
         if (form[fieldKey] !== undefined) extra[fieldKey] = form[fieldKey]
       })
+      if (form.platform === 'chatgpt' && needsSms && isSmsBower) {
+        const selectedCountryIds = normalizeSmsCountryIds(form.sms_countries, form.sms_country)
+        if (selectedCountryIds.length === 0) throw new Error('请至少选择一个 SMSBower 候选国家')
+        if (selectedCountryIds.includes('12')) throw new Error('虚拟/VOIP 国家不能用于 ChatGPT 手机号注册')
+
+        const selectedProviderIdsByCountry = Object.fromEntries(
+          selectedCountryIds
+            .map(country => [country, smsBowerProviderIdsByCountry[country] || []] as const)
+            .filter(([, ids]) => ids.length > 0),
+        )
+        const maxPrice = String(form.sms_max_price || form.smsbower_max_price || '0.13').trim()
+        extra.sms_service = 'dr'
+        extra.sms_country = selectedCountryIds[0]
+        extra.sms_countries = selectedCountryIds.join(',')
+        extra.sms_max_price = maxPrice
+        extra.smsbower_max_price = maxPrice
+        extra.smsbower_provider_ids_by_country = selectedProviderIdsByCountry
+        extra.smsbower_allow_virtual = false
+        extra.smsbower_auto_country = false
+        extra.smsbower_auto_country_min_stock = Math.max(numberOr(form.smsbower_auto_country_min_stock, 1), 0)
+        extra.smsbower_auto_country_max_price = Math.max(numberOr(maxPrice, 0), 0)
+        extra.smsbower_provider_reject_threshold = Math.max(numberOr(form.smsbower_provider_reject_threshold, 2), 1)
+        extra.sms_code_timeout_seconds = Math.min(Math.max(numberOr(form.sms_code_timeout_seconds, 180), 180), 300)
+        extra.sms_phone_max_attempts = Math.min(Math.max(numberOr(form.sms_phone_max_attempts, 8), 1), 20)
+        extra.sms_no_numbers_wait_seconds = Math.min(Math.max(numberOr(form.sms_no_numbers_wait_seconds, 120), 0), 600)
+        extra.sms_tier_cooldown_minutes = Math.min(Math.max(numberOr(form.sms_tier_cooldown_minutes, 45), 30), 60)
+        extra.sms_no_numbers_retry_interval_seconds = 20
+        if (selectedCountryIds.length === 1 && selectedProviderIdsByCountry[selectedCountryIds[0]]?.length) {
+          extra.smsbower_provider_ids = selectedProviderIdsByCountry[selectedCountryIds[0]].join(',')
+        } else {
+          delete extra.smsbower_provider_ids
+        }
+      }
       const created = await apiFetch('/tasks/register', {
         method: 'POST',
         body: JSON.stringify({
@@ -966,6 +1143,19 @@ export default function RegisterWorkbench() {
                     <div className="text-sm text-amber-300">没有可用邮箱服务，请先到设置中启用 Provider。</div>
                   )}
                   {currentMailboxProvider?.description ? <p className="mt-3 text-xs leading-5 text-[var(--text-muted)]">{currentMailboxProvider.description}</p> : null}
+                  {form.platform === 'chatgpt' && form.identity_provider === 'mailbox' ? (
+                    <div className="mt-4">
+                      <ToggleRow
+                        label="注册完成后继续手机号验证"
+                        description={form.sub2api_auto_sync
+                          ? 'Sub2 自动交付已开启，此步骤为必需流程；关闭 Sub2 后可单独关闭'
+                          : '开启后才会租用号码，并显示实时国家、价格和 Provider 档位选择'}
+                        checked={Boolean(form.require_phone_verification || form.sub2api_auto_sync)}
+                        onChange={checked => set('require_phone_verification', checked)}
+                        disabled={Boolean(form.sub2api_auto_sync)}
+                      />
+                    </div>
+                  ) : null}
                   {form.identity_provider === 'phone' ? (
                     <div className="mt-4 grid gap-4 md:grid-cols-2">
                       <ToggleRow
@@ -992,21 +1182,35 @@ export default function RegisterWorkbench() {
                   <div className="mb-4 flex items-center justify-between gap-3">
                     <div>
                       <div className="text-sm font-semibold text-[var(--text-primary)]">短信资源</div>
-                      <div className="mt-1 text-xs text-[var(--text-muted)]">{form.identity_provider === 'mailbox' ? '邮箱建号后继续手机验证，再进入 Sub2 交付' : '用于手机号注册与短信 OTP'}</div>
+                      <div className="mt-1 text-xs text-[var(--text-muted)]">{form.identity_provider === 'mailbox'
+                        ? form.sub2api_auto_sync
+                          ? '邮箱建号后继续手机验证，再进入 Sub2 交付'
+                          : '邮箱建号后继续手机验证，并获取交付所需的 Codex RT'
+                        : '用于手机号注册与短信 OTP'}</div>
                     </div>
                     <Badge variant={form.sms_provider ? 'secondary' : 'danger'}>{form.sms_provider ? '已选择' : '待配置'}</Badge>
                   </div>
                   {smsProviderOptions.length > 0 ? (
                     <div className="grid gap-4 md:grid-cols-2">
                       <FieldSelect label={t('register.smsService')} value={form.sms_provider} onChange={value => set('sms_provider', value)} options={smsProviderOptions} />
-                      {(currentSmsProvider?.fields || []).map(field => (
+                      {(currentSmsProvider?.fields || [])
+                        .filter(field => !(isSmsBower && SMSBOWER_MANAGED_FIELD_KEYS.has(field.key)))
+                        .map(field => (
                         <ProviderFieldControl key={field.key} field={field} value={form[field.key]} onChange={value => set(field.key, value)} />
-                      ))}
+                        ))}
                     </div>
                   ) : (
                     <div className="text-sm text-amber-300">没有可用短信服务，请先到设置中启用 Provider。</div>
                   )}
                   {currentSmsProvider?.description ? <p className="mt-3 text-xs leading-5 text-[var(--text-muted)]">{currentSmsProvider.description}</p> : null}
+                  {isSmsBower ? (
+                    <SmsBowerPriceSelector
+                      value={smsBowerSelection}
+                      onChange={applySmsBowerSelection}
+                      queryProxy={String(form.proxy || '')}
+                      credentialsConfigured={smsBowerCredentialsConfigured}
+                    />
+                  ) : null}
                 </div>
               ) : null}
             </CardContent>
@@ -1243,6 +1447,7 @@ export default function RegisterWorkbench() {
                     ['平台', currentPlatform?.display_name || form.platform || '-'],
                     ['目标', `${Math.max(Number(form.count || 0), 0)} 个 · 并发 ${Math.max(Number(form.concurrency || 1), 1)}`],
                     ['身份', summaryRegistration],
+                    ...(needsSms ? [['接码', summarySms]] : []),
                     ['执行', summaryExecutor],
                     ['线路', form.proxy ? '手动代理' : form.proxy_strategy === 'direct' ? '直连' : `${form.proxy_strategy} · ${requiredProxyRegion || '自动地区'}`],
                     ['首次质检', `${Number(form.post_registration_liveness_delay_seconds || 0)} 秒后`],
