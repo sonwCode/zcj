@@ -3688,7 +3688,11 @@ class RegistrationEngine:
 
             else:
 
-                self._log("注册成功!")
+                # This engine only establishes the base web account/session.
+                # Task-level phone, Codex credential, liveness, and delivery
+                # gates may still follow, so do not publish a misleading final
+                # success message here.
+                self._log("基础账号会话创建完成")
 
             self._log(f"邮箱: {result.email}")
 

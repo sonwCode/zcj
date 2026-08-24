@@ -157,42 +157,58 @@ def _register_task_outcome(
     }
 
 
-def _registration_failure_summary(errors: list[str]) -> list[dict[str, Any]]:
-    categories = (
-        ("email_already_registered", "邮箱已注册", ("user_already_exists", "account already exists")),
-        ("mailbox_auth", "邮箱授权失效", ("invalid_grant", "refresh_token", "unauthorized or expired")),
-        ("mailbox_otp", "邮箱取码失败", ("获取验证码", "等待验证码", "mailbox_otp")),
-        ("proxy_network", "代理或网络异常", ("proxy", "connect tunnel", "tls connect", "device id", "curl:")),
-        ("account_rejected", "账号被远端拒绝", ("deactivated", "deleted", "suspicious")),
+_REGISTRATION_FAILURE_CATEGORIES = (
+    ("email_already_registered", "邮箱已注册", ("user_already_exists", "account already exists")),
+    ("mailbox_auth", "邮箱授权失效", ("invalid_grant", "refresh_token", "unauthorized or expired")),
+    ("mailbox_otp", "邮箱取码失败", ("获取验证码", "等待验证码", "mailbox_otp")),
+    (
+        "proxy_network",
+        "代理或网络异常",
         (
-            "phone_verification",
-            "手机号验证失败",
-            (
-                "phone_number_in_use",
-                "phone number already in use",
-                "phone_number_rejected",
-                "fraud_guard",
-                "phone_country_pool_rejected",
-                "手机号验证",
-                "手机号",
-                "add-phone",
-                "add_phone",
-            ),
+            "proxy",
+            "proxy_network_error",
+            "proxy_or_access_blocked",
+            "unsupported_region",
+            "connect tunnel",
+            "tls connect",
+            "device id",
+            "curl:",
         ),
-        ("codex_credentials", "Codex 凭据获取失败", ("codex", "refresh_token is missing")),
-        ("oauth", "OAuth 流程失败", ("oauth", "authorization", "authorize")),
-    )
+    ),
+    ("account_rejected", "账号被远端拒绝", ("deactivated", "deleted", "suspicious")),
+    (
+        "phone_verification",
+        "手机号验证失败",
+        (
+            "phone_number_in_use",
+            "phone number already in use",
+            "phone_number_rejected",
+            "fraud_guard",
+            "phone_country_pool_rejected",
+            "手机号验证",
+            "手机号",
+            "add-phone",
+            "add_phone",
+        ),
+    ),
+    ("codex_credentials", "Codex 凭据获取失败", ("codex", "refresh_token is missing")),
+    ("oauth", "OAuth 流程失败", ("oauth", "authorization", "authorize")),
+)
+
+
+def _registration_failure_category(error: object) -> tuple[str, str]:
+    lowered = str(error or "unknown error").strip().lower()
+    for code, label, markers in _REGISTRATION_FAILURE_CATEGORIES:
+        if any(marker in lowered for marker in markers):
+            return code, label
+    return "other", "其他错误"
+
+
+def _registration_failure_summary(errors: list[str]) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for raw_error in errors:
         error = str(raw_error or "unknown error").strip()
-        lowered = error.lower()
-        code = "other"
-        label = "其他错误"
-        for candidate_code, candidate_label, markers in categories:
-            if any(marker in lowered for marker in markers):
-                code = candidate_code
-                label = candidate_label
-                break
+        code, label = _registration_failure_category(error)
         item = grouped.setdefault(
             code,
             {"code": code, "label": label, "count": 0, "sample": error[:500]},
@@ -1397,10 +1413,23 @@ def _complete_required_chatgpt_phone_verification(
             or getattr(account, "token", "")
             or ""
         ).strip()
-        for key in ("access_token", "refresh_token", "id_token", "session_token"):
+        for key in (
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "session_token",
+            "cookies",
+            "oai_device_id",
+        ):
             value = str(result_data.get(key) or "").strip()
             if value:
                 account_extra[key] = value
+        if result_data.get("auth_cookies"):
+            account_extra["auth_cookies"] = json.dumps(
+                result_data["auth_cookies"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         if str(result_data.get("refresh_token") or "").strip():
             if prior_access_token and not str(account_extra.get("web_access_token") or "").strip():
                 account_extra["web_access_token"] = prior_access_token
@@ -1422,7 +1451,11 @@ def _complete_required_chatgpt_phone_verification(
             "status": "already_verified" if result_data.get("already_verified") else "bound",
             "provider": provider_key,
             "country": activation_country,
+            "country_iso": str(result_data.get("phone_country") or ""),
             "phone": phone_number,
+            "proxy_country": str(result_data.get("auth_proxy_country") or ""),
+            "route_country_consistent": result_data.get("route_country_consistent"),
+            "auth_generation": int(result_data.get("auth_generation") or 0),
             "bound_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         account_extra["account_overview"] = overview
@@ -1660,7 +1693,12 @@ def _registration_pipeline_update(
 
 
 def _post_registration_probation_offsets(extra: dict[str, Any]) -> list[int]:
-    raw = extra.get("post_registration_probation_offsets_seconds", [300, 900])
+    # Compatibility wrapper: the old implementation accepted several one-off
+    # offsets. Monitoring is now continuous, so only one repeat interval is
+    # returned. Prefer the explicit interval, then the first legacy offset.
+    raw = extra.get("post_registration_probation_interval_seconds")
+    if raw in (None, ""):
+        raw = extra.get("post_registration_probation_offsets_seconds", [60])
     values: list[Any]
     if isinstance(raw, str):
         values = [part.strip() for part in raw.replace(";", ",").split(",")]
@@ -1675,8 +1713,8 @@ def _post_registration_probation_offsets(extra: dict[str, Any]) -> list[int]:
         except (TypeError, ValueError):
             continue
         if parsed > 0:
-            offsets.add(min(parsed, 86400))
-    return sorted(offsets)
+            offsets.add(min(max(parsed, 15), 3600))
+    return [min(offsets)] if offsets else [60]
 
 
 def _int_config(value: Any, default: int) -> int:
@@ -2220,6 +2258,7 @@ def _auto_followup_chatgpt_plus_payment(
 
 
 def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
+    from core.build_info import build_identity
     from core.proxy_pool import proxy_pool
 
     payload = dict(payload or {})
@@ -2229,6 +2268,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     password = payload.get("password") or None
     proxy = payload.get("proxy") or None
     extra = dict(payload.get("extra") or {})
+    logger.log(f"运行构建: {build_identity()}")
+    # Policy enforcement may turn an ordinary mailbox task into an
+    # email-then-phone flow (for example when Codex/Sub2 credentials are
+    # required).  Apply it before deriving the effective registration mode,
+    # concurrency window, SMS activation policy, and retry budget.
+    sub2_sync_required = _enforce_sub2_registration_requirements(platform_name, extra)
     is_chatgpt_phone_registration = (
         platform_name == "chatgpt"
         and (
@@ -2249,7 +2294,6 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         extra.get("complete_started_attempts"),
         False,
     )
-    sub2_sync_required = _enforce_sub2_registration_requirements(platform_name, extra)
     concurrency_cap = _register_concurrency_cap(platform_name, extra)
     requested_concurrency = max(int(payload.get("concurrency", 1) or 1), 1)
     # Email + phone registration spends most of its time waiting for SMS. A
@@ -2527,6 +2571,18 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         extra.get("failure_policy")
         or ("retry_then_continue" if platform_name == "chatgpt" else "")
     ).strip().lower()
+    network_circuit_break_threshold = min(
+        max(_int_config(extra.get("network_circuit_break_threshold"), 3), 0),
+        20,
+    )
+    network_failure_streak = 0
+    network_circuit_open = False
+    network_circuit_reason = ""
+    if platform_name == "chatgpt" and network_circuit_break_threshold > 0:
+        logger.log(
+            "注册网络熔断已启用: "
+            f"连续 {network_circuit_break_threshold} 次代理/网络失败后停止投放新尝试"
+        )
 
     # Pre-create a shared mailbox instance for the entire task to avoid
     # concurrent initialization issues (e.g. MoeMail auto-registering
@@ -2896,27 +2952,29 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     try:
                         from core.lifecycle import schedule_account_probation
 
+                        interval_seconds = int(offsets[0])
                         probation = schedule_account_probation(
                             saved_account_id,
-                            offsets_seconds=offsets,
+                            interval_seconds=interval_seconds,
                         )
                         logger.log(
-                            "已安排非阻塞观察期复检: "
-                            + "、".join(f"{seconds} 秒" for seconds in offsets)
+                            "已安排持续存活复检: "
+                            f"每 {interval_seconds} 秒检查一次，明确失效后停止高频监控"
                         )
                         _registration_pipeline_update(
                             account,
                             "probation",
-                            "scheduled",
+                            "monitoring",
                             detail={
-                                "offsets_seconds": offsets,
+                                "mode": "continuous",
+                                "interval_seconds": interval_seconds,
                                 "next_check_at": probation.get("next_check_at", ""),
                             },
                         )
                         save_account(account)
                     except Exception as probation_exc:
                         logger.log(
-                            f"观察期复检排程失败，账号已保留: {probation_exc}",
+                            f"持续存活复检排程失败，账号已保留: {probation_exc}",
                             level="warning",
                         )
             workspace_join_error = _chatgpt_workspace_join_failure(account)
@@ -3281,6 +3339,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         def _should_submit_more() -> bool:
             if submitted >= max_attempts or logger.is_cancel_requested():
                 return False
+            if network_circuit_open:
+                return False
             if failure_policy in {"stop", "stop_on_failure", "fail_fast"} and errors:
                 return False
             # SMS 号池被耗尽（某条号被拒 + 备份池空）→ 整个任务级别停止
@@ -3347,8 +3407,31 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     completed += 1
                     if result is True:
                         success += 1
+                        network_failure_streak = 0
                     elif result != "__cancel_requested__":
-                        errors.append(str(result))
+                        result_error = str(result)
+                        errors.append(result_error)
+                        failure_code, _failure_label = _registration_failure_category(result_error)
+                        if (
+                            platform_name == "chatgpt"
+                            and network_circuit_break_threshold > 0
+                            and failure_code == "proxy_network"
+                        ):
+                            network_failure_streak += 1
+                            if (
+                                network_failure_streak >= network_circuit_break_threshold
+                                and not network_circuit_open
+                            ):
+                                network_circuit_open = True
+                                network_circuit_reason = result_error[:500]
+                                logger.log(
+                                    "注册网络熔断已触发: "
+                                    f"连续 {network_failure_streak} 次代理/网络失败，"
+                                    "停止投放新账号；已在运行的 worker 将自然收尾",
+                                    level="error",
+                                )
+                        else:
+                            network_failure_streak = 0
                     logger.set_progress(
                         min(
                             success
@@ -3376,6 +3459,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         "account_ids": list(dict.fromkeys(successful_account_ids)),
         "delivery_pending_account_ids": list(dict.fromkeys(delivery_pending_account_ids)),
         "failure_summary": _registration_failure_summary(errors),
+        "network_circuit_breaker": {
+            "enabled": platform_name == "chatgpt" and network_circuit_break_threshold > 0,
+            "threshold": network_circuit_break_threshold,
+            "open": network_circuit_open,
+            "consecutive_failures": network_failure_streak,
+            "reason": network_circuit_reason,
+        },
     }
     if herosms_enabled:
         result_data.update({

@@ -877,14 +877,21 @@ class ChatGPTPlatform(BasePlatform):
     def complete_protocol_codex_credentials(self, account: Account) -> dict:
         """Upgrade a protocol-created Web session to genuine Codex PKCE credentials."""
         mailbox_worker = getattr(self, "_last_protocol_mailbox_worker", None)
-        if mailbox_worker is None or getattr(mailbox_worker, "email_service", None) is None:
+        if (
+            mailbox_worker is None
+            or getattr(mailbox_worker, "email_service", None) is None
+            or getattr(mailbox_worker, "engine", None) is None
+        ):
             return {
                 "ok": False,
                 "error_code": "protocol_session_missing",
                 "error": "Protocol mailbox session is unavailable",
             }
 
-        from platforms.chatgpt.protocol_phone import ChatGPTProtocolEmailThenPhoneWorker
+        from platforms.chatgpt.protocol_phone import (
+            ChatGPTProtocolEmailThenPhoneWorker,
+            _export_session_cookies,
+        )
 
         worker = ChatGPTProtocolEmailThenPhoneWorker(
             email_service=mailbox_worker.email_service,
@@ -894,6 +901,22 @@ class ChatGPTPlatform(BasePlatform):
             cancel_check=self.is_cancel_requested,
             max_phone_attempts=1,
             require_codex_refresh_token=True,
+            existing_device_id=str(
+                getattr(mailbox_worker.engine, "_device_id", "")
+                or (getattr(account, "extra", {}) or {}).get("oai_device_id")
+                or ""
+            ),
+            existing_auth_cookies=(
+                _export_session_cookies(mailbox_worker.engine.session)
+                or (getattr(account, "extra", {}) or {}).get("auth_cookies")
+                or (getattr(account, "extra", {}) or {}).get("cookies")
+                or ""
+            ),
+            proxy_country=str(
+                getattr(mailbox_worker.engine, "preflight_location", "")
+                or getattr(account, "region", "")
+                or ""
+            ),
         )
         result = worker.acquire_codex_credentials(
             email=str(account.email or ""),
@@ -915,10 +938,23 @@ class ChatGPTPlatform(BasePlatform):
         current_access_token = str(extra.get("access_token") or account.token or "").strip()
         if current_access_token and not str(extra.get("web_access_token") or "").strip():
             extra["web_access_token"] = current_access_token
-        for key in ("access_token", "refresh_token", "id_token"):
+        for key in (
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "session_token",
+            "cookies",
+            "oai_device_id",
+        ):
             value = str(tokens.get(key) or "").strip()
             if value:
                 extra[key] = value
+        if tokens.get("auth_cookies"):
+            extra["auth_cookies"] = json.dumps(
+                tokens["auth_cookies"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         extra["oauth_credential_type"] = "codex_oauth"
         account.extra = extra
         account.token = str(extra.get("access_token") or account.token or "")
@@ -937,7 +973,10 @@ class ChatGPTPlatform(BasePlatform):
         if mailbox_worker is None or getattr(mailbox_worker, "engine", None) is None:
             raise RuntimeError("邮箱协议注册会话不存在，手机号验证必须紧接本次邮箱注册执行")
 
-        from platforms.chatgpt.protocol_phone import ChatGPTProtocolEmailThenPhoneWorker
+        from platforms.chatgpt.protocol_phone import (
+            ChatGPTProtocolEmailThenPhoneWorker,
+            _export_session_cookies,
+        )
 
         require_rt = True
         try:
@@ -959,6 +998,22 @@ class ChatGPTPlatform(BasePlatform):
             cancel_check=self.is_cancel_requested,
             max_phone_attempts=min(max(int(max_phone_attempts or 3), 1), 20),
             require_codex_refresh_token=require_rt,
+            existing_device_id=str(
+                getattr(mailbox_worker.engine, "_device_id", "")
+                or (getattr(account, "extra", {}) or {}).get("oai_device_id")
+                or ""
+            ),
+            existing_auth_cookies=(
+                _export_session_cookies(mailbox_worker.engine.session)
+                or (getattr(account, "extra", {}) or {}).get("auth_cookies")
+                or (getattr(account, "extra", {}) or {}).get("cookies")
+                or ""
+            ),
+            proxy_country=str(
+                getattr(mailbox_worker.engine, "preflight_location", "")
+                or getattr(account, "region", "")
+                or ""
+            ),
         )
         result = worker.run_for_account(
             email=str(account.email or ""),
@@ -968,10 +1023,23 @@ class ChatGPTPlatform(BasePlatform):
         if isinstance(result, dict):
             extra = dict(getattr(account, "extra", {}) or {})
             prior_access = str(extra.get("access_token") or getattr(account, "token", "") or "").strip()
-            for key in ("access_token", "refresh_token", "id_token", "session_token"):
+            for key in (
+                "access_token",
+                "refresh_token",
+                "id_token",
+                "session_token",
+                "cookies",
+                "oai_device_id",
+            ):
                 value = str(result.get(key) or "").strip()
                 if value:
                     extra[key] = value
+            if result.get("auth_cookies"):
+                extra["auth_cookies"] = json.dumps(
+                    result["auth_cookies"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
             if str(result.get("refresh_token") or "").strip():
                 if prior_access and not str(extra.get("web_access_token") or "").strip():
                     extra["web_access_token"] = prior_access

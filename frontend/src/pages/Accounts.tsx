@@ -6,6 +6,7 @@ import { apiDownload, apiFetch, triggerBrowserDownload } from '@/lib/utils'
 import { formatDateTime, translateAccountStatus } from '@/lib/i18n'
 import { useI18n } from '@/lib/i18n-context'
 import { TaskLogPanel } from '@/components/tasks/TaskLogPanel'
+import { SchedulerHealth } from '@/components/SchedulerHealth'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -130,12 +131,16 @@ function getSurvivalInfo(acc: any, nowMs: number) {
   if (startedAt === null) return { state: 'unknown', label: '时间未知', duration: '-', title: '' }
 
   const overview = getAccountOverview(acc)
+  const monitor = overview?.probation && typeof overview.probation === 'object'
+    ? overview.probation
+    : {}
   const status = getDisplaySummary(acc)?.status || {}
   const validity = String(getValidityStatus(acc) || '').toLowerCase()
   const lifecycle = String(getLifecycleStatus(acc) || '').toLowerCase()
   const invalid = validity === 'invalid' || ['invalid', 'disabled', 'banned', 'deactivated'].includes(lifecycle)
   const checkedAt = parseAccountTime(
-    overview?.invalid_detected_at
+    monitor?.first_invalid_at
+      || overview?.invalid_detected_at
       || overview?.deactivated_at
       || status?.checked_at
       || overview?.checked_at
@@ -150,6 +155,63 @@ function getSurvivalInfo(acc: any, nowMs: number) {
     label,
     duration,
     title: `${new Date(startedAt).toLocaleString()} - ${invalid ? new Date(endedAt).toLocaleString() : '现在'}`,
+  }
+}
+
+function getContinuousMonitorInfo(acc: any, nowMs: number) {
+  const state = getAccountOverview(acc)?.probation
+  if (!state || typeof state !== 'object') {
+    return {
+      state: 'inactive',
+      label: '等待纳入监控',
+      detail: '后台会自动迁移',
+      title: '持续复检状态尚未写入',
+    }
+  }
+
+  const status = String(state.status || '').toLowerCase()
+  const mode = String(state.mode || '').toLowerCase()
+  const intervalSeconds = Math.max(Number(state.interval_seconds || 60), 1)
+  const nextAt = parseAccountTime(state.next_check_at)
+  const lastAt = parseAccountTime(state.last_checked_at)
+  const lastStatus = String(state.last_status || '').toLowerCase()
+
+  if (status === 'failed') {
+    const windowSeconds = Math.max(Number(state.detection_window_seconds || intervalSeconds), 0)
+    const firstInvalidAt = parseAccountTime(state.first_invalid_at)
+    return {
+      state: 'failed',
+      label: '已捕获失效',
+      detail: `失效窗口 ≤ ${windowSeconds} 秒`,
+      title: firstInvalidAt === null
+        ? '持续复检已停止：账号明确失效'
+        : `首次发现失效：${new Date(firstInvalidAt).toLocaleString()}；最后确认有效到发现失效的窗口不超过 ${windowSeconds} 秒`,
+    }
+  }
+
+  if (status === 'pending' && mode === 'continuous') {
+    const secondsUntilNext = nextAt === null
+      ? intervalSeconds
+      : Math.max(0, Math.ceil((nextAt - nowMs) / 1000))
+    const overdue = nextAt !== null && nextAt < nowMs
+    const statusLabel = lastStatus === 'valid'
+      ? '上次有效'
+      : lastStatus === 'unknown' || lastStatus === 'error'
+        ? '上次未知'
+        : '等待首次'
+    return {
+      state: lastStatus === 'unknown' || lastStatus === 'error' ? 'warning' : 'active',
+      label: `${intervalSeconds} 秒持续复检`,
+      detail: overdue ? '已到期，等待调度' : `${statusLabel} · 下次 ${secondsUntilNext} 秒`,
+      title: `已检查 ${Number(state.check_count || 0)} 次${lastAt === null ? '' : `；最近检测 ${new Date(lastAt).toLocaleString()}`}${state.last_error ? `；${String(state.last_error)}` : ''}`,
+    }
+  }
+
+  return {
+    state: 'inactive',
+    label: '监控未运行',
+    detail: status || '等待调度器迁移',
+    title: '该账号当前没有持续复检排程',
   }
 }
 
@@ -816,9 +878,10 @@ const SurvivalCell = memo(function SurvivalCell({
   const [error, setError] = useState('')
   const [nowMs, setNowMs] = useState(() => Date.now())
   const info = getSurvivalInfo(acc, nowMs)
+  const monitor = getContinuousMonitorInfo(acc, nowMs)
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNowMs(Date.now()), 30_000)
+    const timer = window.setInterval(() => setNowMs(Date.now()), 5_000)
     return () => window.clearInterval(timer)
   }, [])
 
@@ -870,11 +933,20 @@ const SurvivalCell = memo(function SurvivalCell({
     : info.state === 'valid'
       ? 'text-emerald-400'
       : 'text-amber-400'
+  const monitorTone = monitor.state === 'failed'
+    ? 'text-red-400'
+    : monitor.state === 'active'
+      ? 'text-emerald-400'
+      : monitor.state === 'warning'
+        ? 'text-amber-400'
+        : 'text-[var(--text-muted)]'
 
   return (
-    <div className="flex min-w-0 flex-col items-start gap-1" title={error || info.title}>
+    <div className="flex min-w-0 flex-col items-start gap-1" title={error || `${info.title}\n${monitor.title}`}>
       <span className={`text-xs font-medium ${tone}`}>{info.label}</span>
       <span className="whitespace-nowrap text-[11px] text-[var(--text-muted)]">{info.duration}</span>
+      <span className={`whitespace-nowrap text-[11px] font-medium ${monitorTone}`}>{monitor.label}</span>
+      <span className="whitespace-nowrap text-[10px] text-[var(--text-muted)]">{monitor.detail}</span>
       <button
         type="button"
         onClick={check}
@@ -887,81 +959,6 @@ const SurvivalCell = memo(function SurvivalCell({
     </div>
   )
 })
-
-function AutoRefreshIndicator({
-  busy,
-  intervalSeconds,
-  nextAt,
-  lastAt,
-}: {
-  busy: boolean
-  intervalSeconds: number
-  nextAt: number
-  lastAt: number | null
-}) {
-  const [now, setNow] = useState(() => Date.now())
-
-  useEffect(() => {
-    if (intervalSeconds <= 0) return
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
-    return () => window.clearInterval(timer)
-  }, [intervalSeconds])
-
-  const secondsUntilRefresh = intervalSeconds > 0
-    ? Math.max(0, Math.ceil((nextAt - now) / 1000))
-    : 0
-  const progress = intervalSeconds > 0
-    ? Math.min(100, Math.max(0, 100 - ((nextAt - now) / (intervalSeconds * 1000)) * 100))
-    : 0
-  const lastLabel = lastAt == null
-    ? '等待首次同步'
-    : (now - lastAt < 3_000
-      ? '刚刚已同步'
-      : `上次同步 ${Math.max(1, Math.floor((now - lastAt) / 1000))} 秒前`)
-  const enabled = intervalSeconds > 0
-
-  return (
-    <div
-      className="hidden min-w-[188px] items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-pane)]/60 px-2 py-1 sm:flex"
-      title="这里只同步列表中的服务端状态；单行“检测”按钮才会主动检查账号"
-      role="status"
-      aria-live="polite"
-      aria-label={busy
-        ? '正在同步账号状态'
-        : enabled
-          ? `自动刷新已开启，下次同步 ${secondsUntilRefresh} 秒`
-          : '自动刷新已关闭'}
-    >
-      <span
-        className={`h-2 w-2 shrink-0 rounded-full transition-colors ${busy
-          ? 'bg-sky-400 motion-safe:animate-pulse'
-          : enabled
-            ? 'bg-emerald-400'
-            : 'bg-slate-500'}`}
-        aria-hidden="true"
-      />
-      <div className="min-w-0 flex-1 leading-none">
-        <div className="flex items-center gap-1.5 text-[11px] font-medium text-[var(--text-secondary)]">
-          <span>{busy ? '正在同步' : enabled ? '自动刷新' : '手动刷新'}</span>
-          {enabled ? <span className="text-[var(--text-muted)]">· {intervalSeconds} 秒</span> : null}
-        </div>
-        <div className="mt-1 truncate text-[10px] text-[var(--text-muted)]">
-          {busy
-            ? '正在更新账号状态…'
-            : enabled
-              ? `${lastLabel} · 下次 ${secondsUntilRefresh} 秒`
-              : '列表仅在操作完成或手动点击时更新'}
-        </div>
-        <div className="mt-1 h-0.5 overflow-hidden rounded-full bg-[var(--border)]" aria-hidden="true">
-          <div
-            className="h-full rounded-full bg-emerald-400 transition-[width] duration-300 ease-out"
-            style={{ width: `${busy ? 100 : progress}%` }}
-          />
-        </div>
-      </div>
-    </div>
-  )
-}
 
 function MailboxCodeCell({
   acc,
@@ -1380,6 +1377,10 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
   const warnings = getDisplayWarnings(acc)
   const displayBadges = getDisplayBadges(acc)
   const displaySections = getDisplaySections(acc)
+  const monitorState = overview?.probation && typeof overview.probation === 'object'
+    ? overview.probation
+    : {}
+  const monitorInfo = getContinuousMonitorInfo(acc, Date.now())
   const copyText = (text: string) => navigator.clipboard.writeText(text)
   const platformCredentials = credentials.filter((item: any) => item.scope === 'platform')
 
@@ -1447,6 +1448,38 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
           )}
 
           <DisplayWarnings warnings={warnings} />
+          <div className={`rounded-xl border p-3 ${monitorInfo.state === 'failed'
+            ? 'border-red-500/25 bg-red-500/10'
+            : monitorInfo.state === 'active'
+              ? 'border-emerald-500/20 bg-emerald-500/10'
+              : 'border-amber-500/20 bg-amber-500/10'}`}>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-xs font-semibold text-[var(--text-primary)]">持续存活监控</div>
+                <div className="mt-1 text-[11px] text-[var(--text-muted)]">{monitorInfo.detail}</div>
+              </div>
+              <Badge variant={monitorInfo.state === 'failed' ? 'danger' : monitorInfo.state === 'active' ? 'success' : 'warning'}>
+                {monitorInfo.label}
+              </Badge>
+            </div>
+            <div className="mt-3 grid grid-cols-3 gap-2 text-[11px]">
+              <div className="rounded-lg border border-[var(--border-soft)] bg-black/10 px-2.5 py-2">
+                <div className="text-[var(--text-muted)]">复检间隔</div>
+                <div className="mt-1 text-[var(--text-primary)]">{Number(monitorState.interval_seconds || 60)} 秒</div>
+              </div>
+              <div className="rounded-lg border border-[var(--border-soft)] bg-black/10 px-2.5 py-2">
+                <div className="text-[var(--text-muted)]">累计检测</div>
+                <div className="mt-1 text-[var(--text-primary)]">{Number(monitorState.check_count || 0)} 次</div>
+              </div>
+              <div className="rounded-lg border border-[var(--border-soft)] bg-black/10 px-2.5 py-2">
+                <div className="text-[var(--text-muted)]">调度延迟</div>
+                <div className="mt-1 text-[var(--text-primary)]">{Number(monitorState.last_check_lag_seconds || 0)} 秒</div>
+              </div>
+            </div>
+            <div className="mt-2 text-[10px] leading-4 text-[var(--text-muted)]" title={monitorInfo.title}>
+              {monitorInfo.title}
+            </div>
+          </div>
           <DisplaySections sections={displaySections} />
 
           {(displayBadges.length > 0 || verificationMailbox?.email) && (
@@ -1866,18 +1899,6 @@ export default function Accounts() {
   const [getRtSmsapiUrl, setGetRtSmsapiUrl] = useState('')
   const [getRtRecordHar, setGetRtRecordHar] = useState(false)
   const [getRtPhoneReuseCount, setGetRtPhoneReuseCount] = useState(3)
-  const [autoRefreshBusy, setAutoRefreshBusy] = useState(false)
-  const [nextAutoRefreshAt, setNextAutoRefreshAt] = useState(() => Date.now() + 30_000)
-  const [lastAutoRefreshAt, setLastAutoRefreshAt] = useState<number | null>(null)
-  const [survivalRefreshSeconds, setSurvivalRefreshSeconds] = useState(() => {
-    if (typeof window === 'undefined') return 30
-    try {
-      const value = Number(window.localStorage.getItem('accounts_refresh_interval_seconds'))
-      return [0, 15, 30, 60, 120].includes(value) ? value : 30
-    } catch {
-      return 30
-    }
-  })
   const accountLoadAbortRef = useRef<AbortController | null>(null)
   const autoRefreshInFlightRef = useRef(false)
 
@@ -1928,21 +1949,6 @@ export default function Accounts() {
   useEffect(() => { void load() }, [load])
   useEffect(() => () => accountLoadAbortRef.current?.abort(), [])
   useEffect(() => {
-    try {
-      window.localStorage.setItem('accounts_refresh_interval_seconds', String(survivalRefreshSeconds))
-    } catch {
-      // Ignore browsers that block localStorage.
-    }
-  }, [survivalRefreshSeconds])
-  useEffect(() => {
-    setNextAutoRefreshAt(
-      survivalRefreshSeconds > 0
-        ? Date.now() + survivalRefreshSeconds * 1000
-        : 0,
-    )
-  }, [survivalRefreshSeconds])
-  useEffect(() => {
-    if (survivalRefreshSeconds <= 0) return
     const timer = window.setInterval(() => {
       if (
         autoRefreshInFlightRef.current
@@ -1952,18 +1958,13 @@ export default function Accounts() {
         || showAdd
         || batchTask
       ) return
-      const startedAt = Date.now()
-      setNextAutoRefreshAt(startedAt + survivalRefreshSeconds * 1000)
       autoRefreshInFlightRef.current = true
-      setAutoRefreshBusy(true)
       void load().finally(() => {
         autoRefreshInFlightRef.current = false
-        setAutoRefreshBusy(false)
-        setLastAutoRefreshAt(Date.now())
       })
-    }, survivalRefreshSeconds * 1000)
+    }, 15_000)
     return () => window.clearInterval(timer)
-  }, [batchTask, detail, load, showAdd, showImport, survivalRefreshSeconds])
+  }, [batchTask, detail, load, showAdd, showImport])
   const totalPages = Math.max(Math.ceil(total / pageSize), 1)
 
   useEffect(() => {
@@ -2805,39 +2806,19 @@ export default function Accounts() {
           </div>
           
           <div className="flex items-center gap-2">
-            <AutoRefreshIndicator
-              busy={autoRefreshBusy}
-              intervalSeconds={survivalRefreshSeconds}
-              nextAt={nextAutoRefreshAt}
-              lastAt={lastAutoRefreshAt}
-            />
-            <label className="hidden items-center gap-1.5 text-[11px] text-[var(--text-muted)] sm:flex" title="选择自动同步账号列表和存活时间的间隔">
-              间隔
-              <select
-                value={survivalRefreshSeconds}
-                onChange={event => setSurvivalRefreshSeconds(Number(event.target.value))}
-                className="rounded-md border border-[var(--border)] bg-transparent px-2 py-1 text-[11px] text-[var(--text-primary)] focus:border-[var(--text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--text-primary)]"
-                aria-label="自动刷新间隔"
-              >
-                <option value={0}>手动</option>
-                <option value={15}>15 秒</option>
-                <option value={30}>30 秒</option>
-                <option value={60}>1 分钟</option>
-                <option value={120}>2 分钟</option>
-              </select>
-            </label>
+            <SchedulerHealth className="hidden sm:flex" />
             <Button
               variant="ghost"
               size="sm"
               disabled={batchRefreshing || loading}
               className="h-7 px-2.5 text-[var(--text-muted)] hover:text-amber-500 hover:bg-amber-500/10"
-              title={t('accounts.refreshCreditsTitle')}
+              title="立即对当前平台账号发起一次远端有效性检测；后台 60 秒持续复检仍会独立运行"
               onClick={async () => {
                 setBatchRefreshing(true)
                 try {
                   const res = await apiFetch(`/accounts/check-all?platform=${tab}`, { method: 'POST' })
                   if (res?.task_id) {
-                    setBatchTask({ taskId: res.task_id, title: t('accounts.refreshAllCreditsTask', { platform: platformLabel }) })
+                    setBatchTask({ taskId: res.task_id, title: `${platformLabel} · 手动全量检测` })
                     setBatchTaskStatus(null)
                   }
                 } catch (e) {
@@ -2846,10 +2827,10 @@ export default function Accounts() {
                 }
               }}
             >
-              <Zap className={`mr-1 h-3.5 w-3.5 ${batchRefreshing ? 'animate-pulse' : ''}`} />
-              {batchRefreshing ? t('accounts.refreshingCredits') : t('accounts.refreshCredits')}
+              <ShieldCheck className={`mr-1 h-3.5 w-3.5 ${batchRefreshing ? 'animate-pulse' : ''}`} />
+              {batchRefreshing ? '检测中' : '立即全量检测'}
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => load()} disabled={loading} className="h-7 w-7 p-0 text-[var(--text-muted)] hover:text-[var(--text-primary)]">
+            <Button variant="ghost" size="sm" onClick={() => load()} disabled={loading} title="只刷新本地账号列表，不发起远端检测" className="h-7 w-7 p-0 text-[var(--text-muted)] hover:text-[var(--text-primary)]">
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
             </Button>
             {selectedCount > 0 && (
@@ -2908,7 +2889,7 @@ export default function Accounts() {
               <th className="px-3 py-2 text-left">{t('common.email')}</th>
               <th className="px-3 py-2 text-left">{t('common.password')}</th>
               <th className="px-3 py-2 text-left">{t('common.status')}</th>
-              <th className="px-3 py-2 text-left">存活时间</th>
+              <th className="px-3 py-2 text-left">存活监控</th>
               <th className="px-3 py-2 text-left">邮箱接码</th>
               <th className="px-3 py-2 text-left">{t('accounts.link')}</th>
               <th className="px-3 py-2 text-left">{t('accounts.registeredAt')}</th>

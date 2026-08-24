@@ -65,7 +65,7 @@ def test_scheduler_rechecks_retained_invalid_accounts(monkeypatch):
     }
 
 
-def test_scheduler_runs_first_cycle_after_one_minute(monkeypatch):
+def test_scheduler_scans_probation_before_first_full_cycle(monkeypatch):
     from core.scheduler import Scheduler
 
     waits = []
@@ -86,7 +86,21 @@ def test_scheduler_runs_first_cycle_after_one_minute(monkeypatch):
     scheduler._running = True
     scheduler._loop()
 
-    assert waits == [60]
+    assert waits == [5]
+
+
+def test_scheduler_status_exposes_runtime_heartbeat():
+    from core.scheduler import Scheduler
+
+    scheduler = Scheduler()
+    scheduler._update_runtime_status(next_full_in_seconds=60)
+
+    status = scheduler.get_status()
+
+    assert status["heartbeat_at"]
+    assert status["next_full_run_at"]
+    assert status["probation_scan_interval_seconds"] == 5
+    assert status["continuous_check_interval_seconds"] == 60
 
 
 def test_scheduler_exposes_last_cycle_heartbeat(monkeypatch):

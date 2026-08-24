@@ -79,11 +79,15 @@ python scripts/smoke.py http://127.0.0.1:8001/api
 ## 注册与自动检测可靠性
 
 - 批量注册按“目标成功数”补位：单个邮箱建号、手机验证、Codex 凭据或首次存活复检失败，只结束当前尝试，不会提前终止整个批次。
-- 并发 worker 使用独立任务参数和独立邮箱租约；固定邮箱仅允许单账号、单并发，数据库以 `platform + email` 防止重复账号行。
-- ChatGPT 手机流程在注册完成后先做即时存活检查，再默认安排注册后 300 秒和 900 秒的持久化观察期复检。服务重启后排程仍保留，检测未知会退避重试，明确失效才标记无效。
-- 全量检测默认 5 并发，和新号观察期使用独立调度周期。`GET /api/scheduler/status` 可查看调度线程、最近开始/完成时间、耗时、结果和错误，避免后台检测静默失效。
-- 可在任务 `extra` 中通过 `post_registration_liveness_delay_seconds`（0–600）、`post_registration_probation_enabled` 和 `post_registration_probation_offsets_seconds` 调整新号检测；全量检测并发读取配置项 `account_check_concurrency`（1–20）。
+- 并发 worker 使用独立任务参数、邮箱租约和接码 activation；目标 5、并发 5 时五个已启动账号会各自进入接码阶段，不会被进程级号码复用锁串行化。固定邮箱仅允许单账号、单并发，数据库以 `platform + email` 防止重复账号行。
+- 同一账号从邮箱注册进入手机验证和 Codex OAuth 时，会延续自己的设备 ID 与登录 Cookie；会话档案只在该账号内部复用，不跨账号共享。
+- ChatGPT 注册默认启用连续代理/网络故障熔断，连续 3 次后停止投放新账号并允许在途 worker 收尾；可用任务 `extra.network_circuit_break_threshold`（0–20，0 表示关闭）调整。
+- ChatGPT 手机流程在注册完成后先做即时存活检查，随后进入持久化的 60 秒持续复检。服务重启后排程仍保留；检测有效或网络状态未知都会在下一分钟复检，明确失效后记录“最后确认有效—首次发现失效”的时间窗口并停止该账号的高频监控。
+- 持续复检默认 5 并发，调度器每 5 秒扫描到期队列；已有的有效 ChatGPT 账号会自动迁入持续监控。较慢的全量检测使用独立周期。`GET /api/system/scheduler/status` 可查看调度线程、最近开始/完成时间、调度延迟、结果和错误，避免后台检测静默失效；旧的 `/api/scheduler/status` 地址仍兼容。
+- 注册任务和启动日志会输出 `version@git_sha`；`GET /api/system/version` 返回提交、构建时间和进程启动时间，用于确认当前实例是否已部署到新代码。
+- 可在任务 `extra` 中通过 `post_registration_liveness_delay_seconds`（0–600）、`post_registration_probation_enabled` 和 `post_registration_probation_interval_seconds`（默认 60）调整新号检测；全量与持续检测并发读取配置项 `account_check_concurrency`（1–20）。
 - 注册成功与外部交付分开记录：账号落库后即保留 `registration_status=registered`；Sub2API 未完成会记录 `delivery_status=pending`，等待后台补传，不再把两种状态混为一个“失败”。
+- CPA 连接检测使用只读的 Management API `GET /v0/management/auth-files`；只有 2xx 才判定连接成功，401/403 会分别提示管理密钥无效或远程管理未开启。
 
 ## 配置与数据安全
 

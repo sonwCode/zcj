@@ -1936,8 +1936,15 @@ class PhoneCallbackController:
                 and bool(getattr(provider, "reuse_phone_to_max", True))
                 and not self._verify_lock_acquired
             ):
+                lock_wait_started = time.monotonic()
                 _HERO_SMS_VERIFY_LOCK.acquire()
                 self._verify_lock_acquired = True
+                lock_wait_seconds = time.monotonic() - lock_wait_started
+                if lock_wait_seconds >= 0.05:
+                    self.log(
+                        "接码复用锁等待: "
+                        f"{lock_wait_seconds:.2f}s；当前 provider 开启了同号复用串行保护"
+                    )
 
             # Explicit country pools rotate after a rejected/risked number. They
             # take precedence over automatic single-country selection.
@@ -2056,9 +2063,9 @@ class PhoneCallbackController:
             self.log(f"等待短信验证码... (activation_id={_mask_activation_id(self.activation.activation_id)})")
             code_timeout = min(max(
                 _safe_int(self.config.get("sms_code_timeout_seconds"), 180),
-                180,
+                60,
             ), 300)
-            self.log(f"本号码最多等待 {code_timeout // 60} 分钟，超时后自动取消并换号")
+            self.log(f"本号码最多等待 {code_timeout} 秒，超时后自动取消并换号")
             code = provider.get_code(self.activation.activation_id, timeout=code_timeout)
             if code:
                 self.log("已收到短信验证码")

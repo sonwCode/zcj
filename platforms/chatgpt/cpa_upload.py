@@ -340,7 +340,7 @@ def upload_to_team_manager(
 
 
 def test_cpa_connection(api_url: str, api_token: str, proxy: str = None) -> Tuple[bool, str]:
-    """测试 CPA 连接（不走代理）"""
+    """用只读管理端点验证 CPA 连接与 Management Key。"""
     if not api_url:
         return False, "API URL 不能为空"
     if not api_token:
@@ -351,17 +351,26 @@ def test_cpa_connection(api_url: str, api_token: str, proxy: str = None) -> Tupl
     headers = {
         "Authorization": f"Bearer {api_token}",
         "X-Management-Key": api_token,
+        # 保留旧版兼容头，但服务端真正校验的是上面两者之一。
         "X-API-Key": api_token,
         "Accept": "application/json",
     }
     try:
-        response = cffi_requests.options(test_url, headers=headers,
-                                         proxies=None, verify=False,
-                                         timeout=10, impersonate="chrome110")
-        if response.status_code in (200, 204, 401, 403, 405):
-            if response.status_code == 401:
-                return False, "连接成功，但 CPA Management Key 无效"
-            return True, "CPA 连接测试成功"
+        # OPTIONS 只能证明 Web 服务在响应；部署可能在身份验证
+        # 之前直接返回 403/405，旧实现因此会把无效密钥误报为成功。
+        # GET /auth-files 是官方的只读列表端点，可同时验证路径、
+        # 远程管理开关与 Management Key，不会写入或删除账号。
+        response = cffi_requests.get(test_url, headers=headers,
+                                     proxies=None, verify=False,
+                                     timeout=10, impersonate="chrome110")
+        if response.status_code in (200, 204):
+            return True, "CPA 连接测试成功（Management Key 已验证）"
+        if response.status_code == 401:
+            return False, "CPA 认证失败(401)：Management Key 缺失或无效"
+        if response.status_code == 403:
+            return False, "CPA 访问被拒绝(403)：请开启 remote-management.allow-remote 并核对 Management Key"
+        if response.status_code == 405:
+            return False, "CPA 管理端点不支持必需的 GET 检查(405)：请核对服务版本与根地址"
         if response.status_code == 404:
             return False, "CPA 管理接口不存在：请检查 API URL 是否为服务根地址"
         return False, f"服务器返回异常状态码: {response.status_code}"

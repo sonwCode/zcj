@@ -262,43 +262,93 @@ def test_validity_batch_uses_bounded_parallel_workers(monkeypatch):
     assert state["max_active"] >= 2
 
 
-def test_probation_checks_are_persisted_and_advance_across_cycles(monkeypatch):
+def test_probation_checks_are_persisted_and_repeat_every_minute(monkeypatch):
     account_id = _create_account(lifecycle_status="registered")
     monkeypatch.setattr("core.lifecycle.get", lambda _platform: _AlwaysValidPlatform)
 
     state = schedule_account_probation(
         account_id,
-        offsets_seconds=[300, 900],
+        interval_seconds=60,
         now_ts=100,
     )
-    assert state["next_check_at_ts"] == 400
+    assert state["mode"] == "continuous"
+    assert state["interval_seconds"] == 60
+    assert state["next_check_at_ts"] == 160
 
-    assert check_due_account_probations(now_ts=399)["due"] == 0
-    first = check_due_account_probations(now_ts=400, concurrency=2)
+    assert check_due_account_probations(now_ts=159)["due"] == 0
+    first = check_due_account_probations(now_ts=160, concurrency=2)
     assert first["checked"] == 1
     assert first["pending"] == 1
     probation = _overview(account_id).get_summary()["probation"]
-    assert probation["completed_offsets_seconds"] == [300]
-    assert probation["next_check_at_ts"] == 1000
+    assert probation["status"] == "pending"
+    assert probation["check_count"] == 1
+    assert probation["valid_check_count"] == 1
+    assert probation["last_known_valid_at_ts"] == 160
+    assert probation["next_check_at_ts"] == 220
 
-    second = check_due_account_probations(now_ts=1000, concurrency=2)
+    second = check_due_account_probations(now_ts=220, concurrency=2)
     assert second["checked"] == 1
-    assert second["passed"] == 1
+    assert second["pending"] == 1
     probation = _overview(account_id).get_summary()["probation"]
-    assert probation["status"] == "passed"
+    assert probation["status"] == "pending"
+    assert probation["check_count"] == 2
+    assert probation["next_check_at_ts"] == 280
+
+
+def test_probation_default_is_a_continuous_sixty_second_monitor():
+    account_id = _create_account(lifecycle_status="registered")
+
+    state = schedule_account_probation(account_id, now_ts=100)
+
+    assert state["mode"] == "continuous"
+    assert state["interval_seconds"] == 60
+    assert state["offsets_seconds"] == [60]
+    assert state["next_check_at_ts"] == 160
+
+
+def test_existing_active_account_is_migrated_to_continuous_monitor():
+    account_id = _create_account(lifecycle_status="registered")
+
+    result = check_due_account_probations(now_ts=100)
+
+    assert result["monitors_started"] == 1
+    probation = _overview(account_id).get_summary()["probation"]
+    assert probation["status"] == "pending"
+    assert probation["mode"] == "continuous"
+    assert probation["next_check_at_ts"] == 160
+
+
+def test_unknown_probation_result_retries_on_the_same_sixty_second_cadence(monkeypatch):
+    account_id = _create_account(lifecycle_status="registered")
+    monkeypatch.setattr("core.lifecycle.get", lambda _platform: _UnknownPlatform)
+    schedule_account_probation(account_id, interval_seconds=60, now_ts=100)
+
+    result = check_due_account_probations(now_ts=160)
+
+    assert result["unknown"] == 1
+    assert result["pending"] == 1
+    probation = _overview(account_id).get_summary()["probation"]
+    assert probation["status"] == "pending"
+    assert probation["last_status"] == "unknown"
+    assert probation["unknown_check_count"] == 1
+    assert probation["next_check_at_ts"] == 220
 
 
 def test_probation_marks_newly_deactivated_account_failed(monkeypatch):
     account_id = _create_account(lifecycle_status="registered")
     monkeypatch.setattr("core.lifecycle.get", lambda _platform: _AlwaysInvalidPlatform)
-    schedule_account_probation(account_id, offsets_seconds=[300], now_ts=100)
+    schedule_account_probation(account_id, interval_seconds=60, now_ts=100)
 
-    result = check_due_account_probations(now_ts=400)
+    result = check_due_account_probations(now_ts=160)
 
     assert result["failed"] == 1
     overview = _overview(account_id)
     assert overview.validity_status == "invalid"
-    assert overview.get_summary()["probation"]["status"] == "failed"
+    probation = overview.get_summary()["probation"]
+    assert probation["status"] == "failed"
+    assert probation["first_invalid_at_ts"] == 160
+    assert probation["last_known_valid_at_ts"] == 100
+    assert probation["detection_window_seconds"] == 60
 
 
 def test_legacy_invalid_account_preserves_first_known_check_time():

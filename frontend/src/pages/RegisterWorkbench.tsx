@@ -96,6 +96,9 @@ const DEFAULT_FORM: Record<string, any> = {
   failure_policy: 'retry_then_continue',
   complete_started_attempts: false,
   post_registration_liveness_delay_seconds: 60,
+  post_registration_probation_enabled: true,
+  post_registration_probation_interval_seconds: 60,
+  network_circuit_break_threshold: 3,
 }
 
 const SMS_COUNTRY_PROXY_REGIONS: Record<string, { code: string; label: string }> = {
@@ -708,6 +711,12 @@ export default function RegisterWorkbench() {
           Math.max(Number(form.post_registration_liveness_delay_seconds || 60), 0),
           600,
         ),
+        post_registration_probation_enabled: true,
+        post_registration_probation_interval_seconds: 60,
+        network_circuit_break_threshold: Math.min(
+          Math.max(Number(form.network_circuit_break_threshold || 3), 0),
+          20,
+        ),
         sub2api_auto_sync: Boolean(form.sub2api_auto_sync),
         sub2api_proxy_id: Number(form.sub2api_proxy_id || 0),
         sub2api_proxy_region: configuredSub2Region,
@@ -1093,14 +1102,19 @@ export default function RegisterWorkbench() {
           <Card>
             <CardContent className="p-5 sm:p-6">
               <SectionHeading number="04" title="交付与存活质检" description="注册结束后的保存、上传和延迟复检集中在最后一步，避免“显示成功但账号已经失效”。" icon={ShieldCheck} />
-              <div className="grid gap-4 md:grid-cols-2">
+              <div className="grid gap-4 md:grid-cols-3">
                 <FieldSelect
-                  label="注册后存活复检"
+                  label="任务内首次质检"
                   value={form.post_registration_liveness_delay_seconds}
                   onChange={value => set('post_registration_liveness_delay_seconds', value)}
                   options={[[15, '15 秒 · 极速'], [30, '30 秒'], [60, '60 秒 · 推荐'], [120, '2 分钟 · 严格'], [180, '3 分钟']]}
-                  hint="任务成功前再验证一次账号状态；默认 60 秒用于捕获快速失效"
+                  hint="注册任务结束前先验证一次；通过后才进入后台持续监控"
                 />
+                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3">
+                  <div className="flex items-center gap-2 text-xs text-emerald-300"><ShieldCheck className="h-4 w-4" />后台持续复检</div>
+                  <div className="mt-2 text-sm font-medium text-[var(--text-primary)]">每 60 秒，持续运行</div>
+                  <div className="mt-1 text-[11px] leading-4 text-[var(--text-muted)]">服务重启后续跑；有效或未知都排下一分钟，明确失效才停止</div>
+                </div>
                 <div className="rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] px-4 py-3">
                   <div className="flex items-center gap-2 text-xs text-[var(--text-muted)]"><Database className="h-4 w-4" />基础交付</div>
                   <div className="mt-2 text-sm font-medium text-[var(--text-primary)]">保存到 {currentPlatform?.display_name || form.platform} 账号池</div>
@@ -1182,6 +1196,13 @@ export default function RegisterWorkbench() {
                   ]}
                   hint="批量任务建议保留默认策略"
                 />
+                <FieldSelect
+                  label="连续网络失败熔断"
+                  value={form.network_circuit_break_threshold}
+                  onChange={value => set('network_circuit_break_threshold', Number(value))}
+                  options={[[3, '连续 3 次 · 推荐'], [5, '连续 5 次'], [0, '关闭熔断']]}
+                  hint="代理或网络连续失败时停止投放新账号，已在运行的流程仍会收尾"
+                />
                 <ToggleRow
                   label="预启动完整并发窗口"
                   description="并发大于成功目标时仍先启动整个窗口；可能产出超过目标的账号"
@@ -1224,7 +1245,9 @@ export default function RegisterWorkbench() {
                     ['身份', summaryRegistration],
                     ['执行', summaryExecutor],
                     ['线路', form.proxy ? '手动代理' : form.proxy_strategy === 'direct' ? '直连' : `${form.proxy_strategy} · ${requiredProxyRegion || '自动地区'}`],
-                    ['复检', `${Number(form.post_registration_liveness_delay_seconds || 0)} 秒后`],
+                    ['首次质检', `${Number(form.post_registration_liveness_delay_seconds || 0)} 秒后`],
+                    ['持续复检', '每 60 秒 · 持久化'],
+                    ['网络熔断', Number(form.network_circuit_break_threshold || 0) > 0 ? `连续 ${Number(form.network_circuit_break_threshold)} 次` : '关闭'],
                     ['交付', form.sub2api_auto_sync ? `账号池 + Sub2 #${Number(form.sub2api_proxy_id || 0) || '-'}` : '仅账号池'],
                   ].map(([label, value]) => (
                     <div key={label} className="flex items-start justify-between gap-4 text-xs">

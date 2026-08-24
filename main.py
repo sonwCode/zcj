@@ -101,6 +101,8 @@ async def lifespan(app: FastAPI):
     init_db()
     load_all()
     load_providers()
+    from core.build_info import build_identity
+    print(f"[OK] 运行构建: {build_identity()}")
     print("[OK] 数据库初始化完成")
     from core.registry import list_platforms
     print(f"[OK] 已加载平台: {[p['name'] for p in list_platforms()]}")

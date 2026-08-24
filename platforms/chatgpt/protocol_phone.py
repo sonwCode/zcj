@@ -40,6 +40,7 @@ class _PhoneIdentityService:
 
 _PHONE_PREFIX_TO_ISO = {
     "1": "US",
+    "31": "NL",
     "44": "GB",
     "49": "DE",
     "55": "BR",
@@ -129,6 +130,47 @@ def _cookies_to_header(records: list[dict[str, str]]) -> str:
     return "; ".join(f"{name}={value}" for name, value in values.items())
 
 
+def _parse_cookie_records(value) -> list[dict[str, str]]:
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, dict)]
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, list):
+        return [dict(item) for item in parsed if isinstance(item, dict)]
+    records: list[dict[str, str]] = []
+    for part in raw.split(";"):
+        name, separator, cookie_value = part.strip().partition("=")
+        if separator and name and cookie_value:
+            records.append(
+                {"name": name, "value": cookie_value, "domain": "", "path": "/"}
+            )
+    return records
+
+
+def _cookie_value(session, name: str) -> str:
+    """Read a cookie even when the jar contains the same name on two domains."""
+    cookies = getattr(session, "cookies", None)
+    try:
+        value = cookies.get(name) if cookies is not None else ""
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    jar = getattr(cookies, "jar", None)
+    if jar is not None:
+        for cookie in reversed(list(jar)):
+            if str(getattr(cookie, "name", "") or "") == name:
+                value = str(getattr(cookie, "value", "") or "")
+                if value:
+                    return value
+    return ""
+
+
 def _decode_client_auth_session(raw_cookie: str) -> dict:
     first = str(raw_cookie or "").strip().split(".", 1)[0]
     if not first:
@@ -162,6 +204,25 @@ def _is_phone_otp_number_rejection(error_code: str, error_message: str) -> bool:
         or "fraud guard" in message
         or "disallowed phone" in message
         or "unsupported phone" in message
+    )
+
+
+def _is_phone_risk_rejection(error_code: str, error_message: str) -> bool:
+    """Return whether the remote explicitly classified the phone cohort as risky.
+
+    This is different from a malformed or already-used individual number. Once
+    the account/session receives a fraud-guard or similar-number verdict,
+    rotating more provider tiers on that same account only adds retries to an
+    already risked authorization transaction.
+    """
+    code = str(error_code or "").strip().lower()
+    message = str(error_message or "").strip().lower()
+    return (
+        code == "fraud_guard"
+        or "suspicious behavior from phone numbers" in message
+        or "phone numbers similar to yours" in message
+        or "fraud_guard" in message
+        or "fraud guard" in message
     )
 
 
@@ -865,6 +926,9 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
         cancel_check=None,
         max_phone_attempts: int = 3,
         require_codex_refresh_token: bool = True,
+        existing_device_id: str = "",
+        existing_auth_cookies=None,
+        proxy_country: str = "",
     ):
         super().__init__(
             phone_callback=phone_callback,
@@ -873,9 +937,85 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
             cancel_check=cancel_check,
             max_phone_attempts=max_phone_attempts,
             bind_email_after_registration=False,
+            proxy_country=proxy_country,
         )
         self.email_service = email_service
         self.require_codex_refresh_token = bool(require_codex_refresh_token)
+        self.existing_device_id = str(existing_device_id or "").strip()
+        self.existing_auth_cookies = _parse_cookie_records(existing_auth_cookies)
+        self._auth_generation = 0
+
+    @staticmethod
+    def _seed_device_id(engine: RegistrationEngine, device_id: str) -> None:
+        stable_id = str(device_id or "").strip()
+        if not stable_id:
+            return
+        for domain in (
+            "chatgpt.com",
+            ".chatgpt.com",
+            "auth.openai.com",
+            ".auth.openai.com",
+        ):
+            try:
+                engine.session.cookies.set(
+                    "oai-did",
+                    stable_id,
+                    domain=domain,
+                    path="/",
+                )
+            except Exception:
+                pass
+        engine._device_id = stable_id
+
+    def _restore_auth_context(self, engine: RegistrationEngine) -> None:
+        """Carry the account's real cookie jar into each follow-up OAuth session."""
+        restored = 0
+        for item in self.existing_auth_cookies:
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "")
+            if not name or not value:
+                continue
+            path = str(item.get("path") or "/")
+            domain = str(item.get("domain") or "").strip()
+            target_domains = [domain] if domain else ["chatgpt.com", "auth.openai.com"]
+            for target_domain in target_domains:
+                try:
+                    engine.session.cookies.set(
+                        name,
+                        value,
+                        domain=target_domain,
+                        path=path,
+                    )
+                    restored += 1
+                except Exception:
+                    pass
+        if self.existing_device_id:
+            self._seed_device_id(engine, self.existing_device_id)
+        if restored:
+            self._log(
+                "已继承基础注册会话 Cookie: "
+                f"records={len(self.existing_auth_cookies)} generation={self._auth_generation}"
+            )
+
+    def _capture_auth_context(self, engine: RegistrationEngine) -> None:
+        records = _export_session_cookies(getattr(engine, "session", None))
+        if records:
+            self.existing_auth_cookies = records
+        device_id = str(getattr(engine, "_device_id", "") or "").strip()
+        if device_id:
+            self.existing_device_id = device_id
+
+    def _session_context_fields(self, engine: RegistrationEngine) -> dict:
+        self._capture_auth_context(engine)
+        fields: dict[str, object] = {}
+        if self.existing_device_id:
+            fields["oai_device_id"] = self.existing_device_id
+        if self.existing_auth_cookies:
+            fields["auth_cookies"] = list(self.existing_auth_cookies)
+            fields["cookies"] = _cookies_to_header(self.existing_auth_cookies)
+        if self._auth_generation > 0:
+            fields["auth_generation"] = self._auth_generation
+        return fields
 
     @staticmethod
     def _page_state(response) -> tuple[str, str, dict]:
@@ -915,6 +1055,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
         }
 
     def _open_phone_challenge(self, *, email: str, password: str) -> tuple[RegistrationEngine, str, dict]:
+        self._auth_generation += 1
         engine = RegistrationEngine(
             email_service=self.email_service,
             proxy_url=self.proxy_url,
@@ -924,6 +1065,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
         engine.password = password
         if not engine._init_session():
             raise RuntimeError("邮箱账号手机号验证会话初始化失败")
+        self._restore_auth_context(engine)
 
         oauth_start = generate_oauth_url(
             client_id=CODEX_CLIENT_ID,
@@ -935,9 +1077,23 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
         response = engine.session.get(oauth_start.auth_url, allow_redirects=True, timeout=30)
         final_url = str(getattr(response, "url", "") or oauth_start.auth_url)
         engine._authorize_final_url = final_url
-        engine._device_id = str(engine.session.cookies.get("oai-did") or "")
+        session_device_id = _cookie_value(engine.session, "oai-did")
+        if not self.existing_device_id:
+            self.existing_device_id = session_device_id
+        if self.existing_device_id:
+            # Preserve one account-scoped device identity across the base
+            # registration, phone OAuth, and every authorization rebuild.
+            self._seed_device_id(engine, self.existing_device_id)
+        else:
+            engine._device_id = session_device_id
         if not engine._device_id:
             raise RuntimeError("手机号验证授权未建立 Device ID")
+        self._log(
+            "手机号授权会话档案已复用: "
+            f"device={'stable' if self.existing_device_id else 'session'} "
+            f"generation={self._auth_generation} "
+            f"proxy_country={self.proxy_country or 'unknown'}"
+        )
 
         if "/add-phone" in final_url:
             return engine, final_url, {}
@@ -1188,8 +1344,10 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                     "CODEX_RT_MISSING: 手机号已验证，但 Codex OAuth 未返回 refresh_token"
                 )
             self._log("手机号已验证，Codex OAuth 本次未返回 RT", "warning")
-            return {"ok": True, "already_verified": True, "phone_number": ""}
-        return {
+            result = {"ok": True, "already_verified": True, "phone_number": ""}
+            result.update(self._session_context_fields(engine))
+            return result
+        result = {
             "ok": True,
             "already_verified": True,
             "phone_number": "",
@@ -1197,6 +1355,8 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
             "refresh_token": str(codex_tokens.get("refresh_token") or ""),
             "id_token": str(codex_tokens.get("id_token") or ""),
         }
+        result.update(self._session_context_fields(engine))
+        return result
 
     def _rebuild_phone_challenge(
         self,
@@ -1204,6 +1364,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
         email: str,
         password: str,
         reason: str,
+        previous_engine: RegistrationEngine | None = None,
     ) -> tuple[RegistrationEngine, str, dict]:
         """Start a fresh phone authorization transaction for the same account.
 
@@ -1217,6 +1378,8 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
         )
         if self.cancel_check():
             raise RuntimeError("任务已取消")
+        if previous_engine is not None:
+            self._capture_auth_context(previous_engine)
         try:
             return self._open_phone_challenge(email=email, password=password)
         except Exception as exc:
@@ -1250,6 +1413,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                 "error_code": "codex_tokens_incomplete",
                 "error": "Codex OAuth token response missing: " + ", ".join(missing),
             }
+        tokens.update(self._session_context_fields(engine))
         return {"ok": True, "data": tokens}
 
     def run_for_account(self, *, email: str, password: str) -> dict:
@@ -1272,6 +1436,20 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                 phone_number = str(self.phone_callback() or "").strip()
                 if not phone_number:
                     raise RuntimeError("接码平台未返回手机号")
+                phone_country = _phone_country_iso(phone_number)
+                route_mismatch = bool(
+                    self.proxy_country
+                    and phone_country
+                    and self.proxy_country != phone_country
+                )
+                if route_mismatch and not self._route_mismatch_logged:
+                    self._log(
+                        "会话一致性警告: "
+                        f"注册代理国家={self.proxy_country}，手机号国家={phone_country}；"
+                        "当前账号不会静默切换代理，请配置一致的代理与号码国家",
+                        "warning",
+                    )
+                    self._route_mismatch_logged = True
                 self._log(f"邮箱账号手机号验证: 第 {attempt}/{self.max_phone_attempts} 个号码")
                 engine._password_continue_url = add_phone_url
                 engine._password_next_payload = dict(page_payload)
@@ -1296,12 +1474,22 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                             "ACCOUNT_DEACTIVATED: "
                             f"{last_error or '账号已被删除或停用'}"
                         )
+                    if _is_phone_risk_rejection(error_code, last_error):
+                        self._log(
+                            "远端已将当前手机号号段/会话判为风险，停止在同一账号上继续换号",
+                            "warning",
+                        )
+                        raise RuntimeError(
+                            "PHONE_RISK_REJECTED: "
+                            f"{last_error or error_code or 'phone fraud guard'}"
+                        )
                     if error_code == "phone_authorization_invalid":
                         if attempt < self.max_phone_attempts:
                             engine, add_phone_url, page_payload = self._rebuild_phone_challenge(
                                 email=email,
                                 password=password,
                                 reason=error_code,
+                                previous_engine=engine,
                             )
                             if page_payload.get("already_verified"):
                                 return self._handle_already_verified_phone_account(engine)
@@ -1334,6 +1522,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                             email=email,
                             password=password,
                             reason="phone_otp_timeout",
+                            previous_engine=engine,
                         )
                         if page_payload.get("already_verified"):
                             return self._handle_already_verified_phone_account(engine)
@@ -1354,6 +1543,15 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                             "ACCOUNT_DEACTIVATED: "
                             f"{last_error or '账号已被删除或停用'}"
                         )
+                    if _is_phone_risk_rejection(error_code, last_error):
+                        self._log(
+                            "远端已将当前手机号号段/会话判为风险，停止在同一账号上继续换号",
+                            "warning",
+                        )
+                        raise RuntimeError(
+                            "PHONE_RISK_REJECTED: "
+                            f"{last_error or error_code or 'phone fraud guard'}"
+                        )
                     if _is_phone_account_rate_limited(error_code, last_error):
                         raise RuntimeError(
                             "PHONE_ACCOUNT_RATE_LIMITED: "
@@ -1364,6 +1562,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                             email=email,
                             password=password,
                             reason=error_code or "phone_otp_validation_failed",
+                            previous_engine=engine,
                         )
                         if page_payload.get("already_verified"):
                             return self._handle_already_verified_phone_account(engine)
@@ -1397,6 +1596,12 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                     "phone_number": phone_number,
                     "page_type": str(engine._otp_page_type or ""),
                 }
+                result_data.update(self._session_context_fields(engine))
+                if self.proxy_country:
+                    if phone_country:
+                        result_data["phone_country"] = phone_country
+                    result_data["auth_proxy_country"] = self.proxy_country
+                    result_data["route_country_consistent"] = not route_mismatch
                 if codex_tokens:
                     result_data.update(
                         {

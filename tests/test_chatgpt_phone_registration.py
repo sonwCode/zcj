@@ -951,6 +951,58 @@ def test_email_phone_worker_reports_phone_required_without_renting_number(monkey
     }
 
 
+def test_email_phone_worker_restores_account_scoped_cookie_context():
+    class Cookies:
+        def __init__(self):
+            self.set_calls = []
+            self.values = {}
+
+        def set(self, name, value, **kwargs):
+            self.set_calls.append((name, value, kwargs))
+            self.values[(name, kwargs.get("domain", ""))] = value
+
+        def get(self, name, default=""):
+            for (cookie_name, _domain), value in reversed(list(self.values.items())):
+                if cookie_name == name:
+                    return value
+            return default
+
+    cookies = Cookies()
+    engine = SimpleNamespace(
+        session=SimpleNamespace(cookies=cookies),
+        _device_id="",
+    )
+    worker = ChatGPTProtocolEmailThenPhoneWorker(
+        email_service=SimpleNamespace(),
+        phone_callback=lambda: "",
+        existing_device_id="stable-device-id",
+        existing_auth_cookies=[
+            {
+                "name": "__Secure-next-auth.session-token",
+                "value": "session-token",
+                "domain": "chatgpt.com",
+                "path": "/",
+            }
+        ],
+        log_fn=lambda message: None,
+    )
+    worker._auth_generation = 1
+
+    worker._restore_auth_context(engine)
+
+    assert engine._device_id == "stable-device-id"
+    assert any(
+        name == "__Secure-next-auth.session-token"
+        and value == "session-token"
+        and kwargs["domain"] == "chatgpt.com"
+        for name, value, kwargs in cookies.set_calls
+    )
+    assert any(
+        name == "oai-did" and value == "stable-device-id"
+        for name, value, _kwargs in cookies.set_calls
+    )
+
+
 def test_email_phone_worker_stops_on_account_deactivated_without_changing_number(monkeypatch):
     class Callback:
         def __init__(self):
@@ -999,6 +1051,50 @@ def test_email_phone_worker_stops_on_account_deactivated_without_changing_number
 
     assert callback.phone_calls == 1
     assert callback.cleanup_count == 1
+
+
+def test_email_phone_worker_stops_on_fraud_guard_without_rotating_more_numbers(monkeypatch):
+    class Callback:
+        def __init__(self):
+            self.phone_calls = 0
+            self.cleanup_count = 0
+
+        def __call__(self):
+            self.phone_calls += 1
+            return "+15550001111"
+
+        def mark_send_failed(self, reason=""):
+            self.failure_reason = reason
+
+        def cleanup(self):
+            self.cleanup_count += 1
+
+    callback = Callback()
+    engine = SimpleNamespace(
+        _otp_page_type="add_phone",
+        _step_error_code="fraud_guard",
+        _step_error_message=(
+            "We've detected suspicious behavior from phone numbers similar to yours."
+        ),
+    )
+    worker = ChatGPTProtocolEmailThenPhoneWorker(
+        email_service=SimpleNamespace(),
+        phone_callback=callback,
+        log_fn=lambda message, **kwargs: None,
+        max_phone_attempts=8,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_open_phone_challenge",
+        lambda **kwargs: (engine, "https://auth.openai.com/add-phone", {}),
+    )
+    monkeypatch.setattr(worker, "_send_add_phone_number", lambda *args: False)
+
+    with pytest.raises(RuntimeError, match="PHONE_RISK_REJECTED"):
+        worker.run_for_account(email="user@example.com", password="Secret123!")
+
+    assert callback.phone_calls == 1
+    assert "suspicious behavior" in callback.failure_reason.lower()
 
 
 def test_protocol_phone_worker_classifies_suspicious_sms_send_as_number_rejection():

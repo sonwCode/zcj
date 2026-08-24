@@ -11,6 +11,7 @@ import { I18nProvider, useI18n } from "@/lib/i18n-context";
 import type { TranslationKey } from "@/lib/i18n";
 import UpdateBanner from "@/components/UpdateBanner";
 import ActiveTaskDock from "@/components/tasks/ActiveTaskDock";
+import { SchedulerHealth } from "@/components/SchedulerHealth";
 import {
   LayoutDashboard,
   Moon,
@@ -76,7 +77,7 @@ const SETTINGS_NAV_ITEMS: { labelKey: TranslationKey; hash: string }[] = [
 const NAV_ITEMS: NavItem[] = [
   { path: "/", labelKey: "nav.dashboard", icon: LayoutDashboard, exact: true, group: "总览" },
   { path: "/accounts/chatgpt", label: "账号池", icon: Users, group: "账号" },
-  { path: "/register", label: "注册工作台", icon: UserPlus, group: "账号" },
+  { path: "/register", label: "注册中心", icon: UserPlus, group: "账号" },
   { path: "/history", label: "任务日志", icon: ClipboardList, group: "账号" },
   { path: "/plus-manager", label: "Plus 管理", icon: CreditCard, group: "Plus" },
   { path: "/ctf-gpt-plus", label: "CTF Plus", icon: CreditCard, group: "Plus" },
@@ -199,7 +200,9 @@ function Sidebar({
       </nav>
 
       {/* Footer */}
-      <div className={cn("sub2-sidebar-footer flex shrink-0 gap-1 px-3 py-3", collapsed ? "flex-col items-center" : "items-center")}>
+      <div className="sub2-sidebar-footer shrink-0 px-3 py-3">
+        <SchedulerHealth compact={collapsed} className={cn(collapsed ? "mx-auto mb-2" : "mb-3 min-w-0 w-full")} />
+        <div className={cn("flex gap-1", collapsed ? "flex-col items-center" : "items-center")}>
         <button
           onClick={toggleTheme}
           className={cn(
@@ -250,6 +253,7 @@ function Sidebar({
             )}
           </button>
         )}
+        </div>
       </div>
     </aside>
   );

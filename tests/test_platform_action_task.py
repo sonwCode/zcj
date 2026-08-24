@@ -146,6 +146,57 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
     assert pipeline["stages"]["persisted"]["status"] == "passed"
 
 
+def test_chatgpt_register_task_stops_after_consecutive_network_failures(monkeypatch):
+    seen = {"attempts": 0}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            seen["attempts"] += 1
+            raise RuntimeError("proxy_network_error: connect tunnel failed")
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "require_phone_verification": True,
+                "email_pre_phone_max_attempts": 10,
+                "network_circuit_break_threshold": 3,
+            },
+        },
+        logger,
+    )
+
+    assert seen["attempts"] == 3
+    assert logger.finished[0] == tasks_module.TASK_STATUS_FAILED
+    assert logger.result_data["network_circuit_breaker"] == {
+        "enabled": True,
+        "threshold": 3,
+        "open": True,
+        "consecutive_failures": 3,
+        "reason": "proxy_network_error: connect tunnel failed",
+    }
+    assert any(
+        event[0] == "log" and "注册网络熔断已触发" in event[1]
+        for event in logger.events
+    )
+
+
 def test_email_then_phone_keeps_parallel_attempt_window_when_target_is_one(monkeypatch):
     """Phone waits may overlap across independent accounts, even for count=1."""
     import threading
@@ -598,6 +649,78 @@ def test_sub2_auto_sync_forces_mailbox_registration_through_phone_verification(m
     assert extra["sub2api_auto_sync"] is True
     assert extra["require_phone_verification"] is True
     assert extra["register_mode"] == "email_then_phone"
+
+
+def test_registration_mode_is_derived_after_policy_enforcement(monkeypatch):
+    seen = {"phone_calls": 0}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email="policy-order@example.com",
+                password=password or "Secret123!",
+                user_id="acct_policy_order",
+                extra={"access_token": "access-token"},
+            )
+
+    def enforce_before_derivation(_platform_name, extra):
+        extra["require_phone_verification"] = True
+        extra["register_mode"] = "email_then_phone"
+        return False
+
+    def complete_phone(**_kwargs):
+        seen["phone_calls"] += 1
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_enforce_sub2_registration_requirements",
+        enforce_before_derivation,
+    )
+    monkeypatch.setattr(tasks_module, "get", lambda _platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_complete_required_chatgpt_phone_verification",
+        complete_phone,
+    )
+    monkeypatch.setattr(tasks_module, "_upgrade_protocol_codex_credentials", lambda **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_account_has_codex_rt", lambda _account: True)
+    monkeypatch.setattr(tasks_module, "save_account", lambda _account: None)
+    monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_sub2api", lambda *args, **kwargs: None)
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "post_registration_liveness_delay_seconds": 0,
+                "post_registration_probation_enabled": False,
+            },
+        },
+        logger,
+    )
+
+    assert seen["phone_calls"] == 1
+    assert any(
+        event[0] == "log" and "邮箱 + 手机流程" in str(event[1])
+        for event in logger.events
+    )
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
 
 
 def test_sub2_auto_sync_does_not_override_explicit_task_disable(monkeypatch):

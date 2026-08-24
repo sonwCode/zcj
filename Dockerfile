@@ -40,9 +40,12 @@ RUN playwright install --with-deps chromium
 
 # 复制后端代码
 ARG APP_VERSION=dev
+ARG APP_GIT_SHA=unknown
+ARG APP_BUILD_TIME=unknown
 COPY . .
 # 注入版本号
-RUN echo "__version__ = \"${APP_VERSION}\"" > core/version.py
+RUN printf '__version__ = "%s"\n__git_sha__ = "%s"\n__build_time__ = "%s"\n' \
+    "${APP_VERSION}" "${APP_GIT_SHA}" "${APP_BUILD_TIME}" > core/version.py
 # 不需要 .venv 和 frontend 源码
 RUN rm -rf .venv frontend
 

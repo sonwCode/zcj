@@ -339,7 +339,14 @@ export function TaskLogPanel({
           : "border-sky-400/40 bg-sky-400/10 text-sky-200";
 
   const copyLogs = async () => {
-    const copied = await copyTextToClipboard(visibleEvents.map((ev) => ev.line).join("\n"));
+    // Preserve worker correlation in copied diagnostics. The rendered panel is
+    // grouped by subtask, but a flat clipboard export previously discarded
+    // that grouping and made concurrent SMS/OAuth timelines ambiguous.
+    const copied = await copyTextToClipboard(
+      visibleEvents
+        .map((ev) => `${ev.subtaskId ? `[${ev.subtaskId}] ` : ""}${ev.line}`)
+        .join("\n"),
+    );
     setCopyStatus(copied ? "copied" : "failed");
     if (copyResetTimerRef.current !== null) {
       window.clearTimeout(copyResetTimerRef.current);

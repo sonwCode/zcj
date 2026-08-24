@@ -2,7 +2,7 @@
 import math
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlmodel import Session, select
 
@@ -23,6 +23,10 @@ class Scheduler:
         self._status_lock = threading.Lock()
         self._full_cycle_status = self._empty_cycle_status()
         self._probation_cycle_status = self._empty_cycle_status()
+        self._heartbeat_at = ""
+        self._next_full_run_at = ""
+        self._probation_scan_interval_seconds = 5
+        self._continuous_check_interval_seconds = 60
 
     @staticmethod
     def _empty_cycle_status() -> dict:
@@ -52,12 +56,26 @@ class Scheduler:
         with self._status_lock:
             full = dict(self._full_cycle_status)
             probation = dict(self._probation_cycle_status)
+            heartbeat_at = self._heartbeat_at
+            next_full_run_at = self._next_full_run_at
         return {
             "running": bool(self._running),
             "thread_alive": bool(self._thread and self._thread.is_alive()),
+            "heartbeat_at": heartbeat_at,
+            "next_full_run_at": next_full_run_at,
+            "probation_scan_interval_seconds": self._probation_scan_interval_seconds,
+            "continuous_check_interval_seconds": self._continuous_check_interval_seconds,
             "full_cycle": full,
             "probation_cycle": probation,
         }
+
+    def _update_runtime_status(self, *, next_full_in_seconds: float) -> None:
+        next_seconds = max(float(next_full_in_seconds or 0), 0.0)
+        with self._status_lock:
+            self._heartbeat_at = self._now_iso()
+            self._next_full_run_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=next_seconds)
+            ).isoformat().replace("+00:00", "Z")
 
     def start(self):
         if self._running and self._thread and self._thread.is_alive():
@@ -74,7 +92,12 @@ class Scheduler:
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        print("[Scheduler] 已启动")
+        print(
+            "[Scheduler] 已启动: "
+            f"持续复检=每{self._continuous_check_interval_seconds}s，"
+            f"队列扫描={self._probation_scan_interval_seconds}s",
+            flush=True,
+        )
 
     def stop(self):
         self._running = False
@@ -92,23 +115,27 @@ class Scheduler:
                 )
             except Exception:
                 interval_minutes = 5
-            # Wake at least once per minute for short post-registration
-            # probation checks. The heavier full-account sweep still follows
-            # its configured interval and first runs one minute after startup.
+            # Scan the persisted continuous-monitor queue frequently enough to
+            # keep the one-minute cadence tight. The heavier full-account sweep
+            # still follows its configured interval and first runs after one minute.
+            until_full = next_full_run - time.monotonic()
             delay_seconds = max(
                 1,
-                min(60, int(math.ceil(next_full_run - time.monotonic()))),
+                min(
+                    self._probation_scan_interval_seconds,
+                    int(math.ceil(until_full)),
+                ),
             )
-            print(
-                f"[Scheduler] 下一次维护检查将在 {delay_seconds} 秒后运行",
-                flush=True,
-            )
+            self._update_runtime_status(next_full_in_seconds=until_full)
             if self._stop_event.wait(delay_seconds):
                 break
+            self._update_runtime_status(
+                next_full_in_seconds=next_full_run - time.monotonic()
+            )
             try:
                 self._run_probation_cycle()
             except Exception as e:
-                print(f"[Scheduler] 观察期复检错误: {e}", flush=True)
+                print(f"[Scheduler] 持续复检错误: {e}", flush=True)
             if time.monotonic() >= next_full_run:
                 if not self._full_cycle_thread or not self._full_cycle_thread.is_alive():
                     print("[Scheduler] 开始账号有效性检测...", flush=True)
@@ -119,6 +146,9 @@ class Scheduler:
                     )
                     self._full_cycle_thread.start()
                 next_full_run = time.monotonic() + interval_minutes * 60
+                self._update_runtime_status(
+                    next_full_in_seconds=next_full_run - time.monotonic()
+                )
 
     def _run_full_cycle_safely(self):
         try:

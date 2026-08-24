@@ -264,7 +264,10 @@ def check_accounts_validity(
 # Post-registration probation checks
 # ---------------------------------------------------------------------------
 
-DEFAULT_PROBATION_OFFSETS_SECONDS = (300, 900)
+DEFAULT_PROBATION_INTERVAL_SECONDS = 60
+# Compatibility alias for callers that still pass the former offset list.
+# A probation is now continuous; the first value becomes its repeat interval.
+DEFAULT_PROBATION_OFFSETS_SECONDS = (DEFAULT_PROBATION_INTERVAL_SECONDS,)
 
 
 def _normalize_probation_offsets(values) -> list[int]:
@@ -279,29 +282,65 @@ def _normalize_probation_offsets(values) -> list[int]:
     return sorted(result)
 
 
+def _normalize_probation_interval(value: Any, default: int = DEFAULT_PROBATION_INTERVAL_SECONDS) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return min(max(parsed, 15), 3600)
+
+
+def _ts_from_iso(value: Any) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return 0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
 def schedule_account_probation(
     account_id: int,
     *,
     offsets_seconds: list[int] | tuple[int, ...] | None = None,
+    interval_seconds: int | None = None,
     now_ts: int | None = None,
 ) -> dict[str, Any]:
-    """Persist non-blocking follow-up checks for a newly registered account."""
+    """Persist a continuous, non-blocking liveness monitor for one account."""
     start_ts = int(now_ts if now_ts is not None else _utcnow_ts())
-    raw_offsets = offsets_seconds or DEFAULT_PROBATION_OFFSETS_SECONDS
-    offsets = _normalize_probation_offsets(raw_offsets)
-    if not offsets:
-        return {}
+    legacy_offsets = _normalize_probation_offsets(
+        offsets_seconds or DEFAULT_PROBATION_OFFSETS_SECONDS
+    )
+    interval = _normalize_probation_interval(
+        interval_seconds
+        if interval_seconds is not None
+        else (legacy_offsets[0] if legacy_offsets else DEFAULT_PROBATION_INTERVAL_SECONDS)
+    )
     state = {
         "status": "pending",
+        "mode": "continuous",
         "started_at": _iso_from_ts(start_ts),
         "started_at_ts": start_ts,
-        "offsets_seconds": offsets,
+        "interval_seconds": interval,
+        "offsets_seconds": [interval],
         "completed_offsets_seconds": [],
-        "next_offset_seconds": offsets[0],
-        "next_check_at": _iso_from_ts(start_ts + offsets[0]),
-        "next_check_at_ts": start_ts + offsets[0],
+        "next_offset_seconds": interval,
+        "next_check_at": _iso_from_ts(start_ts + interval),
+        "next_check_at_ts": start_ts + interval,
+        "last_known_valid_at": _iso_from_ts(start_ts),
+        "last_known_valid_at_ts": start_ts,
         "last_status": "",
         "retry_count": 0,
+        "check_count": 0,
+        "valid_check_count": 0,
+        "unknown_check_count": 0,
+        "error_count": 0,
     }
     with Session(engine) as session:
         model = session.get(AccountModel, int(account_id))
@@ -313,6 +352,121 @@ def schedule_account_probation(
     return state
 
 
+def ensure_continuous_probation_monitors(
+    *,
+    platform: str = "chatgpt",
+    interval_seconds: int = DEFAULT_PROBATION_INTERVAL_SECONDS,
+    now_ts: int | None = None,
+) -> dict[str, int]:
+    """Migrate every active account onto the persisted continuous monitor.
+
+    This closes the deployment gap for accounts created before continuous
+    monitoring existed. Invalid accounts stay stopped; the slower retained-row
+    sweep can still detect a later manual reauthentication and re-enable them.
+    """
+    current_ts = int(now_ts if now_ts is not None else _utcnow_ts())
+    interval = _normalize_probation_interval(interval_seconds)
+    active_lifecycle_statuses = {"registered", "trial", "subscribed"}
+    result = {
+        "eligible": 0,
+        "active": 0,
+        "started": 0,
+        "migrated": 0,
+        "skipped_invalid": 0,
+    }
+
+    with Session(engine) as session:
+        accounts = session.exec(
+            select(AccountModel).where(AccountModel.platform == str(platform or "chatgpt"))
+        ).all()
+        account_ids = [int(account.id or 0) for account in accounts if account.id]
+        graphs = load_account_graphs(session, account_ids)
+        changed = False
+
+        for account in accounts:
+            account_id = int(account.id or 0)
+            if account_id <= 0:
+                continue
+            graph = dict(graphs.get(account_id) or {})
+            lifecycle_status = str(graph.get("lifecycle_status") or "registered").strip().lower()
+            overview = dict(graph.get("overview") or {})
+            validity_status = str(
+                graph.get("validity_status")
+                or overview.get("validity_status")
+                or "unknown"
+            ).strip().lower()
+            if lifecycle_status not in active_lifecycle_statuses:
+                continue
+            if validity_status == "invalid":
+                result["skipped_invalid"] += 1
+                continue
+
+            result["eligible"] += 1
+            state = dict(overview.get("probation") or {})
+            current_mode = str(state.get("mode") or "").strip().lower()
+            current_status = str(state.get("status") or "").strip().lower()
+            current_interval = _normalize_probation_interval(
+                state.get("interval_seconds")
+                or state.get("next_offset_seconds")
+                or interval
+            )
+            if (
+                current_status == "pending"
+                and current_mode == "continuous"
+                and current_interval == interval
+                and int(state.get("next_check_at_ts") or 0) > 0
+            ):
+                result["active"] += 1
+                continue
+
+            was_configured = bool(state)
+            started_ts = int(state.get("started_at_ts") or current_ts)
+            checked_at = str(overview.get("checked_at") or "")
+            checked_at_ts = _ts_from_iso(checked_at)
+            existing_next_ts = int(state.get("next_check_at_ts") or 0)
+            next_check_ts = current_ts + interval
+            if current_status == "pending" and existing_next_ts > current_ts:
+                next_check_ts = min(existing_next_ts, next_check_ts)
+            last_valid_ts = int(state.get("last_known_valid_at_ts") or 0)
+            if not last_valid_ts and validity_status == "valid":
+                last_valid_ts = checked_at_ts or current_ts
+
+            state.update(
+                {
+                    "status": "pending",
+                    "mode": "continuous",
+                    "started_at": str(state.get("started_at") or _iso_from_ts(started_ts)),
+                    "started_at_ts": started_ts,
+                    "interval_seconds": interval,
+                    "offsets_seconds": [interval],
+                    "next_offset_seconds": interval,
+                    "next_check_at": _iso_from_ts(next_check_ts),
+                    "next_check_at_ts": next_check_ts,
+                    "last_known_valid_at": (
+                        _iso_from_ts(last_valid_ts) if last_valid_ts else ""
+                    ),
+                    "last_known_valid_at_ts": last_valid_ts,
+                    "check_count": int(state.get("check_count") or 0),
+                    "valid_check_count": int(state.get("valid_check_count") or 0),
+                    "unknown_check_count": int(state.get("unknown_check_count") or 0),
+                    "error_count": int(state.get("error_count") or 0),
+                }
+            )
+            patch_account_graph(
+                session,
+                account,
+                summary_updates={"probation": state},
+            )
+            session.add(account)
+            changed = True
+            result["migrated" if was_configured else "started"] += 1
+
+        if changed:
+            session.commit()
+    result["active"] += result["started"] + result["migrated"]
+    return result
+
+
 def _finish_probation_probe(
     account_id: int,
     result: dict[str, Any] | None,
@@ -320,7 +474,7 @@ def _finish_probation_probe(
     now_ts: int,
     error: str = "",
 ) -> str:
-    """Advance one persisted probation state and return its new status."""
+    """Persist one probe and schedule the next 60-second monitor tick."""
     with Session(engine) as session:
         overview_model = session.get(AccountOverviewModel, int(account_id))
         account_model = session.get(AccountModel, int(account_id))
@@ -331,55 +485,63 @@ def _finish_probation_probe(
         if state.get("status") != "pending":
             return str(state.get("status") or "skipped")
 
-        current_offset = int(state.get("next_offset_seconds") or 0)
+        interval = _normalize_probation_interval(
+            state.get("interval_seconds")
+            or state.get("next_offset_seconds")
+            or DEFAULT_PROBATION_INTERVAL_SECONDS
+        )
+        scheduled_at_ts = int(state.get("next_check_at_ts") or now_ts)
         validity_status = str((result or {}).get("validity_status") or "unknown")
+        state["mode"] = "continuous"
+        state["interval_seconds"] = interval
+        state["offsets_seconds"] = [interval]
+        state["next_offset_seconds"] = interval
         state["last_checked_at"] = _iso_from_ts(now_ts)
         state["last_checked_at_ts"] = now_ts
         state["last_status"] = "error" if error else validity_status
         state["last_error"] = str(error or "")[:500]
+        state["last_check_lag_seconds"] = max(now_ts - scheduled_at_ts, 0)
+        state["check_count"] = int(state.get("check_count") or 0) + 1
 
         if validity_status == "invalid":
             state["status"] = "failed"
-            state["next_offset_seconds"] = 0
             state["next_check_at"] = ""
             state["next_check_at_ts"] = 0
-        elif validity_status == "valid":
-            completed = set(
-                _normalize_probation_offsets(
-                    state.get("completed_offsets_seconds") or []
-                )
+            first_invalid_ts = int(state.get("first_invalid_at_ts") or now_ts)
+            last_valid_ts = int(
+                state.get("last_known_valid_at_ts")
+                or state.get("started_at_ts")
+                or now_ts
             )
-            if current_offset:
-                completed.add(current_offset)
-            offsets = [
-                value
-                for value in _normalize_probation_offsets(
-                    state.get("offsets_seconds") or []
-                )
-                if value not in completed
-            ]
-            state["completed_offsets_seconds"] = sorted(completed)
+            state["first_invalid_at"] = str(
+                state.get("first_invalid_at") or _iso_from_ts(first_invalid_ts)
+            )
+            state["first_invalid_at_ts"] = first_invalid_ts
+            state["last_known_valid_at"] = str(
+                state.get("last_known_valid_at") or _iso_from_ts(last_valid_ts)
+            )
+            state["last_known_valid_at_ts"] = last_valid_ts
+            state["detection_window_seconds"] = max(first_invalid_ts - last_valid_ts, 0)
+            state["monitor_stopped_at"] = _iso_from_ts(now_ts)
+            state["monitor_stopped_at_ts"] = now_ts
+        elif validity_status == "valid":
+            state["status"] = "pending"
             state["retry_count"] = 0
-            if offsets:
-                next_offset = min(offsets)
-                start_ts = int(state.get("started_at_ts") or now_ts)
-                # When the process was offline past multiple deadlines, keep
-                # probes separate instead of executing them back-to-back.
-                next_ts = max(start_ts + next_offset, now_ts + 60)
-                state["next_offset_seconds"] = next_offset
-                state["next_check_at"] = _iso_from_ts(next_ts)
-                state["next_check_at_ts"] = next_ts
-            else:
-                state["status"] = "passed"
-                state["next_offset_seconds"] = 0
-                state["next_check_at"] = ""
-                state["next_check_at_ts"] = 0
+            state["valid_check_count"] = int(state.get("valid_check_count") or 0) + 1
+            state["last_known_valid_at"] = _iso_from_ts(now_ts)
+            state["last_known_valid_at_ts"] = now_ts
+            state["next_check_at"] = _iso_from_ts(now_ts + interval)
+            state["next_check_at_ts"] = now_ts + interval
         else:
-            retries = int(state.get("retry_count") or 0) + 1
-            retry_delay = min(60 * (2 ** min(retries - 1, 3)), 300)
-            state["retry_count"] = retries
-            state["next_check_at"] = _iso_from_ts(now_ts + retry_delay)
-            state["next_check_at_ts"] = now_ts + retry_delay
+            state["status"] = "pending"
+            state["retry_count"] = int(state.get("retry_count") or 0) + 1
+            state["unknown_check_count"] = int(state.get("unknown_check_count") or 0) + 1
+            if error:
+                state["error_count"] = int(state.get("error_count") or 0) + 1
+            # A transient detector failure must not create a multi-minute blind
+            # spot. Keep the same fixed cadence and try again next minute.
+            state["next_check_at"] = _iso_from_ts(now_ts + interval)
+            state["next_check_at_ts"] = now_ts + interval
 
         patch_account_graph(session, account_model, summary_updates={"probation": state})
         session.add(account_model)
@@ -394,30 +556,44 @@ def check_due_account_probations(
     now_ts: int | None = None,
     log_fn=None,
 ) -> dict[str, int]:
-    """Run due probation probes without blocking registration workers."""
+    """Run due continuous probes without blocking registration workers."""
     log = log_fn or logger.info
     current_ts = int(now_ts if now_ts is not None else _utcnow_ts())
+    monitor_result = ensure_continuous_probation_monitors(now_ts=current_ts)
     with Session(engine) as session:
         rows = session.exec(select(AccountOverviewModel)).all()
-    due_ids: list[int] = []
+    due_rows: list[tuple[int, int]] = []
     for row in rows:
         state = dict(row.get_summary().get("probation") or {})
         if (
             state.get("status") == "pending"
             and int(state.get("next_check_at_ts") or 0) <= current_ts
         ):
-            due_ids.append(int(row.account_id))
-            if len(due_ids) >= max(int(limit), 1):
-                break
+            due_rows.append(
+                (int(state.get("next_check_at_ts") or 0), int(row.account_id))
+            )
+    due_rows.sort(key=lambda item: (item[0], item[1]))
+    due_total = len(due_rows)
+    selected_rows = due_rows[: max(int(limit), 1)]
+    due_ids = [account_id for _scheduled_at, account_id in selected_rows]
+    max_lag_seconds = max(
+        (max(current_ts - scheduled_at, 0) for scheduled_at, _account_id in selected_rows),
+        default=0,
+    )
 
     results = {
-        "due": len(due_ids),
+        "due": due_total,
+        "selected": len(due_ids),
         "checked": 0,
         "pending": 0,
         "passed": 0,
         "failed": 0,
         "unknown": 0,
         "error": 0,
+        "active_monitors": int(monitor_result.get("active") or 0),
+        "monitors_started": int(monitor_result.get("started") or 0),
+        "monitors_migrated": int(monitor_result.get("migrated") or 0),
+        "max_lag_seconds": max_lag_seconds,
     }
 
     def _probe(account_id: int) -> tuple[int, dict[str, Any] | None, str]:
@@ -440,13 +616,14 @@ def check_due_account_probations(
         validity_status = str((result or {}).get("validity_status") or "unknown")
         if error:
             results["error"] += 1
-            log(f"  账号 #{account_id} 观察期检测异常: {error}")
+            log(f"  账号 #{account_id} 持续复检异常: {error}")
         elif validity_status == "unknown":
             results["unknown"] += 1
+        completed_ts = current_ts if now_ts is not None else _utcnow_ts()
         state_status = _finish_probation_probe(
             account_id,
             result,
-            now_ts=current_ts,
+            now_ts=completed_ts,
             error=error,
         )
         if state_status in {"pending", "passed", "failed"}:
@@ -454,10 +631,11 @@ def check_due_account_probations(
 
     if due_ids:
         log(
-            "观察期复检完成: "
-            f"到期 {results['due']}, 通过 {results['passed']}, "
-            f"失效 {results['failed']}, 待后续 {results['pending']}, "
-            f"未知 {results['unknown']}, 异常 {results['error']}"
+            "60 秒持续复检完成: "
+            f"到期 {results['due']}, 已检查 {results['checked']}, "
+            f"失效 {results['failed']}, 继续监控 {results['pending']}, "
+            f"未知 {results['unknown']}, 异常 {results['error']}, "
+            f"最大调度延迟 {results['max_lag_seconds']} 秒"
         )
     return results
 

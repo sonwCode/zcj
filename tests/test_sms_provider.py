@@ -80,6 +80,40 @@ class TestSmsBowerPricingAndRiskRotation:
 
         assert timeouts == [300]
 
+    def test_phone_callback_allows_short_configured_code_timeout(self, monkeypatch):
+        timeouts = []
+
+        class FakeProvider:
+            auto_report_success_on_code = False
+
+            def get_number(self, *, service, country=""):
+                return SmsActivation("a-short", "+15550000002", country=country)
+
+            def get_code(self, activation_id, timeout=0):
+                timeouts.append(timeout)
+                return ""
+
+            def cancel(self, activation_id):
+                return True
+
+        monkeypatch.setattr(
+            sms_module,
+            "create_sms_provider",
+            lambda *_args, **_kwargs: FakeProvider(),
+        )
+        callback, cleanup = create_phone_callbacks(
+            "smsbower_api",
+            {"smsbower_api_key": "test", "sms_code_timeout_seconds": 75},
+            service="dr",
+            country="33",
+        )
+
+        callback()
+        callback()
+        cleanup()
+
+        assert timeouts == [75]
+
     def test_phone_callback_rotates_explicit_country_pool_after_rejection(self, monkeypatch):
         requested = []
 

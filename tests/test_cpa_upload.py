@@ -38,3 +38,64 @@ def test_upload_to_cpa_uses_single_slash_and_management_headers(monkeypatch):
     assert calls["headers"]["Authorization"] == "Bearer management-key"
     assert calls["headers"]["X-API-Key"] == "management-key"
     assert calls["headers"]["X-Management-Key"] == "management-key"
+
+
+def test_cpa_connection_uses_read_only_authenticated_get(monkeypatch):
+    from platforms.chatgpt import cpa_upload
+
+    calls = {}
+
+    def fake_get(url, **kwargs):
+        calls["url"] = url
+        calls["headers"] = kwargs["headers"]
+        return SimpleNamespace(status_code=200, text="", json=lambda: {"files": []})
+
+    monkeypatch.setattr(cpa_upload.cffi_requests, "get", fake_get)
+    ok, message = cpa_upload.test_cpa_connection(
+        "https://cpa.example/v0/management",
+        "management-key",
+    )
+
+    assert ok is True
+    assert "Management Key 已验证" in message
+    assert calls["url"] == "https://cpa.example/v0/management/auth-files"
+    assert calls["headers"]["Authorization"] == "Bearer management-key"
+    assert calls["headers"]["X-Management-Key"] == "management-key"
+
+
+def test_cpa_connection_does_not_report_forbidden_as_success(monkeypatch):
+    from platforms.chatgpt import cpa_upload
+
+    monkeypatch.setattr(
+        cpa_upload.cffi_requests,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(status_code=403, text=""),
+    )
+
+    ok, message = cpa_upload.test_cpa_connection(
+        "https://cpa.example",
+        "wrong-management-key",
+    )
+
+    assert ok is False
+    assert "403" in message
+    assert "remote-management.allow-remote" in message
+
+
+def test_cpa_connection_reports_invalid_management_key(monkeypatch):
+    from platforms.chatgpt import cpa_upload
+
+    monkeypatch.setattr(
+        cpa_upload.cffi_requests,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(status_code=401, text=""),
+    )
+
+    ok, message = cpa_upload.test_cpa_connection(
+        "https://cpa.example",
+        "wrong-management-key",
+    )
+
+    assert ok is False
+    assert "401" in message
+    assert "Management Key" in message
