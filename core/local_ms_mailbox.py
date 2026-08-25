@@ -885,15 +885,20 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         self._merge_state_records(key, {"failures": failure_record})
         return True
 
-    def release_transient_failure(self, account: MailboxAccount, reason: str = "") -> bool:
-        """Release a row after transport failure without retrying it in this task."""
+    def _release_reserved_failure(
+        self,
+        account: MailboxAccount,
+        reason: str,
+        *,
+        reason_code: str,
+    ) -> bool:
         key = str(
             getattr(account, "account_id", "")
             or getattr(account, "email", "")
         ).strip().lower()
         if not key:
             return False
-        reason_text = str(reason or "mailbox_network_error")[:500]
+        reason_text = str(reason or reason_code)[:500]
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             self._task_retired.add(key)
@@ -904,7 +909,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             failures[key] = {
                 "email": str(getattr(account, "email", "") or ""),
                 "reason": reason_text,
-                "reason_code": "transient_network",
+                "reason_code": reason_code,
                 "failed_at": now,
                 "source_id": self._source_id(),
             }
@@ -912,6 +917,22 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             state["failures"] = failures
             self._save_state(state)
         return True
+
+    def release_uncommitted_failure(self, account: MailboxAccount, reason: str = "") -> bool:
+        """Release a row when OTP delivery never reached a confirmed remote state."""
+        return self._release_reserved_failure(
+            account,
+            reason or "otp_delivery_failed",
+            reason_code="uncommitted_attempt",
+        )
+
+    def release_transient_failure(self, account: MailboxAccount, reason: str = "") -> bool:
+        """Release a row after transport failure without retrying it in this task."""
+        return self._release_reserved_failure(
+            account,
+            reason or "mailbox_network_error",
+            reason_code="transient_network",
+        )
 
     def recover_transient_failures(self) -> int:
         """Undo stale reservations caused only by a previous network outage."""

@@ -592,8 +592,14 @@ class RegistrationEngine:
 
         self.logs: list = []
 
-        self._otp_sent_at: Optional[float] = None  # OTP 发送时间戳
+        self._otp_sent_at: Optional[float] = None  # 服务端确认 OTP 投递后的时间戳
         self._last_otp_error: str = ""
+        self._otp_page_reached: bool = False
+        self._otp_delivery_requested: bool = False
+        self._otp_delivery_confirmed: bool = False
+        self._otp_delivery_method: str = ""
+        self._otp_delivery_http_status: int = 0
+        self._otp_delivery_page_type: str = ""
 
         self._is_existing_account: bool = False  # 是否为已注册账号（用于自动登录）
 
@@ -611,6 +617,7 @@ class RegistrationEngine:
         self._email_otp_continue_url: Optional[str] = None
 
         self._email_otp_page_loaded: bool = False
+        self._email_otp_csrf_token: str = ""
 
         self._otp_continue_url: Optional[str] = None
 
@@ -631,8 +638,9 @@ class RegistrationEngine:
         self._step_error_message: str = ""
 
         # Protocol mailbox registrations use the passwordless OAuth path.
-        # When authorize lands on /email-verification, that navigation has
-        # already advanced the auth state and triggered the first OTP.
+        # Landing on /email-verification proves only that the challenge page
+        # was reached.  It does not prove that an email was delivered; the
+        # delivery action must still return a successful server response.
         self.email_otp_first: bool = False
         self._oauth_email_verification: bool = False
         self.otp_submit_delay: float = 0.0
@@ -1073,10 +1081,9 @@ class RegistrationEngine:
             self._authorize_final_url = final_url
             if self.email_otp_first and "/email-verification" in final_url:
                 self._oauth_email_verification = True
+                self._otp_page_reached = True
                 self._email_otp_continue_url = final_url
-                if not self._otp_sent_at:
-                    self._otp_sent_at = time.time()
-                self._log("OAuth 已直接进入邮箱验证页，沿用当前会话并等待自动 OTP")
+                self._log("OAuth 已直接进入邮箱验证页；保留当前 challenge，稍后显式确认 OTP 投递")
 
             if response.status_code >= 400:
 
@@ -1701,235 +1708,233 @@ class RegistrationEngine:
 
 
 
-    def _send_verification_code(self) -> bool:
+    def _reset_otp_delivery_state(self) -> None:
+        self._otp_sent_at = None
+        self._otp_delivery_requested = False
+        self._otp_delivery_confirmed = False
+        self._otp_delivery_method = ""
+        self._otp_delivery_http_status = 0
+        self._otp_delivery_page_type = ""
 
-        """发送验证码"""
-
+    def _begin_new_otp_wait(self) -> None:
+        resetter = getattr(self.email_service, "begin_new_otp_wait", None)
+        if not callable(resetter):
+            return
         try:
+            resetter()
+            self._log("邮箱轮询基线已重置，后续只接受本次认证产生的新邮件")
+        except Exception as exc:
+            self._log(f"邮箱轮询基线重置失败: {type(exc).__name__}", "warning")
 
-            email_verification_url = self._email_otp_continue_url or "https://auth.openai.com/email-verification"
+    @staticmethod
+    def _otp_response_page_type(response) -> str:
+        try:
+            payload = response.json()
+        except Exception:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        page = payload.get("page")
+        if isinstance(page, dict):
+            return str(page.get("type") or "").strip()
+        return ""
 
+    def _request_email_otp_delivery(
+        self,
+        *,
+        session=None,
+        referer: str = "",
+        prefer_resend: bool = False,
+        include_sentinel: bool = True,
+    ) -> bool:
+        """Request OTP delivery and mark it sent only after a confirmed response."""
+        target_session = session or self.session
+        email_verification_url = (
+            referer
+            or self._email_otp_continue_url
+            or f"{OPENAI_AUTH}/email-verification"
+        )
+        self._reset_otp_delivery_state()
+
+        headers = {
+            "origin": OPENAI_AUTH,
+            "referer": email_verification_url,
+            "accept": "application/json, text/plain, */*",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            **_generate_datadog_trace_headers(),
+        }
+        if self._device_id:
+            headers["oai-device-id"] = self._device_id
+        csrf_token = str(getattr(self, "_email_otp_csrf_token", "") or "")
+        if csrf_token:
+            headers["x-csrf-token"] = csrf_token
+        sentinel_payload = (
+            (self._password_sentinel or self._signup_sentinel)
+            if include_sentinel else None
+        )
+        if sentinel_payload and self._device_id:
+            headers["openai-sentinel-token"] = json.dumps({
+                "p": sentinel_payload.p,
+                "t": sentinel_payload.t,
+                "c": sentinel_payload.c,
+                "id": self._device_id,
+                "flow": sentinel_payload.flow,
+            }, separators=(",", ":"))
+
+        last_status = 0
+        last_server_code = ""
+
+        def request(action: str, method: str, endpoint: str):
+            nonlocal last_status, last_server_code
+            self._otp_delivery_requested = True
+            self._otp_delivery_method = f"{action}:{method}"
+            try:
+                if method == "POST":
+                    response = target_session.post(
+                        endpoint,
+                        headers={**headers, "content-type": "application/json"},
+                        data="{}",
+                        timeout=15,
+                    )
+                else:
+                    response = target_session.get(
+                        endpoint,
+                        headers=headers,
+                        timeout=15,
+                    )
+            except Exception as exc:
+                # Do not blindly retry an indeterminate delivery request: the
+                # first request may have reached the server and a duplicate can
+                # rotate the challenge/code while the mailbox is being polled.
+                safe_error = re.sub(
+                    r"(?i)(https?://)([^/@\s]+)@",
+                    r"\1***@",
+                    str(exc),
+                )[:300]
+                self._step_error_code = "proxy_network_error"
+                self._step_error_message = safe_error or type(exc).__name__
+                self._log(
+                    f"邮箱 OTP 投递请求异常: action={action} method={method} "
+                    f"error={type(exc).__name__}",
+                    "error",
+                )
+                return None
+
+            last_status = int(getattr(response, "status_code", 0) or 0)
+            last_server_code, _server_message = _response_error(response)
+            page_type = self._otp_response_page_type(response)
+            self._otp_delivery_http_status = last_status
+            self._otp_delivery_page_type = page_type
+            self._log(
+                "邮箱 OTP 投递响应: "
+                f"action={action} method={method} status={last_status} "
+                f"page_type={page_type or '-'} server_code={last_server_code or '-'}"
+            )
+
+            if 200 <= last_status < 300 and not last_server_code:
+                self._otp_delivery_confirmed = True
+                self._otp_sent_at = time.time()
+                self._step_error_code = ""
+                self._step_error_message = ""
+                self._log(
+                    "邮箱 OTP 投递已由服务端确认: "
+                    f"action={action} status={last_status}"
+                )
+            return response
+
+        if prefer_resend:
+            response = request("resend", "POST", OPENAI_API_ENDPOINTS["resend_otp"])
+            if response is None:
+                return False
+            if self._otp_delivery_confirmed:
+                return True
+            if last_status in {401, 403, 429}:
+                self._step_error_code = "proxy_or_access_blocked"
+                self._step_error_message = f"HTTP {last_status}"
+                return False
+            self._log(
+                "当前 challenge 的 OTP 重发未被接受，改用显式发送并刷新邮箱基线",
+                "warning",
+            )
+            self._begin_new_otp_wait()
+
+        response = request("send", "GET", OPENAI_API_ENDPOINTS["send_otp"])
+        if response is None:
+            return False
+        if self._otp_delivery_confirmed:
+            return True
+        if last_status in {404, 405}:
+            self._log("OTP GET 端点不接受当前方法，尝试 POST 兼容请求", "warning")
+            response = request("send", "POST", OPENAI_API_ENDPOINTS["send_otp"])
+            if response is None:
+                return False
+            if self._otp_delivery_confirmed:
+                return True
+
+        self._step_error_code = (
+            "proxy_or_access_blocked"
+            if last_status in {401, 403, 429}
+            else "otp_delivery_failed"
+        )
+        detail = f"HTTP {last_status or 'unknown'}"
+        if last_server_code:
+            detail += f", server_code={last_server_code}"
+        self._step_error_message = detail
+        self._log(f"邮箱 OTP 投递未确认: {detail}", "error")
+        return False
+
+    def _send_verification_code(self) -> bool:
+        """Load the challenge page and explicitly confirm email OTP delivery."""
+        try:
+            email_verification_url = (
+                self._email_otp_continue_url
+                or f"{OPENAI_AUTH}/email-verification"
+            )
             self._log(f"邮箱验证页 URL: {email_verification_url[:120]}")
 
-            csrf_token = ""
-
             if not self._email_otp_page_loaded:
-
                 page_resp = self.session.get(
-
                     email_verification_url,
-
                     headers={
-
-                        "referer": "https://auth.openai.com/create-account",
-
+                        "referer": f"{OPENAI_AUTH}/create-account",
                         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-
                     },
-
                     timeout=15,
-
                 )
-
-                self._email_otp_page_loaded = True
-
-                page_status = getattr(page_resp, 'status_code', 0)
-
-                self._log(f"邮箱验证码页加载状态: {page_status}, body_len={len(getattr(page_resp, 'text', '') or '')}")
-
+                page_status = int(getattr(page_resp, "status_code", 0) or 0)
+                self._log(
+                    f"邮箱验证码页加载状态: {page_status}, "
+                    f"body_len={len(getattr(page_resp, 'text', '') or '')}"
+                )
                 if page_status not in (200, 304):
-
-                    self._log(f"邮箱验证码页加载异常，状态码: {page_status}", "warning")
-
+                    self._step_error_code = "otp_delivery_failed"
+                    self._step_error_message = f"verification_page HTTP {page_status}"
+                    self._log(
+                        f"邮箱验证码页加载异常，状态码: {page_status}",
+                        "warning",
+                    )
                     return False
-
-
-
-                # 从页面提取 CSRF token（Next.js 的 __NEXT_DATA__ 或 meta 标签）
-
-                page_text = getattr(page_resp, 'text', '') or ''
-
+                self._email_otp_page_loaded = True
+                self._otp_page_reached = True
+                page_text = str(getattr(page_resp, "text", "") or "")
                 csrf_match = re.search(r'"csrfToken"\s*:\s*"([^"]+)"', page_text)
-
                 if csrf_match:
-
-                    csrf_token = csrf_match.group(1)
-
-                    self._log("从页面提取到 CSRF token")
-
-
-
-                # 给页面资源加载留一点时间（模拟浏览器行为，避免连续请求被风控）
-
+                    self._email_otp_csrf_token = csrf_match.group(1)
+                    self._log("从邮箱验证页提取到 CSRF token")
                 time.sleep(1.5)
 
-
-
-            # 记录发送时间戳
-
-            self._otp_sent_at = time.time()
-
-
-
-            send_headers = {
-
-                "referer": email_verification_url,
-
-                "accept": "application/json, text/plain, */*",
-
-                "sec-fetch-site": "same-origin",
-
-                "sec-fetch-mode": "cors",
-
-                "sec-fetch-dest": "empty",
-
-                **_generate_datadog_trace_headers(),
-
-            }
-
-            if self._device_id:
-
-                send_headers["oai-device-id"] = self._device_id
-
-            if csrf_token:
-
-                send_headers["x-csrf-token"] = csrf_token
-
-
-
-            last_error = ""
-
-            for attempt in range(2):
-
-                try:
-
-                    response = self.session.get(
-
-                        OPENAI_API_ENDPOINTS["send_otp"],
-
-                        headers=send_headers,
-
-                        timeout=15,
-
-                    )
-
-                except Exception as req_err:
-
-                    last_error = str(req_err)
-
-                    self._step_error_code = "proxy_network_error"
-                    self._step_error_message = str(req_err)
-                    self._log(f"验证码发送请求异常 (attempt {attempt+1}): {req_err}", "warning")
-
-                    if attempt == 0:
-
-                        time.sleep(2)
-
-                    continue
-
-
-
-                status = response.status_code
-
-                resp_text = response.text[:300]
-
-                self._log(f"验证码发送状态: {status} (attempt {attempt+1})")
-
-                if status == 200:
-
-                    try:
-
-                        body = response.json()
-
-                        if isinstance(body, dict):
-
-                            detail = body.get("detail") or body.get("error") or body.get("message") or ""
-
-                            if detail:
-
-                                self._log(f"验证码发送API返回消息: {detail}")
-
-                    except Exception:
-
-                        pass
-
-                    return True
-
-
-
-                if status == 429 or (400 <= status < 500):
-
-                    self._step_error_code = "proxy_or_access_blocked" if status in {401, 403, 429} else "otp_send_failed"
-                    self._step_error_message = f"HTTP {status}"
-
-                    last_error = f"HTTP {status}: {resp_text}"
-
-                    self._log(f"验证码发送失败 ({last_error})，{'等待重试' if attempt == 0 else '放弃'}",
-
-                              "warning" if attempt == 0 else "error")
-
-                    if attempt == 0:
-
-                        time.sleep(3)
-
-                    continue
-
-
-
-                # 如果 GET 返回 405/404，尝试 POST
-
-                if status in (405, 404) and attempt == 0:
-
-                    self._log("GET 失败，尝试 POST 方式发送验证码...")
-
-                    try:
-
-                        response = self.session.post(
-
-                            OPENAI_API_ENDPOINTS["send_otp"],
-
-                            headers={**send_headers, "content-type": "application/json"},
-
-                            json={},
-
-                            timeout=15,
-
-                        )
-
-                        self._log(f"POST 验证码发送状态: {response.status_code}")
-
-                        if response.status_code == 200:
-
-                            return True
-
-                    except Exception as post_err:
-
-                        self._log(f"POST 验证码发送异常: {post_err}", "warning")
-
-
-
-                last_error = f"HTTP {status}: {resp_text}"
-
-                if attempt == 0:
-
-                    time.sleep(2)
-
-
-
-            if last_error:
-
-                self._log(f"验证码发送最终失败: {last_error}", "error")
-
-
-
-            return False
-
-
-
-        except Exception as e:
-
-            self._log(f"发送验证码失败: {e}", "error")
-
+            return self._request_email_otp_delivery(
+                referer=email_verification_url,
+                prefer_resend=bool(
+                    self._oauth_email_verification or self._is_existing_account
+                ),
+            )
+        except Exception as exc:
+            self._step_error_code = "otp_delivery_failed"
+            self._step_error_message = type(exc).__name__
+            self._log(f"发送验证码失败: {type(exc).__name__}", "error")
             return False
 
 
@@ -1939,6 +1944,12 @@ class RegistrationEngine:
         """获取验证码"""
 
         self._last_otp_error = ""
+
+        if not bool(getattr(self, "_otp_delivery_confirmed", False)):
+            self._last_otp_error = "邮箱 OTP 投递未获得服务端确认，已停止轮询"
+            self._step_error_code = "otp_delivery_not_confirmed"
+            self._log(self._last_otp_error, "error")
+            return None
 
         try:
 
@@ -1960,7 +1971,7 @@ class RegistrationEngine:
 
 
 
-            elapsed_since_send = "?"
+            elapsed_since_send = "0s"
 
             if self._otp_sent_at:
 
@@ -1968,7 +1979,11 @@ class RegistrationEngine:
 
 
 
-            self._log(f"正在等待邮箱 {self.email} 的验证码 (超时: {otp_timeout}s, OTP已发送: {elapsed_since_send}前)...")
+            self._log(
+                f"正在等待邮箱 {self.email} 的验证码 "
+                f"(超时: {otp_timeout}s, OTP投递已确认: {elapsed_since_send}前, "
+                f"方式: {self._otp_delivery_method or 'confirmed'})..."
+            )
 
 
 
@@ -2634,18 +2649,17 @@ class RegistrationEngine:
             # 6. 如果需要 OTP，等待第二次验证码
 
             if page_type == "email_otp_verification":
-
-                login_session.get(OPENAI_API_ENDPOINTS["send_otp"], headers={
-
-                    "referer": f"{OPENAI_AUTH}/email-verification",
-
-                }, timeout=15)
-
-                self._log("Codex login OTP 已显式发送")
+                self._begin_new_otp_wait()
+                if not self._request_email_otp_delivery(
+                    session=login_session,
+                    referer=f"{OPENAI_AUTH}/email-verification",
+                    prefer_resend=True,
+                    include_sentinel=False,
+                ):
+                    self._log("Codex login OTP 投递未获服务端确认", "error")
+                    return None
 
                 self._log("等待第二次验证码...")
-
-                self._otp_sent_at = time.time()
 
                 code = self._get_verification_code()
 
@@ -2830,18 +2844,17 @@ class RegistrationEngine:
                 # 密码后可能需要 OTP
 
                 if pwd_page == "email_otp_verification" or pwd_page == "email_otp_send":
-
-                    login_session.get(OPENAI_API_ENDPOINTS["send_otp"], headers={
-
-                        "referer": f"{OPENAI_AUTH}/email-verification",
-
-                    }, timeout=15)
-
-                    self._log("Codex login OTP 已显式发送")
+                    self._begin_new_otp_wait()
+                    if not self._request_email_otp_delivery(
+                        session=login_session,
+                        referer=f"{OPENAI_AUTH}/email-verification",
+                        prefer_resend=True,
+                        include_sentinel=False,
+                    ):
+                        self._log("Codex login OTP 投递未获服务端确认", "error")
+                        return None
 
                     self._log("Codex login: 等待验证码...")
-
-                    self._otp_sent_at = time.time()
 
                     code = self._get_verification_code()
 
@@ -3355,6 +3368,7 @@ class RegistrationEngine:
 
             if sen_payload:
 
+                self._signup_sentinel = sen_payload
                 self._log("Sentinel 检查通过")
 
             else:
@@ -3425,22 +3439,26 @@ class RegistrationEngine:
             # 9. 发送验证码（协议模式没有浏览器 JS 自动触发，必须显式调用 API）
 
             if self.email_otp_first and self._oauth_email_verification:
-                self._log("9. OAuth 授权入口已触发 OTP，不重复发送")
+                self._log("9. 已保留 OAuth 邮箱 challenge，显式确认 OTP 投递...")
+                if not self._send_verification_code():
+                    result.error_message = "邮箱 OTP 投递失败"
+                    result.error_code = getattr(self, "_step_error_code", "") or "otp_delivery_failed"
+                    return result
             elif self._is_existing_account:
 
-                self._log("9. [已注册账号] 发送登录验证码...")
+                self._log("9. [已注册账号] 重发并确认登录验证码...")
 
                 if not self._send_verification_code():
-                    result.error_message = "发送验证码失败"
-                    result.error_code = getattr(self, "_step_error_code", "") or "otp_send_failed"
+                    result.error_message = "邮箱 OTP 投递失败"
+                    result.error_code = getattr(self, "_step_error_code", "") or "otp_delivery_failed"
                     return result
             else:
 
                 self._log("9. 发送验证码...")
 
                 if not self._send_verification_code():
-                    result.error_message = "发送验证码失败"
-                    result.error_code = getattr(self, "_step_error_code", "") or "otp_send_failed"
+                    result.error_message = "邮箱 OTP 投递失败"
+                    result.error_code = getattr(self, "_step_error_code", "") or "otp_delivery_failed"
                     return result
 
 

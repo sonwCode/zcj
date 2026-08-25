@@ -607,6 +607,10 @@ class OutlookEmailMailbox(BaseMailbox):
     def mark_registration_failure(self, account: MailboxAccount, reason: str = "") -> bool:
         return self.mark_attempt_failure(account, reason)
 
+    def release_uncommitted_failure(self, account: MailboxAccount, reason: str = "") -> bool:
+        """Retire the lease for this task; remote registration was never committed."""
+        return self.mark_attempt_failure(account, reason)
+
     def mark_plus_success(self, account: MailboxAccount) -> list[str]:
         return self.add_tags_to_account(
             email=account.email,

@@ -552,6 +552,35 @@ def test_transient_network_failure_is_released_but_retired_for_current_task(tmp_
     assert next_task_pool.get_email().email == "first@hotmail.com"
 
 
+def test_unconfirmed_otp_delivery_releases_persistent_mailbox_reservation(tmp_path):
+    state_file = tmp_path / "state.json"
+    pool_text = (
+        "first@hotmail.com----https://example.test/first\n"
+        "second@hotmail.com----https://example.test/second"
+    )
+    pool = LocalMicrosoftMailboxPool(
+        pool_text=pool_text,
+        state_file=str(state_file),
+    )
+
+    first = pool.get_email()
+    assert pool.release_uncommitted_failure(
+        first,
+        "otp_delivery_failed: HTTP 409",
+    ) is True
+    assert pool.get_email().email == "second@hotmail.com"
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert "first@hotmail.com" not in state["used"]
+    assert state["failures"]["first@hotmail.com"]["reason_code"] == "uncommitted_attempt"
+
+    next_task_pool = LocalMicrosoftMailboxPool(
+        pool_text=pool_text,
+        state_file=str(state_file),
+    )
+    assert next_task_pool.get_email().email == "first@hotmail.com"
+
+
 def test_recover_transient_failures_releases_stale_network_reservation(tmp_path):
     state_file = tmp_path / "state.json"
     state_file.write_text(

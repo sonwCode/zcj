@@ -52,6 +52,12 @@ def _bare_engine() -> RegistrationEngine:
     engine.task_uuid = None
     engine.proxy_url = None
     engine._otp_sent_at = None
+    engine._otp_page_reached = False
+    engine._otp_delivery_requested = False
+    engine._otp_delivery_confirmed = False
+    engine._otp_delivery_method = ""
+    engine._otp_delivery_http_status = 0
+    engine._otp_delivery_page_type = ""
     engine._is_existing_account = False
     engine._device_id = None
     engine._sentinel_token = None
@@ -60,6 +66,7 @@ def _bare_engine() -> RegistrationEngine:
     engine._create_account_continue_url = None
     engine._email_otp_continue_url = ""
     engine._email_otp_page_loaded = False
+    engine._email_otp_csrf_token = ""
     engine._otp_continue_url = None
     engine._otp_page_type = None
     engine._otp_response_data = {}
@@ -167,6 +174,99 @@ def test_send_verification_code_visits_email_verification_page_before_send():
     assert calls[0][0] == "https://auth.openai.com/email-verification"
     assert calls[1][0].endswith("/api/accounts/email-otp/send")
     assert engine._email_otp_page_loaded is True
+
+
+def test_passwordless_email_challenge_prefers_resend_and_confirms_delivery():
+    engine = _bare_engine()
+    engine._oauth_email_verification = True
+    engine._email_otp_page_loaded = True
+    calls = []
+
+    class ResendSession:
+        def post(self, url, headers=None, data=None, timeout=None):
+            calls.append(("POST", url, headers or {}, data))
+            return _SendOtpResponse()
+
+        def get(self, *args, **kwargs):
+            raise AssertionError("confirmed resend must not create a second challenge")
+
+    engine.session = ResendSession()
+
+    assert engine._send_verification_code() is True
+    assert calls[0][1].endswith("/api/accounts/email-otp/resend")
+    assert engine._otp_delivery_requested is True
+    assert engine._otp_delivery_confirmed is True
+    assert engine._otp_delivery_method == "resend:POST"
+    assert engine._otp_delivery_http_status == 200
+    assert engine._otp_sent_at is not None
+
+
+def test_failed_otp_delivery_never_sets_sent_timestamp():
+    engine = _bare_engine()
+    engine._email_otp_page_loaded = True
+
+    class FailedResponse:
+        status_code = 409
+        text = '{"error":{"code":"invalid_state"}}'
+
+        def json(self):
+            return {"error": {"code": "invalid_state"}}
+
+    class FailedSession:
+        def get(self, *args, **kwargs):
+            return FailedResponse()
+
+    engine.session = FailedSession()
+
+    assert engine._send_verification_code() is False
+    assert engine._otp_delivery_requested is True
+    assert engine._otp_delivery_confirmed is False
+    assert engine._otp_sent_at is None
+    assert engine._step_error_code == "otp_delivery_failed"
+
+
+def test_send_otp_405_post_fallback_is_reachable_and_confirmed():
+    engine = _bare_engine()
+    engine._email_otp_page_loaded = True
+    calls = []
+
+    class MethodResponse:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.text = "{}"
+
+        def json(self):
+            return {}
+
+    class MethodSession:
+        def get(self, url, **kwargs):
+            calls.append(("GET", url))
+            return MethodResponse(405)
+
+        def post(self, url, **kwargs):
+            calls.append(("POST", url))
+            return MethodResponse(200)
+
+    engine.session = MethodSession()
+
+    assert engine._send_verification_code() is True
+    assert [method for method, _url in calls] == ["GET", "POST"]
+    assert engine._otp_delivery_confirmed is True
+    assert engine._otp_delivery_method == "send:POST"
+
+
+def test_mailbox_polling_requires_confirmed_delivery():
+    engine = _bare_engine()
+
+    class Mailbox:
+        def get_verification_code(self, **kwargs):
+            raise AssertionError("mailbox must not be polled before delivery confirmation")
+
+    engine.email_service = Mailbox()
+
+    assert engine._get_verification_code() is None
+    assert engine._step_error_code == "otp_delivery_not_confirmed"
+    assert "投递未获得服务端确认" in engine._last_otp_error
 
 
 def test_validate_verification_code_uses_device_and_otp_sentinel_flow():
@@ -389,6 +489,7 @@ def test_run_skips_create_account_after_external_callback():
     engine.email_service = SimpleNamespace(service_type=SimpleNamespace(value="local_ms_pool"))
     callback_url = "https://chatgpt.com/api/auth/callback/openai?code=TOKEN&state=STATE"
     create_calls = []
+    delivery_calls = []
 
     class Cookies(dict):
         pass
@@ -424,6 +525,7 @@ def test_run_skips_create_account_after_external_callback():
 
     engine._get_device_id = get_device_id
     engine._check_sentinel = lambda *args, **kwargs: None
+    engine._send_verification_code = lambda: delivery_calls.append(True) or True
     engine._get_verification_code = lambda: "123456"
 
     def validate(_code):
@@ -443,6 +545,7 @@ def test_run_skips_create_account_after_external_callback():
 
     assert result.success is True
     assert create_calls == []
+    assert delivery_calls == [True]
     assert result.workspace_id == ""
     assert result.refresh_token == "session-refresh-token"
     assert result.metadata["refresh_token_status"] == "available"
@@ -505,7 +608,7 @@ def test_session_credentials_fall_back_to_oauth_refresh_token_without_fabricatin
     assert missing["refresh_token_status"] == "missing_from_session"
 
 
-def test_email_otp_first_reuses_authorize_state_without_second_submit_or_send():
+def test_email_otp_first_reuses_authorize_state_but_confirms_delivery():
     engine = _bare_engine()
     engine.email_otp_first = True
     calls = {"submit": 0, "send": 0, "validate": 0}
@@ -547,4 +650,4 @@ def test_email_otp_first_reuses_authorize_state_without_second_submit_or_send():
     result = engine.run()
 
     assert result.success is False
-    assert calls == {"submit": 0, "send": 0, "validate": 1}
+    assert calls == {"submit": 0, "send": 1, "validate": 1}

@@ -1530,13 +1530,14 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
             begin_wait()
         email_otp_url = urljoin(OPENAI_AUTH, continue_url or "/email-verification")
         engine._email_otp_continue_url = email_otp_url
-        send_response = engine.session.get(
-            OPENAI_API_ENDPOINTS["send_otp"],
-            headers={"referer": email_otp_url, "accept": "application/json"},
-            timeout=20,
-        )
-        self._log(f"手机号验证邮箱验证码发送状态: {send_response.status_code}")
-        engine._otp_sent_at = time.time()
+        if not engine._request_email_otp_delivery(
+            session=engine.session,
+            referer=email_otp_url,
+            prefer_resend=True,
+        ):
+            raise RuntimeError(
+                "otp_delivery_failed: 手机号验证登录邮箱 OTP 投递未获服务端确认"
+            )
         code = engine._get_verification_code()
         if not code:
             raise RuntimeError("手机号验证登录未获取到邮箱验证码")

@@ -211,6 +211,17 @@ _REGISTRATION_FAILURE_CATEGORIES = (
         ),
     ),
     ("mailbox_auth", "邮箱授权失效", ("invalid_grant", "refresh_token", "unauthorized or expired")),
+    (
+        "otp_delivery",
+        "邮箱验证码投递失败",
+        (
+            "otp_delivery_failed",
+            "otp_delivery_not_confirmed",
+            "otp_send_failed",
+            "邮箱 otp 投递失败",
+            "otp 投递未获服务端确认",
+        ),
+    ),
     ("mailbox_otp", "邮箱取码失败", ("获取验证码", "等待验证码", "mailbox_otp")),
     (
         "phone_verification",
@@ -233,7 +244,8 @@ _REGISTRATION_FAILURE_CATEGORIES = (
 
 
 def _registration_failure_category(error: object) -> tuple[str, str]:
-    lowered = str(error or "unknown error").strip().lower()
+    explicit_code = str(getattr(error, "code", "") or "").strip()
+    lowered = f"{explicit_code} {str(error or 'unknown error')}".strip().lower()
     for code, label, markers in _REGISTRATION_FAILURE_CATEGORIES:
         if any(marker in lowered for marker in markers):
             return code, label
@@ -2691,12 +2703,29 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     network_failure_streak = 0
     network_circuit_open = False
     network_circuit_reason = ""
+    mailbox_otp_circuit_break_threshold = min(
+        max(_int_config(extra.get("mailbox_otp_circuit_break_threshold"), 2), 0),
+        20,
+    )
+    mailbox_otp_circuit_enabled = (
+        platform_name == "chatgpt"
+        and not is_chatgpt_phone_registration
+        and mailbox_otp_circuit_break_threshold > 0
+    )
+    mailbox_otp_failure_streak = 0
+    mailbox_otp_circuit_open = False
+    mailbox_otp_circuit_reason = ""
     protocol_circuit_open = False
     protocol_circuit_reason = ""
     if platform_name == "chatgpt" and network_circuit_break_threshold > 0:
         logger.log(
             "注册网络熔断已启用: "
             f"连续 {network_circuit_break_threshold} 次代理/网络失败后停止投放新尝试"
+        )
+    if mailbox_otp_circuit_enabled:
+        logger.log(
+            "邮箱 OTP 熔断已启用: "
+            f"连续 {mailbox_otp_circuit_break_threshold} 次投递/取码失败后停止投放新邮箱"
         )
 
     # Pre-create a shared mailbox instance for the entire task to avoid
@@ -3270,9 +3299,19 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             mailbox_worker = getattr(platform, "_last_protocol_mailbox_worker", None)
             mailbox_account = getattr(mailbox_worker, "mailbox_account", None)
             if mailbox_account is not None and not email_account_created:
+                otp_delivery_uncommitted = (
+                    error_code in {
+                        "otp_delivery_failed",
+                        "otp_delivery_not_confirmed",
+                        "otp_send_failed",
+                    }
+                    or failure_category == "otp_delivery"
+                )
                 mailbox_failure_method = (
                     "mark_registration_failure"
                     if email_identity_rejected
+                    else "release_uncommitted_failure"
+                    if otp_delivery_uncommitted
                     else "release_transient_failure"
                     if failure_category == "proxy_network"
                     else "mark_attempt_failure"
@@ -3298,6 +3337,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         elif mailbox_failure_method == "release_transient_failure":
                             logger.log(
                                 "邮箱取码网络异常：当前任务跳过该邮箱，"
+                                "并已释放其持久占用，下一次任务可重试",
+                                level="warning",
+                            )
+                        elif mailbox_failure_method == "release_uncommitted_failure":
+                            logger.log(
+                                "邮箱 OTP 投递未获服务端确认：当前任务跳过该邮箱，"
                                 "并已释放其持久占用，下一次任务可重试",
                                 level="warning",
                             )
@@ -3348,7 +3393,9 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 return "__cancel_requested__"
             if resolved_proxy and _registration_error_counts_as_proxy_failure(exc):
                 proxy_pool.report_fail(leased_proxy_url or resolved_proxy)
-            error = str(exc)
+            error = error_text
+            if error_code and error_code.lower() not in error.lower():
+                error = f"{error_code}: {error}"
             if account is not None and email_account_created:
                 try:
                     account_extra = dict(getattr(account, "extra", {}) or {})
@@ -3513,6 +3560,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 return False
             if network_circuit_open:
                 return False
+            if mailbox_otp_circuit_open:
+                return False
             if protocol_circuit_open:
                 return False
             if failure_policy in {"stop", "stop_on_failure", "fail_fast"} and errors:
@@ -3584,6 +3633,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     if result is True:
                         success += 1
                         network_failure_streak = 0
+                        mailbox_otp_failure_streak = 0
                     elif result != "__cancel_requested__":
                         result_error = str(result)
                         errors.append(result_error)
@@ -3620,6 +3670,26 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                                 )
                         else:
                             network_failure_streak = 0
+                        if (
+                            mailbox_otp_circuit_enabled
+                            and failure_code in {"otp_delivery", "mailbox_otp"}
+                        ):
+                            mailbox_otp_failure_streak += 1
+                            if (
+                                mailbox_otp_failure_streak
+                                >= mailbox_otp_circuit_break_threshold
+                                and not mailbox_otp_circuit_open
+                            ):
+                                mailbox_otp_circuit_open = True
+                                mailbox_otp_circuit_reason = result_error[:500]
+                                logger.log(
+                                    "邮箱 OTP 熔断已触发: "
+                                    f"连续 {mailbox_otp_failure_streak} 次投递/取码失败，"
+                                    "停止投放新邮箱；已在运行的 worker 将自然收尾",
+                                    level="error",
+                                )
+                        else:
+                            mailbox_otp_failure_streak = 0
                     logger.set_progress(
                         min(
                             success
@@ -3658,6 +3728,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             "enabled": platform_name == "chatgpt",
             "open": protocol_circuit_open,
             "reason": protocol_circuit_reason,
+        },
+        "mailbox_otp_circuit_breaker": {
+            "enabled": mailbox_otp_circuit_enabled,
+            "threshold": mailbox_otp_circuit_break_threshold,
+            "open": mailbox_otp_circuit_open,
+            "consecutive_failures": mailbox_otp_failure_streak,
+            "reason": mailbox_otp_circuit_reason,
         },
         "mailbox_pool_exhausted": mailbox_pool_exhausted.is_set(),
     }

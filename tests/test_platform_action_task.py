@@ -198,6 +198,65 @@ def test_chatgpt_register_task_stops_after_consecutive_network_failures(monkeypa
     )
 
 
+def test_chatgpt_register_task_stops_after_consecutive_mailbox_otp_failures(monkeypatch):
+    seen = {"attempts": 0}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            seen["attempts"] += 1
+            raise RuntimeError("otp_delivery_failed: HTTP 409")
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "require_phone_verification": True,
+                "email_pre_phone_max_attempts": 10,
+                "mailbox_otp_circuit_break_threshold": 2,
+            },
+        },
+        logger,
+    )
+
+    assert seen["attempts"] == 2
+    assert logger.finished[0] == tasks_module.TASK_STATUS_FAILED
+    assert logger.result_data["mailbox_otp_circuit_breaker"] == {
+        "enabled": True,
+        "threshold": 2,
+        "open": True,
+        "consecutive_failures": 2,
+        "reason": "otp_delivery_failed: HTTP 409",
+    }
+    assert logger.result_data["failure_summary"] == [
+        {
+            "code": "otp_delivery",
+            "label": "邮箱验证码投递失败",
+            "count": 2,
+            "sample": "otp_delivery_failed: HTTP 409",
+        }
+    ]
+    assert any(
+        event[0] == "log" and "邮箱 OTP 熔断已触发" in event[1]
+        for event in logger.events
+    )
+
+
 def test_chatgpt_register_task_stops_after_systemic_oauth_session_failure(monkeypatch):
     seen = {"attempts": 0}
 
