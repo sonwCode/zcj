@@ -387,9 +387,24 @@ export function TaskLogPanel({
   const friendlyError = String(errorText || "").includes("SMS_POOL_EXHAUSTED")
     ? t("ctfGptPlus.smsPoolExhausted")
     : errorText;
-  const failureSummary = Array.isArray(task?.result?.data?.failure_summary)
+  const rawFailureSummary = Array.isArray(task?.result?.data?.failure_summary)
     ? task.result.data.failure_summary
     : [];
+  const failureSummary = rawFailureSummary.map((item) => {
+    const sample = String(item.sample || "").toLowerCase();
+    // Older backend builds grouped PHONE_RISK_REJECTED under the generic
+    // account-rejected bucket because the message contains “suspicious”.
+    // Correct that label at render time so existing task history is readable.
+    if (
+      item.code === "account_rejected" &&
+      (sample.includes("phone_risk_rejected") ||
+        sample.includes("fraud_guard") ||
+        sample.includes("phone numbers similar to yours"))
+    ) {
+      return { ...item, code: "phone_verification", label: "手机号验证失败" };
+    }
+    return item;
+  });
   const sub2Sync = task?.result?.sub2_sync;
   const statusTone =
     currentStatus === "succeeded"
