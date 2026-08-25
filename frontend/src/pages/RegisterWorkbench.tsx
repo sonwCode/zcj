@@ -162,6 +162,33 @@ const REGION_OPTIONS: SelectOption[] = [
   ['VN', 'VN · 越南'],
 ]
 
+const PROXY_STRATEGY_OPTIONS = [
+  {
+    value: 'auto',
+    label: '智能分配',
+    tag: '推荐',
+    icon: Orbit,
+    summary: '按号码国家优先找匹配代理',
+    description: '有可用代理池时优先使用；没有手动代理时由启动预检决定是否直连。',
+  },
+  {
+    value: 'polling',
+    label: '池内分散',
+    tag: '并发场景',
+    icon: RefreshCw,
+    summary: '每个新尝试重新分配一条代理',
+    description: '按最少占用、最久未使用优先，尽量让并发任务分散到不同代理条目。',
+  },
+  {
+    value: 'direct',
+    label: '直连',
+    tag: '仅调试',
+    icon: ArrowRight,
+    summary: '不使用代理池',
+    description: '直接从云服务器访问目标服务，手机号国家无法跟随出口地区。',
+  },
+] as const
+
 function FieldInput({
   label,
   value,
@@ -795,6 +822,18 @@ export default function RegisterWorkbench() {
   )
   const sub2ProxyMissing = Boolean(form.sub2api_auto_sync && Number(form.sub2api_proxy_id || 0) <= 0)
   const routeConfigurationInvalid = registrationProxyMismatch || sub2ProxyMismatch || sub2ProxyMissing
+  // `sticky` remains accepted by the backend for old API callers, but the
+  // workbench no longer presents it as a separate choice: ChatGPT routes are
+  // pinned to a session automatically after a proxy is assigned.
+  const effectiveProxyStrategy = form.proxy_strategy === 'sticky' ? 'polling' : (form.proxy_strategy || 'auto')
+  const selectedProxyStrategy = PROXY_STRATEGY_OPTIONS.find(
+    option => option.value === effectiveProxyStrategy,
+  ) || PROXY_STRATEGY_OPTIONS[0]
+  const manualProxyConfigured = Boolean(String(form.proxy || '').trim())
+  const manualProxyRegionUnknown = Boolean(manualProxyConfigured && needsSms && !explicitRegistrationProxyRegion)
+  const routeSummary = manualProxyConfigured
+    ? `手动覆盖${explicitRegistrationProxyRegion ? ` · ${explicitRegistrationProxyRegion}` : ' · 地区待预检'}`
+    : `${selectedProxyStrategy.label} · ${requiredProxyRegion || '自动地区'}`
   const selectedSub2Model = SUB2_FREE_MODEL_OPTIONS
     .find(([value]) => value === form.sub2api_default_model)?.[1]
     || form.sub2api_default_model
@@ -924,17 +963,20 @@ export default function RegisterWorkbench() {
     const items: string[] = []
     if (Number(form.concurrency || 1) > 5) items.push('并发超过 5 会明显增加验证码、代理和接码压力')
     if (Number(form.count || 1) > 1 && form.email) items.push('批量任务填写固定邮箱可能导致多次尝试复用同一身份')
-    if (form.proxy_strategy === 'direct' && (needsSms || form.sub2api_auto_sync)) {
-      items.push('直连模式无法保证手机号国家与出口地区一致')
+    if (effectiveProxyStrategy === 'direct' && (needsSms || form.sub2api_auto_sync)) {
+      items.push('直连模式没有稳定的地区对应关系，手机号验证更容易触发风控')
     }
     if (Number(form.post_registration_liveness_delay_seconds || 0) < 30) {
       items.push('复检等待少于 30 秒，可能漏掉注册后快速失效的账号')
     }
-    if (form.proxy_strategy === 'sticky' || form.proxy_strategy === 'polling') {
-      items.push('代理池策略依赖设置页中已有可用代理')
+    if (effectiveProxyStrategy === 'polling') {
+      items.push('池内分散依赖设置页中已有可用代理；每个注册流程拿到代理后会自动固定会话')
+    }
+    if (manualProxyRegionUnknown) {
+      items.push('手动代理未带 region-XX 地区标记，启动时会以实际出口 IP 做预检，无法提前保证与号码国家一致')
     }
     return items
-  }, [form, needsSms])
+  }, [effectiveProxyStrategy, form, manualProxyRegionUnknown, needsSms])
 
   const canSubmit = blockingIssues.length === 0 && !submitting && !polling
   const targetReady = Boolean(currentPlatform && Number(form.count || 0) > 0)
@@ -989,7 +1031,9 @@ export default function RegisterWorkbench() {
           : needsSms && form.identity_provider === 'mailbox'
             ? 'email_then_phone'
             : 'email',
-        proxy_strategy: form.proxy ? 'manual_template' : form.proxy_strategy,
+        proxy_strategy: form.proxy
+          ? 'manual_template'
+          : effectiveProxyStrategy,
         proxy_country: requiredProxyRegion || undefined,
         failure_policy: form.failure_policy,
         complete_started_attempts: Boolean(form.complete_started_attempts),
@@ -1468,55 +1512,130 @@ export default function RegisterWorkbench() {
                 })}
               </div>
 
-              <div className="mt-5 rounded-xl border border-[var(--border-soft)] bg-[var(--bg-pane)]/40 p-4">
-                <div className="mb-3 flex items-center justify-between gap-3">
+              <div className="mt-5 rounded-2xl border border-[var(--border-soft)] bg-[var(--bg-pane)]/40 p-4 sm:p-5">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div>
-                    <div className="text-sm font-semibold text-[var(--text-primary)]">代理策略</div>
-                    <div className="mt-1 text-xs text-[var(--text-muted)]">手动代理优先级最高；未填写时按下方策略运行</div>
+                    <div className="flex items-center gap-2 text-sm font-semibold text-[var(--text-primary)]">
+                      <Orbit className="h-4 w-4 text-[var(--text-accent)]" />
+                      注册出口
+                    </div>
+                    <div className="mt-1 text-xs leading-5 text-[var(--text-muted)]">选择代理来源；单次注册的会话固定由系统自动完成</div>
                   </div>
-                  <Badge variant="secondary">{requiredProxyRegion || 'AUTO'} · {requiredProxyLabel}</Badge>
+                  <Badge variant="secondary">目标地区：{requiredProxyRegion ? `${requiredProxyRegion} · ${requiredProxyLabel}` : '自动选择'}</Badge>
                 </div>
-                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-                  {[
-                    ['auto', '自动', '有池用池，无池直连'],
-                    ['polling', '轮换', '每次尝试切换代理'],
-                    ['sticky', '固定会话', '同一流程保持出口'],
-                    ['direct', '直连', '完全不使用代理池'],
-                  ].map(([value, label, description]) => (
-                    <button
-                      key={value}
-                      type="button"
-                      onClick={() => set('proxy_strategy', value)}
-                      className={`rounded-lg border px-3 py-3 text-left transition-colors ${
-                        form.proxy_strategy === value
-                          ? 'border-[var(--accent-edge)] bg-[var(--accent-soft)]'
-                          : 'border-[var(--border-soft)] bg-[var(--chip-bg)] hover:border-[var(--accent-edge)]'
-                      }`}
-                    >
-                      <span className="block text-xs font-medium text-[var(--text-primary)]">{label}</span>
-                      <span className="mt-1 block text-[10px] leading-4 text-[var(--text-muted)]">{description}</span>
-                    </button>
-                  ))}
+
+                <div className="mt-4 grid gap-3 lg:grid-cols-3">
+                  {PROXY_STRATEGY_OPTIONS.map(option => {
+                    const active = effectiveProxyStrategy === option.value
+                    const Icon = option.icon
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        onClick={() => set('proxy_strategy', option.value)}
+                        className={`group rounded-xl border p-4 text-left transition-all ${
+                          active
+                            ? 'border-[var(--accent-edge)] bg-[var(--accent-soft)] shadow-sm'
+                            : 'border-[var(--border-soft)] bg-[var(--chip-bg)] hover:border-[var(--accent-edge)] hover:bg-[var(--accent-soft)]/40'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <span className={`flex h-9 w-9 items-center justify-center rounded-lg ${active ? 'bg-[var(--accent-edge)]/20 text-[var(--text-accent)]' : 'bg-[var(--bg-hover)] text-[var(--text-muted)] group-hover:text-[var(--text-accent)]'}`}>
+                            <Icon className="h-4 w-4" />
+                          </span>
+                          <div className="flex items-center gap-2">
+                            <Badge variant={active ? 'default' : 'secondary'}>{option.tag}</Badge>
+                            {active ? <Check className="h-4 w-4 text-[var(--text-accent)]" /> : null}
+                          </div>
+                        </div>
+                        <div className="mt-3 text-sm font-semibold text-[var(--text-primary)]">{option.label}</div>
+                        <div className="mt-1 text-xs font-medium leading-5 text-[var(--text-secondary)]">{option.summary}</div>
+                        <div className="mt-2 text-[11px] leading-5 text-[var(--text-muted)]">{option.description}</div>
+                      </button>
+                    )
+                  })}
                 </div>
-                <div className="mt-4">
+
+                <div className="mt-4 rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] p-4">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <div className="text-xs font-medium uppercase tracking-wide text-[var(--text-muted)]">本次实际线路</div>
+                      <div className="mt-1 text-base font-semibold text-[var(--text-primary)]">{routeSummary}</div>
+                    </div>
+                    <Badge variant={registrationProxyMismatch ? 'danger' : manualProxyRegionUnknown ? 'secondary' : 'success'}>
+                      {registrationProxyMismatch ? '地区不一致' : manualProxyRegionUnknown ? '等待预检' : '配置可用'}
+                    </Badge>
+                  </div>
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                    <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/50 px-3 py-2.5">
+                      <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)]"><Smartphone className="h-3.5 w-3.5" />号码国家</div>
+                      <div className="mt-1 text-sm font-medium text-[var(--text-primary)]">{smsRegion ? `${requiredProxyRegion} · ${requiredProxyLabel}` : '未指定，启动时自动判断'}</div>
+                    </div>
+                    <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/50 px-3 py-2.5">
+                      <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)]"><MapPin className="h-3.5 w-3.5" />目标代理地区</div>
+                      <div className={`mt-1 text-sm font-medium ${registrationProxyMismatch ? 'text-red-300' : manualProxyRegionUnknown ? 'text-amber-300' : 'text-[var(--text-primary)]'}`}>
+                        {manualProxyConfigured
+                          ? explicitRegistrationProxyRegion || '手动代理 · 启动时预检'
+                          : requiredProxyRegion || '由代理池预检选择'}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-3 rounded-xl border border-blue-500/20 bg-blue-500/5 p-4">
+                  <div className="flex items-start gap-3">
+                    <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-blue-300" />
+                    <div>
+                      <div className="text-sm font-medium text-[var(--text-primary)]">会话稳定性：系统自动固定</div>
+                      <div className="mt-1 text-xs leading-5 text-[var(--text-muted)]">拿到 711Proxy 后，当前注册流程会自动追加 Session 并固定约 180 分钟；不需要再单独选择“固定会话”。</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 rounded-xl border border-[var(--border-soft)] bg-[var(--bg-pane)]/40 p-4">
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold text-[var(--text-primary)]">手动代理覆盖 <span className="font-normal text-[var(--text-muted)]">（可选）</span></div>
+                      <div className="mt-1 text-xs leading-5 text-[var(--text-muted)]">填写后会覆盖上面的代理策略；留空则使用代理池。</div>
+                    </div>
+                    <Badge variant={manualProxyConfigured ? 'default' : 'secondary'}>{manualProxyConfigured ? '已覆盖代理池' : '未启用'}</Badge>
+                  </div>
                   <FieldInput
-                    label="手动代理（可选）"
+                    label="代理地址"
                     value={form.proxy}
                     onChange={value => set('proxy', value)}
                     placeholder="http://user:pass@host:port"
-                    hint="填写后覆盖代理池策略；711 代理中的 region-xx 会参与地区预检"
                   />
+                  <div className="mt-2 text-[11px] leading-5 text-[var(--text-muted)]">711Proxy 建议在用户名中带 <code className="rounded bg-[var(--bg-hover)] px-1">region-US</code> 这类地区标记；其他代理会在启动时通过实际出口 IP 预检地区。</div>
+                  <div className={`mt-3 flex items-start gap-2 rounded-lg border px-3 py-2.5 text-xs leading-5 ${
+                    registrationProxyMismatch
+                      ? 'border-red-500/25 bg-red-500/10 text-red-300'
+                      : manualProxyRegionUnknown
+                        ? 'border-amber-500/25 bg-amber-500/10 text-amber-300'
+                        : 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300'
+                  }`}>
+                    {registrationProxyMismatch ? <XCircle className="mt-0.5 h-4 w-4 shrink-0" /> : manualProxyRegionUnknown ? <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> : <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" />}
+                    <span>{registrationProxyMismatch
+                      ? `手动代理地区 ${explicitRegistrationProxyRegion} 与流程要求 ${requiredProxyRegion} 不一致`
+                      : manualProxyRegionUnknown
+                        ? '已填写手动代理，但地区还不能确认；启动预检会检查实际出口 IP。'
+                        : `线路预检条件满足：${manualProxyConfigured ? '使用手动代理' : effectiveProxyStrategy === 'direct' ? '直连' : `${selectedProxyStrategy.label} 使用代理池`}${requiredProxyRegion ? `，目标地区 ${requiredProxyRegion}` : ''}`}</span>
+                  </div>
                 </div>
-                <div className={`mt-4 flex items-start gap-2 rounded-lg border px-3 py-2.5 text-xs leading-5 ${
-                  registrationProxyMismatch
-                    ? 'border-red-500/25 bg-red-500/10 text-red-300'
-                    : 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300'
-                }`}>
-                  {registrationProxyMismatch ? <XCircle className="mt-0.5 h-4 w-4 shrink-0" /> : <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" />}
-                  <span>{registrationProxyMismatch
-                    ? `手动代理地区 ${explicitRegistrationProxyRegion} 与流程要求 ${requiredProxyRegion} 不一致`
-                    : `线路预检通过：${form.proxy ? '使用手动代理' : form.proxy_strategy === 'direct' ? '直连' : '使用代理池策略'}${requiredProxyRegion ? `，目标地区 ${requiredProxyRegion}` : ''}`}</span>
-                </div>
+
+                <details className="mt-4 rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] px-4 py-3">
+                  <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-medium text-[var(--text-primary)]">
+                    <span className="flex items-center gap-2"><Settings2 className="h-4 w-4 text-[var(--text-muted)]" />策略怎么工作</span>
+                    <ChevronDown className="h-4 w-4 text-[var(--text-muted)]" />
+                  </summary>
+                  <ol className="mt-3 space-y-2 pl-5 text-xs leading-5 text-[var(--text-muted)]">
+                    <li>先根据手机号国家计算目标地区。</li>
+                    <li>再按所选策略获取代理；手动代理会覆盖代理池。</li>
+                    <li>711Proxy 在注册流程中自动固定 Session，避免同一流程中途换出口。</li>
+                    <li>代理失败会进入冷却，下一次尝试再换其他可用条目。</li>
+                  </ol>
+                </details>
+
                 <div className="mt-3 flex items-center gap-2 text-xs text-[var(--text-muted)]">
                   <ScanText className="h-3.5 w-3.5" />验证码策略：{summaryVerification}
                 </div>
@@ -1671,7 +1790,7 @@ export default function RegisterWorkbench() {
                     ...(needsSms ? [['接码', summarySms]] : []),
                     ...(needsSms && isSmsBower ? [['价格', summarySmsPrice]] : []),
                     ['执行', summaryExecutor],
-                    ['线路', form.proxy ? '手动代理' : form.proxy_strategy === 'direct' ? '直连' : `${form.proxy_strategy} · ${requiredProxyRegion || '自动地区'}`],
+                    ['线路', routeSummary],
                     ['首次质检', `${Number(form.post_registration_liveness_delay_seconds || 0)} 秒后`],
                     ['持续复检', '每 60 秒 · 持久化'],
                     ['网络熔断', Number(form.network_circuit_break_threshold || 0) > 0 ? `连续 ${Number(form.network_circuit_break_threshold)} 次` : '关闭'],
