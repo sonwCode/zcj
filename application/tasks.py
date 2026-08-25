@@ -187,7 +187,6 @@ _REGISTRATION_FAILURE_CATEGORIES = (
             "authentication token is invalidated",
             "account has been deactivated",
             "account has been deleted",
-            "suspicious",
         ),
     ),
     (
@@ -232,6 +231,9 @@ _REGISTRATION_FAILURE_CATEGORIES = (
             "phone_number_rejected",
             "fraud_guard",
             "phone_country_pool_rejected",
+            "phone_risk_rejected",
+            "phone numbers similar to yours",
+            "suspicious behavior from phone numbers",
             "手机号验证",
             "手机号",
             "add-phone",

@@ -1,8 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, ChevronDown, ChevronRight, Copy, ListFilter, ScrollText, TriangleAlert } from "lucide-react";
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  CircleStop,
+  Copy,
+  ListFilter,
+  Loader2,
+  ScrollText,
+  TriangleAlert,
+} from "lucide-react";
 
 import { API_BASE, apiFetch, copyTextToClipboard } from "@/lib/utils";
-import { getTaskStatusText, isTerminalTaskStatus } from "@/lib/tasks";
+import { getTaskStatusText, isCancellableTaskStatus, isTerminalTaskStatus } from "@/lib/tasks";
 import { useI18n } from "@/lib/i18n-context";
 
 /**
@@ -97,6 +107,7 @@ export function TaskLogPanel({
   const [events, setEvents] = useState<LogEvent[]>([]);
   const [task, setTask] = useState<TaskSnapshot | null>(null);
   const [doneStatus, setDoneStatus] = useState<string | null>(null);
+  const [canceling, setCanceling] = useState(false);
   const [logView, setLogView] = useState<"summary" | "all">("summary");
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "failed">("idle");
   // 折叠状态：默认全展开（undefined / false 都视为展开）
@@ -108,6 +119,8 @@ export function TaskLogPanel({
   const onTaskUpdateRef = useRef(onTaskUpdate);
   const sseHealthyRef = useRef(false);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const initialEventsLoadedRef = useRef(false);
+  const pendingTerminalStatusRef = useRef<string | null>(null);
   const pendingEventsRef = useRef<LogEvent[]>([]);
   const flushTimerRef = useRef<number | null>(null);
   const taskSyncInFlightRef = useRef(false);
@@ -128,6 +141,8 @@ export function TaskLogPanel({
     cursorRef.current = 0;
     doneRef.current = false;
     sseHealthyRef.current = false;
+    initialEventsLoadedRef.current = false;
+    pendingTerminalStatusRef.current = null;
     pendingEventsRef.current = [];
     taskSignatureRef.current = "";
     if (flushTimerRef.current !== null) {
@@ -171,6 +186,10 @@ export function TaskLogPanel({
         scheduleFlush();
       }
       if (payload?.done && !doneRef.current) {
+        if (!initialEventsLoadedRef.current) {
+          pendingTerminalStatusRef.current = payload.status || "succeeded";
+          return;
+        }
         flushEvents();
         doneRef.current = true;
         sseHealthyRef.current = false;
@@ -179,6 +198,25 @@ export function TaskLogPanel({
         const nextStatus = payload.status || "succeeded";
         setDoneStatus(nextStatus);
         onDoneRef.current(nextStatus);
+      }
+    };
+
+    const hydrateTaskEvents = async (since = 0) => {
+      let cursor = Math.max(Number(since || 0), 0);
+      for (let page = 0; page < 50; page += 1) {
+        const data = await apiFetch(
+          '/tasks/' + taskId + '/events?since=' + cursor + '&limit=500',
+        );
+        const items = Array.isArray(data?.items) ? data.items : [];
+        if (!items.length) break;
+        for (const item of items) pushEvent(item);
+        const nextCursor = items.reduce(
+          (max: number, item: StreamPayload) => Math.max(max, Number(item?.id || 0)),
+          cursor,
+        );
+        if (nextCursor <= cursor) break;
+        cursor = nextCursor;
+        if (items.length < 500) break;
       }
     };
 
@@ -203,34 +241,56 @@ export function TaskLogPanel({
           onTaskUpdateRef.current?.(latest);
         }
         if (isTerminalTaskStatus(latest.status) && !doneRef.current) {
-          pushEvent({ done: true, status: latest.status });
+          if (!initialEventsLoadedRef.current) {
+            pendingTerminalStatusRef.current = latest.status;
+          } else {
+            await hydrateTaskEvents(cursorRef.current);
+            pushEvent({ done: true, status: latest.status });
+          }
         }
       } finally {
         taskSyncInFlightRef.current = false;
       }
     };
 
-    const es = new EventSource(`${API_BASE}/tasks/${taskId}/logs/stream`);
-    eventSourceRef.current = es;
-    es.onopen = () => {
-      sseHealthyRef.current = true;
-    };
-    es.onmessage = (e) => {
-      sseHealthyRef.current = true;
-      pushEvent(JSON.parse(e.data));
-    };
-    es.onerror = () => {
-      if (doneRef.current) {
-        es.close();
-        if (eventSourceRef.current === es) {
-          eventSourceRef.current = null;
+    const startLogTransport = async () => {
+      await hydrateTaskEvents(0);
+      initialEventsLoadedRef.current = true;
+      await syncTask();
+      if (doneRef.current) return;
+
+      const es = new EventSource(
+        API_BASE + '/tasks/' + taskId + '/logs/stream?since=' + cursorRef.current,
+      );
+      eventSourceRef.current = es;
+      es.onopen = () => {
+        sseHealthyRef.current = true;
+      };
+      es.onmessage = (e) => {
+        sseHealthyRef.current = true;
+        pushEvent(JSON.parse(e.data));
+      };
+      es.onerror = () => {
+        if (doneRef.current) {
+          es.close();
+          if (eventSourceRef.current === es) {
+            eventSourceRef.current = null;
+          }
+          return;
         }
-        return;
+        sseHealthyRef.current = false;
+      };
+      if (pendingTerminalStatusRef.current && !doneRef.current) {
+        const terminalStatus = pendingTerminalStatusRef.current;
+        pendingTerminalStatusRef.current = null;
+        pushEvent({ done: true, status: terminalStatus });
       }
-      sseHealthyRef.current = false;
     };
 
-    syncTask().catch(() => {});
+    startLogTransport().catch(() => {
+      initialEventsLoadedRef.current = true;
+      syncTask().catch(() => {});
+    });
 
     // 进度需要持续轮询：SSE 只发 events，progress 在 task model 上，
     // 必须主动 GET /tasks/{id} 拿。原实现里只在 SSE 不健康时轮询，导致
@@ -268,6 +328,7 @@ export function TaskLogPanel({
         window.clearTimeout(copyResetTimerRef.current);
         copyResetTimerRef.current = null;
       }
+      setCanceling(false);
     };
   }, [taskId]);
 
@@ -311,6 +372,7 @@ export function TaskLogPanel({
   };
 
   const currentStatus = doneStatus || task?.status || "running";
+  const canCancel = isCancellableTaskStatus(currentStatus) && !canceling;
   const progress = task?.progress_detail || {};
   const progressTotal = Number(progress.total || 0);
   const progressCurrent = Number(progress.current || 0);
@@ -355,6 +417,26 @@ export function TaskLogPanel({
       setCopyStatus("idle");
       copyResetTimerRef.current = null;
     }, 1800);
+  };
+
+  const cancelTask = async () => {
+    if (!canCancel) return;
+    setCanceling(true);
+    try {
+      const updated = await apiFetch(
+        "/tasks/" + encodeURIComponent(taskId) + "/cancel",
+        { method: "POST" },
+      );
+      setTask(updated);
+      onTaskUpdateRef.current?.(updated);
+    } catch (error) {
+      setTask((current) => ({
+        ...(current || {}),
+        error: error instanceof Error ? error.message : "停止任务失败",
+      }));
+    } finally {
+      setCanceling(false);
+    }
   };
 
   return (
@@ -504,6 +586,21 @@ export function TaskLogPanel({
             {copyStatus === "copied" ? <Check className="h-3.5 w-3.5" /> : copyStatus === "failed" ? <TriangleAlert className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
             {copyStatus === "copied" ? t("taskLog.copied") : copyStatus === "failed" ? t("taskLog.copyFailed") : t("taskLog.copyLogs")}
           </button>
+          {isCancellableTaskStatus(currentStatus) ? (
+            <button
+              type="button"
+              onClick={cancelTask}
+              disabled={canceling}
+              className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-red-400/35 bg-red-400/10 px-3 text-xs text-red-300 hover:bg-red-400/20 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {canceling ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <CircleStop className="h-3.5 w-3.5" />
+              )}
+              {canceling ? "正在停止" : "停止任务"}
+            </button>
+          ) : null}
         </div>
       </div>
 

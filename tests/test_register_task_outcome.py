@@ -97,6 +97,17 @@ def test_registration_failure_summary_prioritizes_phone_errors_over_oauth_marker
     ]
 
 
+def test_phone_risk_rejection_is_not_misreported_as_account_deactivation():
+    summary = _registration_failure_summary(
+        [
+            "PHONE_RISK_REJECTED: We've detected suspicious behavior from phone numbers similar to yours."
+        ]
+    )
+
+    assert summary[0]["code"] == "phone_verification"
+    assert summary[0]["label"] == "手机号验证失败"
+
+
 def test_terminal_account_errors_are_not_treated_as_generic_phone_or_oauth_failures():
     summary = _registration_failure_summary(
         ["手机号验证会话重建失败: You do not have an account"]
