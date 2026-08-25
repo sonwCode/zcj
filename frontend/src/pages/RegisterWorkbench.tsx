@@ -1559,10 +1559,10 @@ export default function RegisterWorkbench() {
                 <div className="mt-4 rounded-xl border border-[var(--border-soft)] bg-[var(--chip-bg)] p-4">
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <div>
-                      <div className="text-xs font-medium uppercase tracking-wide text-[var(--text-muted)]">本次实际线路</div>
+                      <div className="text-xs font-medium uppercase tracking-wide text-[var(--text-muted)]">本次线路预览</div>
                       <div className="mt-1 text-base font-semibold text-[var(--text-primary)]">{routeSummary}</div>
                     </div>
-                    <Badge variant={registrationProxyMismatch ? 'danger' : manualProxyRegionUnknown ? 'secondary' : 'success'}>
+                    <Badge variant={registrationProxyMismatch ? 'danger' : manualProxyRegionUnknown ? 'warning' : 'success'}>
                       {registrationProxyMismatch ? '地区不一致' : manualProxyRegionUnknown ? '等待预检' : '配置可用'}
                     </Badge>
                   </div>
