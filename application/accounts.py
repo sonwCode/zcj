@@ -103,6 +103,18 @@ def _redact_list_provider_account(item: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _redact_list_provider_resource(item: dict[str, Any]) -> dict[str, Any]:
+    # resource_identifier doubles as the inbox access token for several mailbox
+    # drivers (tempmail_lol / tempmail_web) and metadata carries the same token,
+    # so neither may appear in the frequently-polled list payload.
+    payload = dict(item or {})
+    identifier = payload.get("resource_identifier")
+    payload["resource_identifier"] = ""
+    payload["resource_identifier_present"] = identifier not in (None, "")
+    payload["metadata"] = {}
+    return payload
+
+
 class AccountsService:
     def __init__(self, repository: AccountsRepository | None = None):
         self.repository = repository or AccountsRepository()
@@ -216,6 +228,7 @@ class AccountsService:
     def _serialize(item: AccountRecord, *, include_secrets: bool = True) -> dict:
         credentials = list(item.credentials or [])
         provider_accounts = list(item.provider_accounts or [])
+        provider_resources = list(item.provider_resources or [])
         overview = dict(item.overview or {})
         password = item.password
         primary_token = item.primary_token
@@ -223,6 +236,9 @@ class AccountsService:
             credentials = [_redact_list_credential(entry) for entry in credentials]
             provider_accounts = [
                 _redact_list_provider_account(entry) for entry in provider_accounts
+            ]
+            provider_resources = [
+                _redact_list_provider_resource(entry) for entry in provider_resources
             ]
             overview = _redact_list_secret_tree(overview)
             password = ""
@@ -247,7 +263,7 @@ class AccountsService:
             "display_summary": item.display_summary,
             "credentials": credentials,
             "provider_accounts": provider_accounts,
-            "provider_resources": item.provider_resources,
+            "provider_resources": provider_resources,
             "created_at": serialize_datetime(item.created_at),
             "updated_at": serialize_datetime(item.updated_at),
         }

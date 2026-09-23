@@ -7,7 +7,8 @@ services:
     environment:
       DISPLAY: ":99"
       ACCOUNT_MANAGER_DATABASE_URL: "sqlite:////app/data/account_manager.db"
-      APP_PASSWORD: "${ZCJ_APP_PASSWORD}"
+      # 必填：留空会让所有 /api 接口无需鉴权，因此这里强制要求设置。
+      APP_PASSWORD: "${ZCJ_APP_PASSWORD:?ZCJ_APP_PASSWORD must be set}"
     volumes:
       - ./data:/app/data
     restart: unless-stopped

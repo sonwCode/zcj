@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 
+import hmac
+
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -38,11 +40,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         # Check Authorization header
         auth_header = request.headers.get("authorization", "")
-        if auth_header.startswith("Bearer ") and auth_header[7:] == password:
+        if auth_header.startswith("Bearer ") and hmac.compare_digest(auth_header[7:], password):
             return await call_next(request)
 
         # Check cookie
-        if request.cookies.get("_auth") == password:
+        if hmac.compare_digest(request.cookies.get("_auth", ""), password):
             return await call_next(request)
 
         return Response(content='{"detail":"Unauthorized"}', status_code=401, media_type="application/json")

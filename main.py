@@ -127,13 +127,24 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Account Manager", version="2.0.0", lifespan=lifespan)
 
+if not os.environ.get("APP_PASSWORD", "").strip():
+    print(
+        "[WARN] 未设置 APP_PASSWORD：所有 /api 接口当前无需鉴权，"
+        "本实例持有的账号口令、平台 Token 与代理凭据均可被任意访问。"
+        "公网或共享网络部署请务必设置 APP_PASSWORD。"
+    )
+
 app.add_middleware(AuthMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 前端由本服务同源托管，默认不需要 CORS。仅在前后端分离调试时通过
+# APP_CORS_ORIGINS 显式列出来源，避免任意站点携带凭据访问本 API。
+_cors_origins = [item.strip() for item in os.environ.get("APP_CORS_ORIGINS", "").split(",") if item.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 app.include_router(accounts_router, prefix="/api")
 app.include_router(account_checks_router, prefix="/api")

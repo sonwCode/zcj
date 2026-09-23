@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import UniqueConstraint, inspect
+from sqlalchemy import UniqueConstraint, event, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, SQLModel, Session, create_engine, select
 
@@ -22,6 +22,24 @@ def _default_database_url() -> str:
 
 DATABASE_URL = os.getenv("ACCOUNT_MANAGER_DATABASE_URL", _default_database_url())
 engine = create_engine(DATABASE_URL)
+
+if DATABASE_URL.startswith("sqlite"):
+
+
+    @event.listens_for(engine, "connect")
+    def _apply_sqlite_pragmas(dbapi_connection, _connection_record):
+        """Use WAL and a sane busy timeout so concurrent writers do not fail fast.
+
+        The registration workload runs many threads against one SQLite file; the
+        default rollback-journal mode serialises readers against the writer.
+        """
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=10000")
+        finally:
+            cursor.close()
 
 _ACCOUNT_SAVE_LOCKS = tuple(threading.RLock() for _ in range(64))
 

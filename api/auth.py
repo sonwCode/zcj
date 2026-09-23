@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import os
 
 from fastapi import APIRouter
@@ -24,6 +25,6 @@ def auth_login(body: LoginRequest):
     password = os.environ.get("APP_PASSWORD", "").strip()
     if not password:
         return {"ok": True}
-    if body.password == password:
+    if hmac.compare_digest(body.password, password):
         return {"ok": True, "token": password}
     return {"ok": False, "error": "密码错误"}
