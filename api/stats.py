@@ -4,9 +4,10 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter
-from sqlmodel import Session, select, func, text
+from sqlmodel import Session, select, func
 
 from core.db import TaskLog, ProxyModel, AccountModel, AccountOverviewModel, engine
+from core.registration.attribution import attribution_table, summarize_attributions
 
 router = APIRouter(prefix="/stats", tags=["stats"])
 
@@ -149,3 +150,53 @@ def stats_errors(days: int = 7, platform: str = "", limit: int = 20):
         rows = session.exec(q).all()
 
     return [{"error": row[0], "count": row[1]} for row in rows]
+
+
+@router.get("/attribution")
+def stats_attribution(days: int = 7, platform: str = "", limit: int = 200):
+    """失败归因聚合：把原始错误串映射为稳定的根因分类。"""
+    cutoff = _utcnow() - timedelta(days=days)
+    with Session(engine) as session:
+        q = (
+            select(TaskLog.error, func.count().label("count"))
+            .where(TaskLog.status == "failed")
+            .where(TaskLog.created_at >= cutoff)
+            .where(TaskLog.error != "")
+        )
+        if platform:
+            q = q.where(TaskLog.platform == platform)
+        q = q.group_by(TaskLog.error).order_by(func.count().desc()).limit(limit)
+        rows = session.exec(q).all()
+
+    raw = [{"error": row[0], "count": int(row[1] or 0)} for row in rows]
+    buckets = summarize_attributions(raw)
+    total = sum(item["count"] for item in buckets)
+    for item in buckets:
+        item["share"] = round(item["count"] / total * 100, 1) if total else 0
+    return {
+        "window_days": days,
+        "platform": platform,
+        "total_failures": total,
+        "categories": buckets,
+        "table": attribution_table(),
+    }
+
+
+@router.get("/diagnostics")
+def stats_diagnostics():
+    """只读运行诊断：凭据加密、CF 清关、入库边界与前置检查。"""
+    from core.cloudflare_clearance import clearance_status
+    from core.registration.persistence import boundary_summary
+    from core.registration.preflight import run_preflight
+    from core.vault import vault_status
+
+    try:
+        preflight = run_preflight().to_dict()
+    except Exception as exc:
+        preflight = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "vault": vault_status(),
+        "cloudflare_clearance": clearance_status(),
+        "persistence_boundary": boundary_summary(),
+        "preflight": preflight,
+    }

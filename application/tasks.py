@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import queue
 import threading
 import time
@@ -22,7 +23,10 @@ from core.base_platform import AccountStatus, RegisterConfig
 from core.datetime_utils import format_local_clock, serialize_datetime
 from core.db import AccountModel, TaskEventModel, TaskLog, TaskModel, engine, save_account
 from core.platform_accounts import build_platform_account
+from core.proxy_strategy import describe_decision, resolve_proxy
 from core.proxy_utils import mask_proxy_url
+from core.registration.persistence import evaluate_persistence
+from core.registration.preflight import run_preflight
 from core.registration_logging import classify_registration_log
 from core.registry import get
 from infrastructure.platform_runtime import PlatformRuntime
@@ -1933,16 +1937,49 @@ def _inline_mailbox_concurrency_cap(pool_text: str, extra: dict[str, Any]) -> tu
     return max(len(bases) * per_base, 1), len(bases), per_base
 
 
+def _resolve_registration_proxy_decision(
+    platform_name: str,
+    *,
+    explicit_proxy: str | None,
+    proxy_getter: Callable[[], Any],
+    allow_pool: bool = True,
+    region: str = "",
+    account_proxy: str | None = None,
+) -> Any:
+    """Resolve the proxy tier for one registration.
+
+    ``proxy_getter`` may return either a route string or a ``(route, tier)``
+    tuple (``ProxyPool.next_route``/``acquire_route`` do the latter) so the
+    returned decision records whether the stable runtime or the static pool
+    supplied the route.  ``platform_name`` is accepted for symmetry with the
+    legacy helper and for future per-platform policies.
+    """
+    return resolve_proxy(
+        account_proxy=account_proxy,
+        explicit_proxy=explicit_proxy,
+        pool_getter=proxy_getter,
+        region=region,
+        allow_pool=allow_pool,
+    )
+
+
 def _resolve_registration_proxy_for_platform(
     platform_name: str,
     *,
     explicit_proxy: str | None,
-    proxy_getter: Callable[[], str | None],
+    proxy_getter: Callable[[], Any],
     allow_pool: bool = True,
+    region: str = "",
+    account_proxy: str | None = None,
 ) -> str | None:
-    if explicit_proxy:
-        return explicit_proxy
-    return proxy_getter() if allow_pool else None
+    return _resolve_registration_proxy_decision(
+        platform_name,
+        explicit_proxy=explicit_proxy,
+        proxy_getter=proxy_getter,
+        allow_pool=allow_pool,
+        region=region,
+        account_proxy=account_proxy,
+    ).proxy
 
 
 def _pin_chatgpt_registration_proxy(
@@ -2656,12 +2693,16 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         else ("auto", "")
     )
     allow_proxy_pool = proxy_strategy != "direct"
-    registration_base_proxy = _resolve_registration_proxy_for_platform(
+    registration_proxy_decision = _resolve_registration_proxy_decision(
         platform_name,
         explicit_proxy=proxy,
-        proxy_getter=lambda: proxy_pool.get_next(proxy_region),
+        proxy_getter=lambda: proxy_pool.next_route(proxy_region),
         allow_pool=allow_proxy_pool,
+        region=proxy_region,
     )
+    registration_base_proxy = registration_proxy_decision.proxy
+    if registration_proxy_decision.used_proxy:
+        logger.log(describe_decision(registration_proxy_decision))
     if proxy_strategy in {"polling", "sticky"} and not registration_base_proxy:
         error = "代理策略要求使用代理池，但当前没有启用且可分配的代理"
         logger.log(error, level="error")
@@ -2669,6 +2710,39 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         return
 
     logger.set_progress(0, progress_total)
+    preflight_report = None
+    try:
+        preflight_report = run_preflight(
+            require_browser=str(payload.get("executor_type") or "").strip().lower()
+            in {"headless", "headed"},
+            browser_profile=str(
+                extra.get("browser_profile") or extra.get("camoufox_profile") or ""
+            ),
+        )
+        for check in preflight_report.checks:
+            if not check.ok:
+                logger.log(
+                    f"前置检查未通过: {check.name} - {check.detail}",
+                    level="error" if check.required else "warning",
+                )
+        if preflight_report.ok:
+            logger.log(
+                "前置检查通过: "
+                + ", ".join(check.name for check in preflight_report.checks if check.ok)
+            )
+        enforce_preflight = _bool_config(
+            extra.get("enforce_preflight"),
+            _bool_config(os.getenv("ZCJ_ENFORCE_PREFLIGHT"), False),
+        )
+        if enforce_preflight and not preflight_report.ok:
+            error = "注册前置检查未通过: " + ", ".join(
+                check.name for check in preflight_report.failures
+            )
+            logger.log(error, level="error")
+            logger.finish(TASK_STATUS_FAILED, error=error)
+            return
+    except Exception as preflight_exc:
+        logger.log(f"前置检查执行异常（忽略）: {preflight_exc}", level="warning")
     if herosms_enabled:
         if hero_reuse_to_max:
             logger.log(
@@ -2855,8 +2929,9 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         resolved_proxy = _resolve_registration_proxy_for_platform(
             platform_name,
             explicit_proxy=proxy,
-            proxy_getter=lambda: proxy_pool.acquire_next(proxy_region),
+            proxy_getter=lambda: proxy_pool.acquire_route(proxy_region),
             allow_pool=allow_proxy_pool,
+            region=proxy_region,
         )
         leased_proxy_url = resolved_proxy
         proxy_pool_lease = bool(
@@ -3117,7 +3192,35 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 "passed" if liveness_status == "valid" else "unknown",
                 detail={"validity_status": liveness_status or "unknown"},
             )
-            _registration_pipeline_update(account, "persisted", "passed")
+            persistence_decision = evaluate_persistence(account)
+            persistence_enforced = _bool_config(
+                extra.get("enforce_persistence_boundary"),
+                _bool_config(os.getenv("ZCJ_ENFORCE_PERSISTENCE_BOUNDARY"), False),
+            )
+            if persistence_enforced and not persistence_decision.ok:
+                boundary_error = (
+                    "PERSISTENCE_BOUNDARY: "
+                    + persistence_decision.detail
+                    + f"（{persistence_decision.code}）"
+                )
+                _registration_pipeline_update(
+                    account,
+                    "persisted",
+                    "failed",
+                    error=boundary_error,
+                    detail=persistence_decision.log_fields(),
+                )
+                account.status = AccountStatus.PENDING_VERIFICATION
+                save_account(account)
+                logger.record_error(boundary_error)
+                _save_task_log(platform_name, account.email, "failed", error=boundary_error)
+                return boundary_error
+            _registration_pipeline_update(
+                account,
+                "persisted",
+                "passed",
+                detail=persistence_decision.log_fields(),
+            )
             saved_model = save_account(account)
             saved_account_id = int(getattr(saved_model, "id", 0) or 0)
             probation_enabled = (
@@ -4767,8 +4870,8 @@ def _register_chatgpt_accounts_for_gopay(
                 "chatgpt", payload, logger, resolved_proxy=resolved_proxy
             )
             # SMS provider 配置诊断
-            sms_provider = extra.get("sms_provider") or ""
-            sms_key = str(extra.get("smspool_api_key") or "").strip()
+            sms_provider = register_extra.get("sms_provider") or ""
+            sms_key = str(register_extra.get("smspool_api_key") or "").strip()
             if sms_key:
                 logger.log(f"SMS provider: {sms_provider} (使用任务内 API Key)")
             else:

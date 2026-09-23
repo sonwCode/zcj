@@ -811,11 +811,12 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         local, domain = text.rsplit("@", 1)
         return f"{local.split('+', 1)[0]}@{domain}"
 
-    def _available_entry(self) -> LocalMicrosoftMailboxEntry:
+    def _available_entry(self, exclude: set[str] | None = None) -> LocalMicrosoftMailboxEntry:
         entries = self._entries()
         state = self._state()
         used = set((state.get("used") or {}).keys())
         blocked = set((state.get("blocked") or {}).keys())
+        skipped = exclude or set()
         # Only bare-parent keys retire the whole tree. Blocking one child
         # (e.g. already_registered on a single plus-address) must not hide
         # siblings. Bare keys are those without a '+' local-part.
@@ -824,6 +825,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             if "@" in item and "+" not in item.split("@", 1)[0]
         }
         for entry in entries:
+            if entry.key in skipped:
+                continue
             base_key = self._base_email_key(entry.login_account or entry.email)
             if (
                 entry.key in blocked
@@ -868,7 +871,20 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             key,
             {"blocked": blocked_record, "failures": failure_record},
         )
+        self.release_reservation(key)
         return True
+
+    def release_reservation(self, resource_key: str) -> bool:
+        """Release the cross-process claim for one mailbox identity."""
+        key = str(resource_key or "").strip().lower()
+        if not key:
+            return False
+        try:
+            from infrastructure.reservation_repository import POOL_MAILBOX, reservation_repository
+
+            return reservation_repository.release(pool=POOL_MAILBOX, resource_key=key)
+        except Exception:
+            return False
 
     def mark_attempt_failure(self, account: MailboxAccount, reason: str = "") -> bool:
         key = str(getattr(account, "account_id", "") or getattr(account, "email", "")).strip().lower()
@@ -1039,8 +1055,27 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         return self._available_entry().email
 
     def get_email(self) -> MailboxAccount:
+        from infrastructure.reservation_repository import POOL_MAILBOX, reservation_repository
+
         with self._lock:
-            entry = self._available_entry()
+            entry = None
+            tried: set[str] = set()
+            owner = f"{self.provider_name}:{self._source_id()}"
+            while entry is None:
+                candidate = self._available_entry(exclude=tried)
+                claimed = reservation_repository.reserve(
+                    pool=POOL_MAILBOX,
+                    resource_key=candidate.key,
+                    owner=owner,
+                    ttl_seconds=3600,
+                    metadata={"email": candidate.email, "source_id": self._source_id()},
+                )
+                if claimed is not None:
+                    entry = candidate
+                    break
+                tried.add(candidate.key)
+                if len(tried) >= 200:
+                    raise RuntimeError("本地微软邮箱池没有可原子预占的邮箱")
             self._reserve(entry)
 
         credentials = entry.credentials()

@@ -1,29 +1,31 @@
 """数据库模型 - SQLite via SQLModel"""
 import json
-import os
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import UniqueConstraint, event, inspect
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Field, SQLModel, Session, create_engine, select
+from sqlmodel import Field, SQLModel, Session, select
+
+from .storage import build_engine, database_url, describe, is_sqlite
+from .vault import EncryptedText, blind_index
 
 
 def _utcnow():
     return datetime.now(timezone.utc)
 
 
-def _default_database_url() -> str:
-    database_path = Path(__file__).resolve().parent.parent / "account_manager.db"
-    return f"sqlite:///{database_path}"
+DATABASE_URL = database_url()
+engine = build_engine(DATABASE_URL)
 
 
-DATABASE_URL = os.getenv("ACCOUNT_MANAGER_DATABASE_URL", _default_database_url())
-engine = create_engine(DATABASE_URL)
+def storage_backend() -> dict:
+    """Return the active storage backend description (read-only)."""
+    return describe(DATABASE_URL).to_dict()
 
-if DATABASE_URL.startswith("sqlite"):
+
+if is_sqlite(DATABASE_URL):
 
 
     @event.listens_for(engine, "connect")
@@ -58,7 +60,7 @@ class AccountModel(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     platform: str = Field(index=True)
     email: str = Field(index=True)
-    password: str
+    password: str = Field(sa_type=EncryptedText)
     user_id: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
@@ -95,7 +97,7 @@ class AccountCredentialModel(SQLModel, table=True):
     provider_name: str = Field(default="", index=True)
     credential_type: str = Field(default="secret", index=True)
     key: str = Field(default="", index=True)
-    value: str = ""
+    value: str = Field(default="", sa_type=EncryptedText)
     is_primary: bool = False
     source: str = ""
     metadata_json: str = "{}"
@@ -118,7 +120,7 @@ class ProviderAccountModel(SQLModel, table=True):
     provider_name: str = Field(default="", index=True)
     login_identifier: str = Field(default="", index=True)
     display_name: str = ""
-    credentials_json: str = "{}"
+    credentials_json: str = Field(default="{}", sa_type=EncryptedText)
     metadata_json: str = "{}"
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
@@ -144,8 +146,8 @@ class ProviderResourceModel(SQLModel, table=True):
     provider_type: str = Field(default="mailbox", index=True)
     provider_name: str = Field(default="", index=True)
     resource_type: str = Field(default="resource", index=True)
-    resource_identifier: str = Field(default="", index=True)
-    handle: str = ""
+    resource_identifier: str = Field(default="", index=True, sa_type=EncryptedText)
+    handle: str = Field(default="", sa_type=EncryptedText)
     display_name: str = ""
     metadata_json: str = "{}"
     created_at: datetime = Field(default_factory=_utcnow)
@@ -212,8 +214,8 @@ class ProviderSettingModel(SQLModel, table=True):
     auth_mode: str = ""
     enabled: bool = True
     is_default: bool = False
-    config_json: str = "{}"
-    auth_json: str = "{}"
+    config_json: str = Field(default="{}", sa_type=EncryptedText)
+    auth_json: str = Field(default="{}", sa_type=EncryptedText)
     metadata_json: str = "{}"
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
@@ -322,12 +324,24 @@ class ProxyModel(SQLModel, table=True):
     __tablename__ = "proxies"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    url: str = Field(unique=True)
+    # ``url`` embeds proxy credentials, so it is encrypted at rest.  Equality
+    # lookups go through the deterministic ``url_index`` blind index instead.
+    url: str = Field(sa_type=EncryptedText)
+    url_index: str = Field(default="", index=True)
     region: str = ""
     success_count: int = 0
     fail_count: int = 0
     is_active: bool = True
     last_checked: Optional[datetime] = None
+
+
+@event.listens_for(ProxyModel, "before_insert")
+@event.listens_for(ProxyModel, "before_update")
+def _sync_proxy_url_index(_mapper, _connection, target) -> None:
+    """Keep the blind index in step with the plaintext URL on every write."""
+    raw = getattr(target, "url", "")
+    if raw:
+        target.url_index = blind_index(str(raw))
 
 
 class SmsPoolBlacklistModel(SQLModel, table=True):
@@ -349,6 +363,36 @@ class SmsPoolBlacklistModel(SQLModel, table=True):
     last_error_message: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
     last_attempted_at: datetime = Field(default_factory=_utcnow)
+
+
+class ResourceReservationModel(SQLModel, table=True):
+    """Cross-process reservation of a pool resource (mailbox, phone, proxy).
+
+    The unique constraint on (pool, resource_key) is the atomicity primitive:
+    two workers racing for the same resource can both INSERT, but only one
+    COMMIT succeeds, so the loser sees IntegrityError and moves on.
+    """
+
+    __tablename__ = "resource_reservations"
+    __table_args__ = (
+        UniqueConstraint("pool", "resource_key", name="uq_resource_reservations_pool_key"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    pool: str = Field(index=True)
+    resource_key: str = Field(index=True)
+    owner: str = Field(default="", index=True)
+    status: str = Field(default="reserved", index=True)
+    metadata_json: str = "{}"
+    reserved_at: datetime = Field(default_factory=_utcnow)
+    expires_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_metadata(self) -> dict:
+        return json.loads(self.metadata_json or "{}")
+
+    def set_metadata(self, data: dict):
+        self.metadata_json = json.dumps(data or {}, ensure_ascii=False)
 
 
 def save_account(account) -> 'AccountModel':
@@ -551,10 +595,13 @@ def init_db():
     from core.account_graph import sync_all_account_graphs
     from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 
-    _migrate_legacy_accounts_schema()
+    if is_sqlite(DATABASE_URL):
+        _migrate_legacy_accounts_schema()
     _ensure_accounts_unique_index()
     _ensure_column("provider_definitions", "category", "TEXT DEFAULT ''")
+    _ensure_column("proxies", "url_index", "TEXT DEFAULT ''")
     SQLModel.metadata.create_all(engine)
+    _backfill_proxy_url_index()
 
     with Session(engine) as session:
         ProviderDefinitionsRepository().ensure_seeded()
@@ -577,6 +624,31 @@ def _ensure_column(table: str, column: str, col_type: str):
     with engine.begin() as conn:
         conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
     print(f"[DB] 已添加列 {table}.{column}")
+
+
+def _backfill_proxy_url_index() -> None:
+    """Populate ``url_index`` for proxy rows written before the blind index existed."""
+    inspector = inspect(engine)
+    if "proxies" not in set(inspector.get_table_names()):
+        return
+    columns = {c["name"] for c in inspector.get_columns("proxies")}
+    if "url_index" not in columns:
+        return
+    with Session(engine) as session:
+        rows = session.exec(select(ProxyModel)).all()
+        updated = 0
+        for row in rows:
+            raw = str(row.url or "")
+            if not raw:
+                continue
+            expected = blind_index(raw)
+            if str(row.url_index or "") != expected:
+                row.url_index = expected
+                session.add(row)
+                updated += 1
+        if updated:
+            session.commit()
+            print(f"[DB] 已回填 {updated} 条代理盲索引")
 
 
 def _cleanup_empty_provider_settings():

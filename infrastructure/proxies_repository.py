@@ -4,6 +4,7 @@ from sqlmodel import Session, select
 
 from core.db import ProxyModel, engine
 from core.proxy_utils import infer_proxy_region, normalize_proxy_url
+from core.vault import blind_index
 from domain.proxies import ProxyCreateCommand, ProxyRecord, ProxyUpdateCommand
 
 
@@ -54,7 +55,7 @@ class ProxiesRepository:
         if not url:
             return None
         with Session(engine) as session:
-            existing = session.exec(select(ProxyModel).where(ProxyModel.url == url)).first()
+            existing = session.exec(select(ProxyModel).where(ProxyModel.url_index == blind_index(url))).first()
             if existing:
                 return None
             model = ProxyModel(url=url, region=command.region.strip().upper() or infer_proxy_region(url))
@@ -71,7 +72,7 @@ class ProxiesRepository:
             model = session.get(ProxyModel, proxy_id)
             if not model:
                 return None
-            existing = session.exec(select(ProxyModel).where(ProxyModel.url == url)).first()
+            existing = session.exec(select(ProxyModel).where(ProxyModel.url_index == blind_index(url))).first()
             if existing and existing.id != proxy_id:
                 return None
             model.url = url
@@ -91,7 +92,7 @@ class ProxiesRepository:
                 if not url or url in seen:
                     continue
                 seen.add(url)
-                existing = session.exec(select(ProxyModel).where(ProxyModel.url == url)).first()
+                existing = session.exec(select(ProxyModel).where(ProxyModel.url_index == blind_index(url))).first()
                 if existing:
                     continue
                 session.add(ProxyModel(url=url, region=normalized_region or infer_proxy_region(url)))

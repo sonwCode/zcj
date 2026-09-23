@@ -110,6 +110,14 @@ class HTTPClient:
         if self.proxies and "proxies" not in kwargs:
             kwargs["proxies"] = self.proxies
 
+        # 可选 Cloudflare 清关：未配置 ZCJ_CF_CLEARANCE_URL 时是空操作。
+        try:
+            from core.cloudflare_clearance import apply_clearance
+
+            kwargs["headers"] = apply_clearance(kwargs.get("headers") or {}, url)
+        except Exception:
+            pass
+
         last_exception = None
         for attempt in range(self.config.max_retries):
             try:

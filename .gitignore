@@ -50,8 +50,12 @@ data/
 .env
 .env.local
 
-# 文档
-docs/
+# 文档（仅保留对外文档，其余草稿仍忽略）
+docs/*
+!docs/registration-architecture.md
+!docs/configuration.md
+!docs/telemetry-and-runtime.md
+!docs/optimization-roadmap.md
 
 # macOS
 .DS_Store

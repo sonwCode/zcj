@@ -9,6 +9,7 @@ import threading
 from sqlmodel import Session, select
 
 from .db import ProxyModel, engine
+from .vault import blind_index
 from .proxy_utils import normalize_proxy_url, redact_proxy_credentials
 
 _PROXY_CHECK_URLS = (
@@ -209,6 +210,43 @@ class ProxyPool:
             return dynamic
         return None
 
+    def next_route(self, region: str = "") -> tuple[Optional[str], str]:
+        """Non-reserving route selection that also reports the supplying tier."""
+        dynamic = self._dynamic_proxy()
+        if dynamic:
+            key = self._proxy_key(dynamic)
+            with self._lock:
+                if self._cooldown_until.get(key, 0.0) <= monotonic():
+                    self._remember_assignment(dynamic, reserve=False)
+                    return dynamic, "stable_runtime"
+        selected = self._select_static(region, reserve=False)
+        if selected:
+            return selected, "pool"
+        return None, "direct"
+
+    def acquire_route(self, region: str = "") -> tuple[Optional[str], str]:
+        """Reserve a route and report whether the runtime or the pool supplied it."""
+        dynamic = self._dynamic_proxy()
+        if dynamic:
+            key = self._proxy_key(dynamic)
+            with self._lock:
+                if (
+                    self._cooldown_until.get(key, 0.0) <= monotonic()
+                    and self._lease_counts.get(key, 0) == 0
+                ):
+                    self._remember_assignment(dynamic, reserve=True)
+                    return dynamic, "stable_runtime"
+
+        selected = self._select_static(region, reserve=True)
+        if selected:
+            return selected, "pool"
+
+        if dynamic:
+            with self._lock:
+                self._remember_assignment(dynamic, reserve=True)
+            return dynamic, "stable_runtime"
+        return None, "direct"
+
     def release(self, url: str | None) -> None:
         key = self._proxy_key(url)
         if not key:
@@ -226,7 +264,7 @@ class ProxyPool:
         if not key:
             return ""
         with Session(engine) as session:
-            proxy = session.exec(select(ProxyModel).where(ProxyModel.url == key)).first()
+            proxy = session.exec(select(ProxyModel).where(ProxyModel.url_index == blind_index(key))).first()
         return f"#{int(proxy.id)}" if proxy and proxy.id is not None else "dynamic"
 
     def report_success(self, url: str) -> None:
@@ -251,9 +289,9 @@ class ProxyPool:
         # another's read-modify-write result in SQLite.
         with self._lock:
             with Session(engine) as session:
-                proxy = session.exec(select(ProxyModel).where(ProxyModel.url == url)).first()
+                proxy = session.exec(select(ProxyModel).where(ProxyModel.url_index == blind_index(url))).first()
                 if not proxy and normalized and normalized != url:
-                    proxy = session.exec(select(ProxyModel).where(ProxyModel.url == normalized)).first()
+                    proxy = session.exec(select(ProxyModel).where(ProxyModel.url_index == blind_index(normalized))).first()
                 if not proxy:
                     return
                 if success:
