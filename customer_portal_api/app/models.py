@@ -6,7 +6,7 @@ from typing import Optional
 from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, SQLModel
 
-from app.db import utcnow
+from customer_portal_api.app.db import utcnow
 
 
 class PortalRole(SQLModel, table=True):

@@ -4,9 +4,9 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlmodel import Session
 
-from app.db import engine
-from app.models import PortalUser
-from app.security import decode_access_token
+from customer_portal_api.app.db import engine
+from customer_portal_api.app.models import PortalUser
+from customer_portal_api.app.security import decode_access_token
 
 
 bearer_scheme = HTTPBearer(auto_error=False)

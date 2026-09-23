@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import os
 import json
 import secrets
 from datetime import timedelta
@@ -10,8 +11,8 @@ from typing import Any
 
 from fastapi import HTTPException, status
 
-from app.config import settings
-from app.db import utcnow
+from customer_portal_api.app.config import settings
+from customer_portal_api.app.db import utcnow
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -88,3 +89,58 @@ def hash_refresh_token(token: str) -> str:
 
 def refresh_token_expiry():
     return utcnow() + timedelta(seconds=settings.refresh_token_ttl_seconds)
+
+
+
+
+_PAYMENT_UNSIGNED_FLAG = "PORTAL_PAYMENT_ALLOW_UNSIGNED_CALLBACKS"
+_PAYMENT_SECRET_MAP = "PORTAL_PAYMENT_CALLBACK_SECRETS"
+
+
+def payment_callback_secret(channel_code: str) -> str:
+    """Resolve the shared secret for one payment channel.
+
+    Lookup order: PORTAL_PAYMENT_SECRET_<CHANNEL>, then the
+    PORTAL_PAYMENT_CALLBACK_SECRETS map ("channel:secret,channel2:secret2").
+    """
+    code = str(channel_code or "").strip().lower()
+    if not code:
+        return ""
+    direct = os.getenv("PORTAL_PAYMENT_SECRET_" + code.upper().replace("-", "_"), "").strip()
+    if direct:
+        return direct
+    for pair in os.getenv(_PAYMENT_SECRET_MAP, "").split(","):
+        name, _, secret = pair.partition(":")
+        if name.strip().lower() == code and secret.strip():
+            return secret.strip()
+    return ""
+
+
+def verify_payment_callback(channel_code: str, raw_body: bytes, signature: str) -> None:
+    """Reject unsigned or badly signed payment callbacks.
+
+    Without this, anyone who can guess an order number could POST a fake
+    "success" callback and activate a subscription for free.
+    """
+    secret = payment_callback_secret(channel_code)
+    if not secret:
+        if os.getenv(_PAYMENT_UNSIGNED_FLAG, "").strip().lower() in {"1", "true", "yes", "on"}:
+            print(
+                "[portal][WARN] 支付渠道 " + str(channel_code) +
+                " 未配置签名密钥，因 " + _PAYMENT_UNSIGNED_FLAG + " 已显式开启而跳过校验"
+            )
+            return
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="支付渠道未配置回调签名密钥，已拒绝该回调",
+        )
+
+    provided = str(signature or "").strip()
+    if provided.startswith("sha256="):
+        provided = provided[len("sha256="):]
+    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    if not provided or not hmac.compare_digest(expected, provided):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="支付回调签名校验失败",
+        )

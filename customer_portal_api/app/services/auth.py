@@ -3,9 +3,9 @@ from __future__ import annotations
 from fastapi import HTTPException, status
 from sqlmodel import Session, or_, select
 
-from app.config import settings
-from app.db import utcnow
-from app.models import (
+from customer_portal_api.app.config import settings
+from customer_portal_api.app.db import utcnow
+from customer_portal_api.app.models import (
     PortalPermission,
     PortalPlatform,
     PortalRole,
@@ -14,7 +14,7 @@ from app.models import (
     RefreshToken,
     UserPlatformAccess,
 )
-from app.security import (
+from customer_portal_api.app.security import (
     create_access_token,
     create_refresh_token,
     hash_refresh_token,

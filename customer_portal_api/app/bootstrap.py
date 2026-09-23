@@ -4,10 +4,10 @@ import json
 
 from sqlmodel import Session, select
 
-from app.catalog import CONFIG_DEFAULTS, PERMISSION_SEEDS, PLATFORM_SEEDS, ROLE_SEEDS
-from app.config import settings
-from app.db import engine, init_portal_db, utcnow
-from app.models import (
+from customer_portal_api.app.catalog import CONFIG_DEFAULTS, PERMISSION_SEEDS, PLATFORM_SEEDS, ROLE_SEEDS
+from customer_portal_api.app.config import resolve_seed_admin_password, settings
+from customer_portal_api.app.db import engine, init_portal_db, utcnow
+from customer_portal_api.app.models import (
     PortalConfig,
     PortalPermission,
     PortalPlatform,
@@ -16,7 +16,7 @@ from app.models import (
     PortalRolePermission,
     PortalUser,
 )
-from app.security import hash_password
+from customer_portal_api.app.security import hash_password, verify_password
 
 
 def initialize_runtime() -> None:
@@ -103,12 +103,16 @@ def _seed_roles(session: Session) -> None:
 def _seed_admin(session: Session) -> None:
     admin = session.exec(select(PortalUser).where(PortalUser.username == settings.seed_admin_username)).first()
     if admin:
+        # Already provisioned: surface the fact if it still uses the shipped default.
+        if verify_password("admin123456", admin.password_hash):
+            print("[portal][WARN] 管理员账号仍在使用出厂默认口令 admin123456，请立即修改！")
         return
+    password, generated = resolve_seed_admin_password()
     session.add(
         PortalUser(
             username=settings.seed_admin_username,
             email=settings.seed_admin_email,
-            password_hash=hash_password(settings.seed_admin_password),
+            password_hash=hash_password(password),
             display_name="管理员",
             role_code="admin",
             status="active",
@@ -116,6 +120,13 @@ def _seed_admin(session: Session) -> None:
             updated_at=utcnow(),
         )
     )
+    if generated:
+        print("[portal][WARN] 未配置 PORTAL_ADMIN_PASSWORD，已生成一次性管理员口令：")
+        print("[portal][WARN]     用户名: " + settings.seed_admin_username)
+        print("[portal][WARN]     口令  : " + password)
+        print("[portal][WARN] 该口令只显示这一次，请立即登录并修改。")
+    else:
+        print("[portal] 已按 PORTAL_ADMIN_PASSWORD 创建管理员账号 " + settings.seed_admin_username)
 
 
 def _seed_platforms(session: Session) -> None:
