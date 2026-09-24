@@ -1,4 +1,4 @@
-"""Geo- and platform-coherent browser identity profile.
+"""Geo-, platform- and browser-coherent identity profile.
 
 The protocol registration path used to ship a *constant* fingerprint: a fixed
 User-Agent, a fixed ``Accept-Language: en-US``, and a Sentinel ``p`` payload that
@@ -6,24 +6,25 @@ always claimed ``1920x1080`` / ``GMT+0000 (Coordinated Universal Time)`` / ``en-
 That contradicts the proxy exit country (the IP says JP while the JS says UTC/en-US)
 and makes every account share one identity, which is trivially clusterable.
 
-It also contradicted *itself*. ``curl_cffi`` impersonates a specific browser build,
-and its Chrome targets are not all Windows: every target from ``chrome119`` up is
-macOS (``chrome142`` is macOS Tahoe). The old code impersonated ``chrome142`` while
-sending ``Windows NT 10.0; Win64; x64`` and ``sec-ch-ua-platform: "Windows"``, so the
-TLS/HTTP2 fingerprint said macOS and the headers said Windows.
+It also contradicted *itself* twice over:
 
-Every value in ``_CHROME_TARGETS`` was **measured**, not looked up: the installed
+* **OS** - ``curl_cffi``'s Chrome targets are not all Windows. Every target from
+  ``chrome119`` up is macOS, so the old ``Windows NT 10.0`` UA and
+  ``sec-ch-ua-platform: "Windows"`` disagreed with the macOS TLS/HTTP2 fingerprint.
+* **browser family** - the profile was always Chrome, while the reference
+  implementations rotate between Chrome, Safari and Firefox.
+
+Every value in ``_BROWSER_TARGETS`` was **measured**, not looked up: the installed
 ``curl_cffi`` was pointed at a local echo server and the headers it actually sent were
-read back. Two things that were guessed wrong before and are now measured:
+read back. That caught three things guessing got wrong - the OS, the Chrome "GREASE"
+brand *and its position* (Chrome rotates both per build: 136/142 put it third, 146
+second, 150 first), and the fact that Safari and Firefox send **no client hints at
+all** and Safari additionally omits ``priority``, ``sec-fetch-user`` and
+``upgrade-insecure-requests``. Emitting Chrome-shaped headers under a Safari UA would
+be a contradiction in the other direction.
 
-* the OS - which decides the UA and the ``sec-ch-ua-platform`` hint
-* the Chrome "GREASE" brand **and its position** - Chrome rotates both per build
-  (136 and 142 put it third, 146 second, 150 first), so pinning one spelling at one
-  position is wrong for most versions
-
-Only the hints ``curl_cffi`` itself sends are emitted. Chrome sends the wider
-``sec-ch-ua-*`` family only after a server opts in with ``Accept-CH``, so sending them
-by default would be its own deviation.
+Run ``scripts/probe_curl_cffi_headers.py`` after upgrading curl_cffi; it re-measures
+every target and exits non-zero on any drift.
 
 The remaining layers stay coherent per session: the region decides timezone, locale and
 ``Accept-Language`` so they agree with the proxy exit IP, and hardware-shaped fields
@@ -33,49 +34,118 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 DEFAULT_REGION = "US"
 DEFAULT_IMPERSONATE = os.environ.get("ZCJ_CHATGPT_IMPERSONATE", "chrome142")
+# Empty means "stay on Chrome", which is what the project did before families existed.
+# Set ZCJ_CHATGPT_BROWSER_FAMILY=auto to rotate, or to a family name to pin one.
+DEFAULT_FAMILY = os.environ.get("ZCJ_CHATGPT_BROWSER_FAMILY", "")
 
 _Q = chr(34)
 
-# impersonate -> measured values for that target.
-#
-# ``sec_ch_ua`` is the exact header the installed curl_cffi sends for this target.
-# Keep it in sync by re-running the local echo probe if curl_cffi is upgraded;
-# ``sentinel_check`` will flag a version mismatch inside the profile, and
-# ``scripts/probe_curl_cffi_headers.py`` regenerates this table.
-_CHROME_TARGETS: dict[str, dict[str, str]] = {
+# From the reference implementation's fingerprint rotation (mac_safari 30, ios_safari
+# 15, chrome 35, firefox 20). Only used when the family is explicitly "auto".
+_FAMILY_WEIGHTS = (("chrome", 35), ("safari", 30), ("firefox", 20), ("safari_ios", 15))
+
+_NAV_ACCEPT = {
+    "chrome": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8,"
+        "application/signed-exchange;v=b3;q=0.7"
+    ),
+    "firefox": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "safari": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "safari_ios": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+# Every field below was read back from the installed curl_cffi by pointing it at a
+# local echo server. Keep in sync with scripts/probe_curl_cffi_headers.py.
+_BROWSER_TARGETS: dict[str, dict[str, str]] = {
     "chrome136": {
-        "version": "136",
+        "family": "chrome",
         "os_family": "macOS",
-        "ua_token": "Macintosh; Intel Mac OS X 10_15_7",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
         "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        "accept_encoding": "gzip, deflate, br, zstd",
     },
     "chrome142": {
-        "version": "142",
+        "family": "chrome",
         "os_family": "macOS",
-        "ua_token": "Macintosh; Intel Mac OS X 10_15_7",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
         "sec_ch_ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+        "accept_encoding": "gzip, deflate, br, zstd",
     },
     "chrome146": {
-        "version": "146",
+        "family": "chrome",
         "os_family": "macOS",
-        "ua_token": "Macintosh; Intel Mac OS X 10_15_7",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         "sec_ch_ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+        "accept_encoding": "gzip, deflate, br, zstd",
     },
     "chrome150": {
-        "version": "150",
+        "family": "chrome",
         "os_family": "macOS",
-        "ua_token": "Macintosh; Intel Mac OS X 10_15_7",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
         "sec_ch_ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+        "accept_encoding": "gzip, deflate, br, zstd",
+    },
+    "safari180": {
+        "family": "safari",
+        "os_family": "macOS",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+        "sec_ch_ua": "",
+        "accept_encoding": "gzip, deflate, br",
+    },
+    "safari184": {
+        "family": "safari",
+        "os_family": "macOS",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Safari/605.1.15",
+        "sec_ch_ua": "",
+        "accept_encoding": "gzip, deflate, br",
+    },
+    "safari2601": {
+        "family": "safari",
+        "os_family": "macOS",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0.1 Safari/605.1.15",
+        "sec_ch_ua": "",
+        "accept_encoding": "gzip, deflate, br",
+    },
+    "safari180_ios": {
+        "family": "safari_ios",
+        "os_family": "iOS",
+        "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+        "sec_ch_ua": "",
+        "accept_encoding": "gzip, deflate, br",
+    },
+    "safari260_ios": {
+        "family": "safari_ios",
+        "os_family": "iOS",
+        "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1",
+        "sec_ch_ua": "",
+        "accept_encoding": "gzip, deflate, br, zstd",
+    },
+    "firefox144": {
+        "family": "firefox",
+        "os_family": "macOS",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:144.0) Gecko/20100101 Firefox/144.0",
+        "sec_ch_ua": "",
+        "accept_encoding": "gzip, deflate, br, zstd",
+    },
+    "firefox147": {
+        "family": "firefox",
+        "os_family": "macOS",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:147.0) Gecko/20100101 Firefox/147.0",
+        "sec_ch_ua": "",
+        "accept_encoding": "gzip, deflate, br, zstd",
     },
 }
 
 _SCREENS_BY_OS: dict[str, tuple] = {
     "macOS": ("1440x900", "1512x982", "1728x1117", "2560x1600", "1920x1080"),
+    "iOS": ("390x844", "393x852", "428x926", "375x812"),
     "Windows": ("1920x1080", "2560x1440", "1536x864", "1680x1050"),
 }
 _CORES = (4, 8, 12, 16)
@@ -88,16 +158,19 @@ class BrowserProfile:
 
     region: str
     impersonate: str
+    family: str
     os_family: str
     user_agent: str
     accept_language: str
+    accept_encoding: str
     navigator_language: str
     timezone: str
     timezone_label: str
+    timezone_resolved: bool
     screen: str
     platform: str
     sec_ch_ua: str
-    chrome_version: str
+    browser_version: str
     hardware_concurrency: int
     device_memory: int
 
@@ -105,17 +178,23 @@ class BrowserProfile:
         return {
             "region": self.region,
             "impersonate": self.impersonate,
+            "family": self.family,
             "os_family": self.os_family,
             "user_agent": self.user_agent,
             "accept_language": self.accept_language,
             "navigator_language": self.navigator_language,
             "timezone": self.timezone,
+            "timezone_resolved": self.timezone_resolved,
             "screen": self.screen,
             "platform": self.platform,
             "sec_ch_ua": self.sec_ch_ua,
             "hardware_concurrency": self.hardware_concurrency,
             "device_memory": self.device_memory,
         }
+
+    @property
+    def is_chromium(self) -> bool:
+        return bool(self.sec_ch_ua)
 
     def js_date_string(self) -> str:
         """Render ``Date.toString()`` in the profile timezone.
@@ -135,44 +214,51 @@ class BrowserProfile:
         return now.strftime("%a %b %d %Y %H:%M:%S ") + "GMT" + offset + " (" + label + ")"
 
     def headers(self, *, navigation: bool = False, referer: str = "", origin: str = "") -> dict:
-        """Request headers, matching what the impersonated build would send.
+        """Request headers matching what the impersonated build would send.
 
-        Only the three client hints curl_cffi itself emits are included; the wider
-        ``sec-ch-ua-*`` family is opt-in via ``Accept-CH`` and sending it by default
-        would be its own deviation. ``Accept-Encoding`` carries ``zstd`` because
-        Chrome 123+ negotiates it. ``Connection`` is deliberately absent: the transport
-        is HTTP/2, where a real Chrome never sends it.
+        The families differ in more than the UA, and every difference below was measured:
 
-        ``navigation=True`` switches the ``Sec-Fetch-*`` group to a top-level document
-        navigation (document/navigate/none, plus user and upgrade-insecure-requests)
-        and the ``priority`` hint to ``u=0``. XHR requests use empty/cors/same-origin
-        with ``u=1``.
+        * Chrome sends ``sec-ch-ua``/``-platform``/``-mobile``; Safari and Firefox send
+          **none** of them, so emitting them under those UAs would be the tell
+        * Safari sends neither ``priority`` nor ``sec-fetch-user`` nor
+          ``upgrade-insecure-requests``
+        * Firefox sends ``te: trailers``
+        * ``accept-encoding`` differs per target (older Safari lacks ``zstd``)
+
+        ``navigation=True`` switches ``Sec-Fetch-*`` to a top-level document navigation;
+        XHR requests use empty/cors/same-origin. ``Connection`` is never sent: the
+        transport is HTTP/2, where a real browser does not send it.
         """
         headers = {
             "User-Agent": self.user_agent,
-            "sec-ch-ua": self.sec_ch_ua,
-            "sec-ch-ua-platform": _Q + self.platform + _Q,
-            "sec-ch-ua-mobile": "?0",
             "Accept-Language": self.accept_language,
-            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Encoding": self.accept_encoding,
         }
+        if self.is_chromium:
+            headers["sec-ch-ua"] = self.sec_ch_ua
+            headers["sec-ch-ua-platform"] = _Q + self.platform + _Q
+            headers["sec-ch-ua-mobile"] = "?1" if self.os_family == "iOS" else "?0"
+
         if navigation:
-            headers["Accept"] = (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,image/apng,*/*;q=0.8"
-            )
+            headers["Accept"] = _NAV_ACCEPT.get(self.family, _NAV_ACCEPT["safari"])
             headers["Sec-Fetch-Dest"] = "document"
             headers["Sec-Fetch-Mode"] = "navigate"
             headers["Sec-Fetch-Site"] = "none"
-            headers["Sec-Fetch-User"] = "?1"
-            headers["Upgrade-Insecure-Requests"] = "1"
-            headers["priority"] = "u=0, i"
         else:
             headers["Accept"] = "application/json"
             headers["Sec-Fetch-Dest"] = "empty"
             headers["Sec-Fetch-Mode"] = "cors"
             headers["Sec-Fetch-Site"] = "same-origin"
-            headers["priority"] = "u=1, i"
+
+        # Safari omits this trio; Chrome and Firefox send it.
+        if self.family in ("chrome", "firefox"):
+            headers["priority"] = "u=0, i" if navigation else "u=1, i"
+            if navigation:
+                headers["Sec-Fetch-User"] = "?1"
+                headers["Upgrade-Insecure-Requests"] = "1"
+        if self.family == "firefox":
+            headers["TE"] = "trailers"
+
         if referer:
             headers["Referer"] = referer
         if origin:
@@ -229,15 +315,12 @@ def known_regions() -> list:
     return sorted(_REGIONS)
 
 
+def known_families() -> list:
+    return sorted({spec["family"] for spec in _BROWSER_TARGETS.values()})
+
+
 def known_impersonate_targets() -> list:
-    return sorted(_CHROME_TARGETS)
-
-
-def resolve_impersonate(target: str | None = "") -> str:
-    value = str(target or "").strip()
-    if value in _CHROME_TARGETS:
-        return value
-    return DEFAULT_IMPERSONATE if DEFAULT_IMPERSONATE in _CHROME_TARGETS else "chrome142"
+    return sorted(_BROWSER_TARGETS)
 
 
 def _seed_int(seed: str) -> int:
@@ -245,33 +328,79 @@ def _seed_int(seed: str) -> int:
     return int(hashlib.sha256(material).hexdigest()[:12], 16)
 
 
+def timezone_is_available(name: str) -> bool:
+    """Whether ``ZoneInfo`` can resolve ``name`` on this host.
+
+    The profile renders its timezone into the Sentinel payload as a JS
+    ``Date.toString()``. When the zone cannot be resolved the renderer falls back to
+    UTC, and the payload then claims ``GMT+0000`` while the proxy exit is somewhere
+    else - the exact contradiction this module exists to remove. It is worth checking
+    explicitly because it fails *only* on hosts without tzdata, so it passes in
+    development and breaks on a stripped-down server image.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(str(name))
+        return True
+    except Exception:
+        return False
+
+
+def _targets_of_family(family: str) -> list:
+    return sorted(t for t, spec in _BROWSER_TARGETS.items() if spec["family"] == family)
+
+
+def resolve_impersonate(target: str | None = "", *, seed: str = "", family: str | None = "") -> str:
+    """Pick one target. An explicit target always wins over a family request."""
+    value = str(target or "").strip()
+    if value in _BROWSER_TARGETS:
+        return value
+
+    wanted = str(family if family is not None else DEFAULT_FAMILY).strip().lower()
+    if wanted == "auto":
+        weighted: list = []
+        for name, weight in _FAMILY_WEIGHTS:
+            weighted.extend([name] * weight)
+        wanted = weighted[_seed_int(str(seed) + ":family") % len(weighted)]
+    if wanted:
+        candidates = _targets_of_family(wanted)
+        if candidates:
+            return candidates[_seed_int(str(seed) + ":target") % len(candidates)]
+
+    return DEFAULT_IMPERSONATE if DEFAULT_IMPERSONATE in _BROWSER_TARGETS else "chrome142"
+
+
 def _build(region: str, seed: str, target: str) -> BrowserProfile:
     navigator_language, accept_language, tz, tz_label = _REGIONS[region]
-    spec = _CHROME_TARGETS[target]
-    version = spec["version"]
-    os_family = spec["os_family"]
+    spec = _BROWSER_TARGETS[target]
     n = _seed_int(seed)
-
-    user_agent = (
-        "Mozilla/5.0 (" + spec["ua_token"] + ") "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/" + version + ".0.0.0 Safari/537.36"
-    )
+    os_family = spec["os_family"]
     screens = _SCREENS_BY_OS.get(os_family) or _SCREENS_BY_OS["macOS"]
+
+    version = ""
+    for pattern in (r"Chrome/([\d.]+)", r"Version/([\d.]+)", r"Firefox/([\d.]+)"):
+        match = re.search(pattern, spec["user_agent"])
+        if match:
+            version = match.group(1)
+            break
 
     return BrowserProfile(
         region=region,
         impersonate=target,
+        family=spec["family"],
         os_family=os_family,
-        user_agent=user_agent,
+        user_agent=spec["user_agent"],
         accept_language=accept_language,
+        accept_encoding=spec["accept_encoding"],
         navigator_language=navigator_language,
         timezone=tz,
         timezone_label=tz_label,
+        timezone_resolved=timezone_is_available(tz),
         screen=screens[n % len(screens)],
         platform=os_family,
         sec_ch_ua=spec["sec_ch_ua"],
-        chrome_version=version,
+        browser_version=version,
         hardware_concurrency=_CORES[(n >> 8) % len(_CORES)],
         device_memory=_MEMORY[(n >> 16) % len(_MEMORY)],
     )
@@ -283,6 +412,7 @@ def resolve_profile(
     seed: str | None = "",
     proxy_url: str | None = "",
     impersonate: str | None = "",
+    family: str | None = None,
     allow_network: bool = False,
 ) -> BrowserProfile:
     """Resolve one coherent profile for a session.
@@ -291,10 +421,15 @@ def resolve_profile(
     task layer which already probes the route. When it is missing the default region is
     used - we deliberately do *not* perform a network lookup here, so this stays a pure
     function that the offline preflight can call.
+
+    ``family`` defaults to ``DEFAULT_FAMILY``, which is empty - meaning Chrome, the
+    behaviour the project had before families existed. Pass ``"auto"`` to rotate across
+    Chrome/Safari/Firefox by the reference weights, or a family name to pin one.
     """
     normalized = normalize_region(region)
-    target = resolve_impersonate(impersonate)
-    return _build(normalized, str(seed or proxy_url or normalized), target)
+    material = str(seed or proxy_url or normalized)
+    target = resolve_impersonate(impersonate, seed=material, family=family)
+    return _build(normalized, material, target)
 
 
 def with_overrides(
@@ -323,9 +458,10 @@ def with_overrides(
     return replace(profile, **changes) if changes else profile
 
 
-def profile_for_extra(extra: dict | None, *, seed: str = "") -> BrowserProfile:
+def profile_for_extra(extra: dict | None, *, seed: str = "", family: str | None = None) -> BrowserProfile:
     """Convenience for callers that only have the task ``extra`` mapping."""
     data = extra or {}
     region = str(data.get("proxy_route_country") or data.get("region") or "")
     target = str(data.get("browser_impersonate") or "")
-    return resolve_profile(region, seed=seed, impersonate=target)
+    chosen = family if family is not None else str(data.get("browser_family") or "")
+    return resolve_profile(region, seed=seed, impersonate=target, family=chosen)

@@ -2,12 +2,12 @@
 """Verify the browser profile against what curl_cffi actually sends.
 
 The profile in ``core/identity_profile.py`` has to agree with the impersonated build
-in two places that are easy to get wrong and impossible to see by reading the code:
-the OS (which decides the User-Agent and the ``sec-ch-ua-platform`` hint) and the
-Chrome "GREASE" brand *and its position* in ``sec-ch-ua``, which Chrome rotates per
-build. Two public projects disagreed with each other on the Chrome 142 value, and one
-of them paired ``chrome142`` with a Windows UA even though curl_cffi's chrome142 is
-macOS - so guessing is not good enough.
+in several places that are easy to get wrong and impossible to see by reading the code:
+the OS (which decides the User-Agent and the ``sec-ch-ua-platform`` hint), the Chrome
+"GREASE" brand *and its position* in ``sec-ch-ua`` (Chrome rotates both per build),
+and whether a family sends client hints at all. Two public projects disagreed with each
+other on the Chrome 142 value, and one paired ``chrome142`` with a Windows UA even
+though curl_cffi's chrome142 is macOS - so guessing is not good enough.
 
 This script points the installed curl_cffi at a local echo server and reads back the
 headers it really sends, then compares them with the table. No external network, no
@@ -29,7 +29,7 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.identity_profile import _CHROME_TARGETS, resolve_profile  # noqa: E402
+from core.identity_profile import _BROWSER_TARGETS, resolve_profile  # noqa: E402
 
 
 class _Echo(http.server.BaseHTTPRequestHandler):
@@ -62,6 +62,46 @@ def probe(target: str, port: int) -> dict:
     return dict(_Echo.captured)
 
 
+def compare(target: str, port: int) -> tuple:
+    """Return (problems, expected_ua, expected_hints, expected_platform)."""
+    actual = probe(target, port)
+    spec = _BROWSER_TARGETS[target]
+    profile = resolve_profile("US", seed="probe", impersonate=target)
+    emitted = profile.headers()
+
+    expected_ua = actual.get("user-agent", "")
+    expected_encoding = actual.get("accept-encoding", "")
+    expected_hints = actual.get("sec-ch-ua", "")
+    expected_platform = actual.get("sec-ch-ua-platform", "")
+
+    problems = []
+    if profile.user_agent != expected_ua:
+        problems.append("UA 不一致")
+    if spec["user_agent"] != expected_ua:
+        problems.append("表里的 UA 与 curl_cffi 不一致")
+    if profile.accept_encoding != expected_encoding:
+        problems.append("Accept-Encoding 不一致")
+
+    if expected_hints:
+        if spec["sec_ch_ua"] != expected_hints:
+            problems.append("sec-ch-ua 不一致")
+        if emitted.get("sec-ch-ua") != expected_hints:
+            problems.append("headers() 的 sec-ch-ua 与 curl_cffi 不一致")
+        if emitted.get("sec-ch-ua-platform") != expected_platform:
+            problems.append("sec-ch-ua-platform 不一致")
+        if profile.platform != expected_platform.strip(chr(34)):
+            problems.append("画像 platform 与 client hint 不一致")
+    else:
+        # Safari / Firefox: curl_cffi sends no client hints, so emitting any is a tell.
+        leaked = sorted(k for k in emitted if k.lower().startswith("sec-ch-ua"))
+        if leaked:
+            problems.append("非 Chromium 却发了 " + ", ".join(leaked))
+        if spec["sec_ch_ua"]:
+            problems.append("表里给非 Chromium 填了 sec-ch-ua")
+
+    return problems, expected_ua, expected_hints, expected_platform
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--emit", action="store_true", help="print a paste-ready table")
@@ -81,47 +121,37 @@ def main() -> int:
     server, port = _serve()
     mismatches = []
     try:
-        for target in sorted(_CHROME_TARGETS):
-            actual = probe(target, port)
-            spec = _CHROME_TARGETS[target]
-            profile = resolve_profile("US", seed="probe", impersonate=target)
-
-            expected_ua = actual.get("user-agent", "")
-            expected_hint = actual.get("sec-ch-ua", "")
-            expected_platform = actual.get("sec-ch-ua-platform", "")
-
-            problems = []
-            if profile.user_agent != expected_ua:
-                problems.append("UA 不一致")
-            if spec["sec_ch_ua"] != expected_hint:
-                problems.append("sec-ch-ua 不一致")
-            if profile.headers()["sec-ch-ua-platform"] != expected_platform:
-                problems.append("sec-ch-ua-platform 不一致")
-            if profile.platform != expected_platform.strip(chr(34)):
-                problems.append("画像 platform 与 client hint 不一致")
-
+        for target in sorted(_BROWSER_TARGETS):
+            try:
+                problems, ua, hints, platform = compare(target, port)
+            except Exception as exc:
+                problems, ua, hints, platform = ["探测失败: %s" % exc], "", "", ""
+            family = _BROWSER_TARGETS[target]["family"]
             status = "OK  " if not problems else "FAIL"
-            print("%s %-10s %s" % (status, target, ", ".join(problems) or "与 curl_cffi 完全一致"))
-
+            print("%s %-16s %-11s %s" % (status, target, family, ", ".join(problems) or "与 curl_cffi 完全一致"))
             if args.emit:
-                print("    ua_token  = %r" % (expected_ua.split("(")[1].split(")")[0],))
-                print("    sec_ch_ua = %r" % expected_hint)
+                print("        \"user_agent\": %r," % ua)
+                print("        \"sec_ch_ua\": %r," % hints)
+                print("        \"accept_encoding\": %r," % (_BROWSER_TARGETS[target]["accept_encoding"],))
             if problems:
-                mismatches.append((target, expected_ua, expected_hint))
+                mismatches.append((target, ua, hints, platform, problems))
     finally:
         server.shutdown()
 
     if mismatches:
         print()
-        print("以下目标的画像与 curl_cffi 实际发送的内容不一致：")
-        for target, ua, hint in mismatches:
+        print("以下目标与 curl_cffi 实际发送的内容不一致：")
+        for target, ua, hints, platform, problems in mismatches:
             print("  %s" % target)
-            print("    实际 UA        : %s" % ua)
-            print("    实际 sec-ch-ua : %s" % hint)
+            for item in problems:
+                print("    - %s" % item)
+            print("    实际 UA          : %s" % ua)
+            print("    实际 sec-ch-ua   : %s" % (hints or "(未发送)"))
+            print("    实际 platform    : %s" % (platform or "(未发送)"))
         return 1
 
     print()
-    print("全部 %d 个目标与 curl_cffi 实际发送的头一致。" % len(_CHROME_TARGETS))
+    print("全部 %d 个目标与 curl_cffi 实际发送的头一致。" % len(_BROWSER_TARGETS))
     return 0
 
 
