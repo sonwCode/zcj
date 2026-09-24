@@ -477,8 +477,10 @@ class OutlookEmailMailbox(BaseMailbox):
         before_ids: set = None,
         code_pattern: str = None,
     ) -> str:
+        from core.registration.otp import extract_otp
+
         seen = set(before_ids or [])
-        pattern = re.compile(code_pattern or DEFAULT_CODE_PATTERN)
+        pattern = re.compile(code_pattern) if code_pattern else None
         started = time.time()
         last_error: Exception | None = None
 
@@ -492,9 +494,14 @@ class OutlookEmailMailbox(BaseMailbox):
                     if not self._matches_keyword(mail, keyword):
                         continue
                     text = re.sub(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", " ", self._message_text(mail))
-                    match = pattern.search(text)
-                    if match:
-                        return match.group(1) if match.groups() else match.group(0)
+                    code = extract_otp(
+                        text,
+                        subject=str(mail.get("subject") or ""),
+                        sender=str(mail.get("from") or ""),
+                        code_pattern=pattern,
+                    )
+                    if code:
+                        return code
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
             time.sleep(self.poll_interval)

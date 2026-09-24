@@ -1250,10 +1250,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         return ""
 
     @staticmethod
-    def _extract_code(raw: str, pattern: re.Pattern) -> str:
+    def _extract_code(raw: str, pattern: re.Pattern | None = None) -> str:
+        from core.registration.otp import extract_otp
+
         text = LocalMicrosoftMailboxPool._clean_search_text(str(raw or ""))
-        match = pattern.search(text)
-        return match.group(1) if match and match.groups() else (match.group(0) if match else "")
+        return extract_otp(text, code_pattern=pattern)
 
     def _mailbox_url_snapshot(self, entry: LocalMicrosoftMailboxEntry, pattern: re.Pattern | None = None) -> dict:
         if not entry.url_ready:
@@ -1268,7 +1269,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         raw = response.text or ""
         if response.status_code != 200:
             raise RuntimeError(f"接码 API 读取失败: HTTP {response.status_code} {raw[:200]}")
-        code_pattern = pattern or re.compile(r"(?<!#)(?<!\d)(\d{6})(?!\d)")
+        code_pattern = pattern
         code = ""
         received_at = ""
         try:
@@ -1428,8 +1429,10 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         before_ids: set = None,
         code_pattern: str = None,
     ) -> str:
+        from core.registration.otp import extract_otp
+
         seen = set(before_ids or [])
-        pattern = re.compile(code_pattern or r"(?<!#)(?<!\d)(\d{6})(?!\d)")
+        pattern = re.compile(code_pattern) if code_pattern else None
         start = time.time()
         entry = self._entry_for_account(account)
         poll_interval = self.mailbox_url_poll_interval if entry.url_ready else 5
@@ -1447,9 +1450,14 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 code = str(mail.get("code") or "")
                 if code:
                     return code
-                match = pattern.search(text)
-                if match:
-                    return match.group(1) if match.groups() else match.group(0)
+                code = extract_otp(
+                    text,
+                    subject=str(mail.get("subject") or ""),
+                    sender=str(mail.get("from") or mail.get("sender") or ""),
+                    code_pattern=pattern,
+                )
+                if code:
+                    return code
             time.sleep(poll_interval)
         raise TimeoutError(f"等待验证码超时 ({timeout}s)")
 

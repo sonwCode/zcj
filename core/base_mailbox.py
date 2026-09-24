@@ -17,6 +17,13 @@ DEFAULT_TEMPMAIL_LOL_API_URL = "https://api.tempmail.lol/v2"
 DEFAULT_TEMPMAIL_WEB_BASE_URL = "https://web2.temp-mail.org"
 
 
+def _extract_otp(text: str, **kwargs) -> str:
+    """Lazy wrapper so importing this module never pulls in the registration package."""
+    from core.registration.otp import extract_otp
+
+    return extract_otp(text, **kwargs)
+
+
 @dataclass
 class MailboxAccount:
     email: str
@@ -468,7 +475,7 @@ class LaoudoMailbox(BaseMailbox):
 
     def wait_for_code(self, account: MailboxAccount, keyword: str = "trae",
                       timeout: int = 120, before_ids: set = None, code_pattern: str = None) -> str:
-        import re, time
+        import time
         from curl_cffi import requests as curl_requests
         seen = set(before_ids) if before_ids else set()
         start = time.time()
@@ -492,9 +499,9 @@ class LaoudoMailbox(BaseMailbox):
                                 str(mail.get("content") or mail.get("html") or ""))
                         if keyword and keyword.lower() not in text.lower():
                             continue
-                        m = re.search(code_pattern or r'(?<!#)(?<!\d)(\d{6})(?!\d)', text)
-                        if m:
-                            return m.group(1) if m.groups() else m.group(0)
+                        code = _extract_otp(text, subject=str(mail.get("subject") or ""), code_pattern=code_pattern)
+                        if code:
+                            return code
             except Exception:
                 pass
             time.sleep(4)
@@ -553,7 +560,7 @@ class AitreMailbox(BaseMailbox):
 
     def wait_for_code(self, account: MailboxAccount, keyword: str = "trae",
                       timeout: int = 120, before_ids: set = None, code_pattern: str = None) -> str:
-        import re, time, requests
+        import time, requests
         seen = set(before_ids) if before_ids else set()
         last_check = None
         start = time.time()
@@ -575,9 +582,9 @@ class AitreMailbox(BaseMailbox):
                         text = mail.get("preview", "") + mail.get("content", "")
                         if keyword and keyword.lower() not in text.lower():
                             continue
-                        m = re.search(code_pattern or r'(?<!#)(?<!\d)(\d{6})(?!\d)', text)
-                        if m:
-                            return m.group(1) if m.groups() else m.group(0)
+                        code = _extract_otp(text, code_pattern=code_pattern)
+                        if code:
+                            return code
             except Exception:
                 pass
             time.sleep(3)
@@ -662,7 +669,7 @@ class TempMailLolMailbox(BaseMailbox):
 
     def wait_for_code(self, account: MailboxAccount, keyword: str = "",
                       timeout: int = 120, before_ids: set = None, code_pattern: str = None) -> str:
-        import re, time, requests
+        import time, requests
         seen = set(before_ids or [])
         start = time.time()
         new_mail_count = 0
@@ -682,9 +689,12 @@ class TempMailLolMailbox(BaseMailbox):
                     print(f"[TempMailLol] 新邮件 #{new_mail_count} id={mid} subject={str(mail.get('subject', ''))[:80]}")
                     if keyword and keyword.lower() not in text.lower():
                         continue
-                    m = re.search(code_pattern or r'(?<!#)(?<!\d)(\d{6})(?!\d)', text)
-                    if m:
-                        code_val = m.group(1) if m.groups() else m.group(0)
+                    code_val = _extract_otp(
+                        text,
+                        subject=str(mail.get("subject") or ""),
+                        code_pattern=code_pattern,
+                    )
+                    if code_val:
                         print(f"[TempMailLol] 匹配到验证码: {code_val}")
                         return code_val
                     print(f"[TempMailLol] 邮件未匹配验证码 text[:150]={text[:150]}")
@@ -899,10 +909,11 @@ class TempMailWebMailbox(BaseMailbox):
             str(message.get(key) or "")
             for key in ("subject", "body", "text", "content", "html")
         )
-        match = re.search(code_pattern or r"(?<!#)(?<!\d)(\d{6})(?!\d)", text)
-        if not match:
-            return ""
-        return match.group(1) if match.groups() else match.group(0)
+        return _extract_otp(
+            text,
+            subject=str(message.get("subject") or ""),
+            code_pattern=code_pattern,
+        )
 
     def get_current_ids(self, account: MailboxAccount) -> set:
         try:
@@ -1094,8 +1105,8 @@ class DuckMailMailbox(BaseMailbox):
                     except Exception:
                         body = str(msg.get("subject") or "")
                     body = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '', body)
-                    m = re.search(r"(?<!#)(?<!\d)(\d{6})(?!\d)", body)
-                    if m: return m.group(1)
+                    code = _extract_otp(body)
+                    if code: return code
             except Exception:
                 pass
             time.sleep(3)
@@ -1436,10 +1447,9 @@ class CFWorkerMailbox(BaseMailbox):
                     # 排除时间戳模式 m=+XXXXXX. 和 t=XXXXXXXXXX
                     search_text = re.sub(r'm=\+\d+\.\d+', '', search_text)
                     search_text = re.sub(r'\bt=\d+\b', '', search_text)
-                    m = re.search(code_pattern or r'(?<!#)(?<!\d)(\d{6})(?!\d)', search_text)
-                    if m:
-                        code_val = m.group(1) if m.groups() else m.group(0)
-                        print(f"[CFWorker] 匹配到验证码 (regex): {code_val}")
+                    code_val = _extract_otp(search_text, code_pattern=code_pattern)
+                    if code_val:
+                        print(f"[CFWorker] 匹配到验证码: {code_val}")
                         return code_val
                     # 没有匹配到验证码，打印 raw 前 150 字符帮助诊断
                     print(f"[CFWorker] 邮件未匹配验证码 raw[:150]={raw[:150]}")
@@ -1720,11 +1730,12 @@ class MoeMailMailbox(BaseMailbox):
                     seen.add(mid)
                     body = str(msg.get("content") or msg.get("text") or msg.get("body") or msg.get("html") or "") + " " + str(msg.get("subject") or "")
                     body = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '', body)
-                    if pattern:
-                        m = pattern.search(body)
-                    else:
-                        m = re.search(code_pattern or r'(?<!#)(?<!\d)(\d{6})(?!\d)', body)
-                    if m: return m.group(1) if m.groups() else m.group(0) if code_pattern else m.group(1)
+                    code = _extract_otp(
+                        body,
+                        subject=str(msg.get("subject") or ""),
+                        code_pattern=pattern or code_pattern,
+                    )
+                    if code: return code
             except Exception:
                 pass
             time.sleep(3)
@@ -1849,7 +1860,7 @@ class FreemailMailbox(BaseMailbox):
 
     def wait_for_code(self, account: MailboxAccount, keyword: str = "",
                       timeout: int = 120, before_ids: set = None, code_pattern: str = None) -> str:
-        import re, time
+        import time
         seen = set(before_ids or [])
         start = time.time()
         while time.time() - start < timeout:
@@ -1866,8 +1877,8 @@ class FreemailMailbox(BaseMailbox):
                         return code
                     # 兜底：从 preview 提取
                     text = str(msg.get("preview", "")) + " " + str(msg.get("subject", ""))
-                    m = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
-                    if m: return m.group(1)
+                    code = _extract_otp(text)
+                    if code: return code
             except Exception:
                 pass
             time.sleep(3)
@@ -2049,9 +2060,9 @@ class TestmailMailbox(BaseMailbox):
                     if keyword and keyword.lower() not in text.lower():
                         continue
                     text = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '', text)
-                    match = pattern.search(text) if pattern else re.search(r'(?<!#)(?<!\d)(\d{6})(?!\d)', text)
-                    if match:
-                        return match.group(1) if match.groups() else match.group(0)
+                    code = _extract_otp(text, code_pattern=pattern)
+                    if code:
+                        return code
             except Exception:
                 pass
             time.sleep(3)
@@ -2161,7 +2172,7 @@ class DDGEmailMailbox(BaseMailbox):
         if not self.imap_user or not self.imap_pass:
             raise RuntimeError("DDG Email 未配置 IMAP（ddg_imap_user / ddg_imap_pass），无法读取验证码")
 
-        pattern = code_pattern or r'(?<!\d)(\d{6})(?!\d)'
+        pattern = re.compile(code_pattern) if code_pattern else None
         start = time.time()
         seen_ids: set[bytes] = set()
         baseline_done = False
@@ -2231,9 +2242,8 @@ class DDGEmailMailbox(BaseMailbox):
                     combined = re.sub(r'<style[^>]*>.*?</style>', '', combined, flags=re.DOTALL | re.IGNORECASE)
                     combined = re.sub(r'<script[^>]*>.*?</script>', '', combined, flags=re.DOTALL | re.IGNORECASE)
                     combined = re.sub(r'<[^>]+>', ' ', combined)
-                    m = re.search(pattern, combined)
-                    if m:
-                        code = m.group(1) if m.groups() else m.group(0)
+                    code = _extract_otp(combined, code_pattern=pattern)
+                    if code:
                         print(f"[DDG Email] IMAP 获取验证码: {code}")
                         return code
 

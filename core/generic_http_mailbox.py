@@ -9,7 +9,6 @@
 """
 from __future__ import annotations
 
-import re
 import time
 from copy import deepcopy
 from urllib.parse import urlencode
@@ -398,11 +397,12 @@ class GenericHttpMailbox(BaseMailbox):
                     if not combined.strip():
                         continue
 
-                    # 正则提取验证码
-                    pattern = code_pattern or r'(?<!\d)(\d{6})(?!\d)'
-                    m = re.search(pattern, combined)
-                    if m:
-                        return m.group(1) if m.groups() else m.group(0)
+                    # 候选打分：优先贴近验证关键字、且发件人可信的那个
+                    from core.registration.otp import extract_otp
+
+                    code = extract_otp(combined, code_pattern=code_pattern)
+                    if code:
+                        return code
 
             except Exception:
                 pass
