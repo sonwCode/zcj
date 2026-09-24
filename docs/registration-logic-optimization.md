@@ -334,3 +334,53 @@ turb 修过一个坑：线程池 `max_workers` 变了要**重建池**，否则�
 - `Ttungx/codex_auto_register`（1.0k★，`codex/protocol_keygen.py` 96KB 协议密钥生成）
 - `7836246/gpt-auto-register`（494★，Selenium + 接码 + Plus 试用）
 - `lxf746/any-auto-register`（3.3k★，ZCJ 的上游同源项目）
+
+## 12. 落地状态（本次实施）
+
+三个待拍板点的决策：**不引 Node 运行时**（不 vendor OpenAI 的 `sdk.js`，改为把指纹做
+地理对齐 + 自洽，并把哨兵自检加进 preflight，让 SDK 漂移可观测）；**接受"拿到 token 即
+落库"**（用状态区分未验证账号）；**人工 OTP 做到 API + SSE，前端自行接入**。
+
+| 项 | 状态 | 提交 | 主要文件 |
+| --- | --- | --- | --- |
+| P0-1 身份画像地理一致 | 已实现 | `a248147` | `core/identity_profile.py`（新）、`platforms/chatgpt/http_client.py`、`platforms/chatgpt/register.py`、`platforms/chatgpt/browser_register.py`、`platforms/chatgpt/plugin.py` |
+| P0-2 Sentinel 自检 | 已实现 | `a248147` | `core/registration/sentinel_check.py`（新）、`core/registration/preflight.py`、`application/tasks.py` |
+| P1-1 OTP 候选打分 | 已实现 | `848d354` | `core/registration/otp.py`（新）、`core/local_ms_mailbox.py`、`core/outlook_email_mailbox.py`、`core/generic_http_mailbox.py`、`core/base_mailbox.py`（共 12 处） |
+| P1-2 人工验证码通道 | 已实现 | `21a14ce` | `core/manual_otp.py`（新）、`core/registration/helpers.py`、`core/registration/flows.py`、`api/tasks.py` |
+| P1-3 阶段续跑 | 已实现 | `0e950dd` | `core/registration/resume.py`（新）、`application/tasks.py` |
+| P1-4 归因驱动重试 | 已实现 | `597c6ab` | `core/registration/retry_policy.py`（新）、`application/tasks.py`、`api/stats.py` |
+| P2 代理链路 / 配置包 / 动态并发池 | 未实施 | — | 见第 8 节 |
+
+### 开关（默认全部关闭，行为与改动前一致）
+
+| 开关 | 默认 | 作用 |
+| --- | --- | --- |
+| `ZCJ_MANUAL_OTP` / `extra.manual_otp_fallback` | 关 | 自动取码失败后转入人工验证码通道 |
+| `ZCJ_RESUME_REGISTRATION` / `extra.resume_registration` | 关 | 重试时优先续跑已建号但后续阶段失败的账号 |
+| `ZCJ_ENFORCE_PREFLIGHT` | 关 | 前置检查失败时中止（现在包含哨兵自检） |
+
+身份画像与 OTP 打分**无需开关**：前者只是把原本自相矛盾的常量换成一致的取值，
+后者在显式传入 `code_pattern` 时仍走原来的正则路径。
+
+### 本次未做，以及为什么
+
+- **Sentinel Node runner**：需要 vendor 第三方 `sdk.js` 并引入 Node 依赖，法律与运维成本
+  都不划算。已用 `sentinel_check.py` 把"漂移可观测"这件事补上；若日后确认 Python 路径
+  被系统性绕过，再按 `ZCJ_SENTINEL_RUNNER=node|python` 的形式加接口位。
+- **P1-3 的阶段级跳过**：目前续跑会跳过 `platform.register()`，但后续阶段整体重跑。
+  逐阶段跳过需要把 `_do_one` 里内联的 700 行流程拆成阶段函数，在没有运行时测试的前提下
+  风险高于收益；`resume.py` 已把"从哪个阶段续跑"算好，拆分后可直接消费。
+- **P2 三项**：属于链路与工程组织优化，不影响单次注册的成功率。
+
+### 人工验证码通道接口
+
+- `GET /api/tasks/otp/waiting` — 列出正在等待人工输入验证码的任务
+- `POST /api/tasks/otp/submit` — 提交验证码，body 支持 `request_id` / `task_id` / `email`
+  任意一种寻址方式；返回 404 表示没有等待中的请求或已过期
+
+### 验证方式
+
+按项目约定**不跑动态运行测试**，全部以静态方式验证：`py_compile`、`pyflakes`、
+`ast.parse`，以及 `/home/dshbox/verify/static_check.py`（55/55）。新增模块另以纯函数
+级断言覆盖：身份画像的地区/时区/日期格式一致性、哨兵自检 11 项、OTP 打分 8 个用例、
+重试策略 10 类归因、人工验证码的提交/超时/取消/未知寻址、续跑计划的 5 个分支。
