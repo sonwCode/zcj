@@ -134,17 +134,36 @@ def check_browser_profile(profile: str) -> PreflightCheck:
     )
 
 
+def check_sentinel() -> PreflightCheck:
+    """Verify the Python Sentinel solver still yields a coherent payload.
+
+    OpenAI ships new ``sdk.js`` builds regularly and ZCJ reimplements the SDK VM
+    in Python, so a shape change breaks signup silently — and only after the proxy
+    and mailbox have already been paid for. This check is offline and cheap.
+    """
+    try:
+        from core.registration.sentinel_check import run_sentinel_self_test
+    except Exception as exc:
+        return PreflightCheck("sentinel", True, f"跳过: {exc}", required=False)
+    report = run_sentinel_self_test()
+    return PreflightCheck("sentinel", report.ok, report.summary())
+
+
+
 def run_preflight(
     *,
     require_browser: bool = False,
     browser_profile: str = "",
     extra_checks: Sequence[PreflightCheck] = (),
+    sentinel: bool = False,
 ) -> PreflightReport:
     checks: list[PreflightCheck] = [
         check_python(),
         check_curl_cffi(),
         check_http_stack(),
     ]
+    if sentinel:
+        checks.append(check_sentinel())
     if require_browser or browser_profile:
         browser = check_browser_stack()
         checks.append(browser if require_browser else PreflightCheck(
@@ -160,11 +179,13 @@ def assert_preflight(
     require_browser: bool = False,
     browser_profile: str = "",
     extra_checks: Iterable[PreflightCheck] = (),
+    sentinel: bool = False,
 ) -> PreflightReport:
     report = run_preflight(
         require_browser=require_browser,
         browser_profile=browser_profile,
         extra_checks=tuple(extra_checks),
+        sentinel=sentinel,
     )
     if not report.ok:
         raise PreflightError(report)

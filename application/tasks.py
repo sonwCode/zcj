@@ -2718,6 +2718,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             browser_profile=str(
                 extra.get("browser_profile") or extra.get("camoufox_profile") or ""
             ),
+            sentinel=platform_name == "chatgpt",
         )
         for check in preflight_report.checks:
             if not check.ok:

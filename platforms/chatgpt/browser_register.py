@@ -2310,10 +2310,11 @@ def _decode_jwt_payload(token: str) -> dict:
 
 
 class _SentinelTokenGenerator:
-    def __init__(self, device_id: str, user_agent: str):
+    def __init__(self, device_id: str, user_agent: str, profile=None):
         self.device_id = device_id or str(uuid.uuid4())
         self.user_agent = user_agent or _random_chrome_ua()
         self.sid = str(uuid.uuid4())
+        self.profile = profile
 
     @staticmethod
     def _fnv1a32(text: str) -> str:
@@ -2334,17 +2335,31 @@ class _SentinelTokenGenerator:
 
     def _config(self) -> list:
         perf_now = 1000 + random.random() * 49000
+        profile = getattr(self, "profile", None)
+        if profile is not None:
+            screen = profile.screen
+            date_string = profile.js_date_string()
+            navigator_language = profile.navigator_language
+            hardware_concurrency = profile.hardware_concurrency
+        else:
+            screen = "1920x1080"
+            date_string = time.strftime(
+                "%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)",
+                time.gmtime(),
+            )
+            navigator_language = "en-US"
+            hardware_concurrency = random.choice([4, 8, 12, 16])
         return [
-            "1920x1080",
-            time.strftime("%a, %d %b %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
+            screen,
+            date_string,
             4294705152,
             random.random(),
             self.user_agent,
             SENTINEL_SDK_URL,
             None,
             None,
-            "en-US",
-            "en-US,en",
+            navigator_language,
+            navigator_language,
             random.random(),
             "webkitTemporaryStorage−undefined",
             "location",
@@ -2352,7 +2367,7 @@ class _SentinelTokenGenerator:
             perf_now,
             self.sid,
             "",
-            random.choice([4, 8, 12, 16]),
+            hardware_concurrency,
             int(time.time() * 1000 - perf_now),
         ]
 
@@ -2416,8 +2431,40 @@ def _browser_fetch(page, url: str, *, method: str = "GET", headers: dict | None 
     )
 
 
-def _build_browser_sentinel_token(page, device_id: str, flow: str, user_agent: str) -> str:
-    generator = _SentinelTokenGenerator(device_id, user_agent)
+def _browser_profile_from_page(page, fallback=None):
+    """Overlay the live browser identity onto the resolved profile."""
+    from core.identity_profile import resolve_profile, with_overrides
+
+    base = fallback or resolve_profile()
+    try:
+        info = page.evaluate(
+            "() => ({ lang: navigator.language || '',"
+            " tz: (Intl.DateTimeFormat().resolvedOptions().timeZone) || '',"
+            " screen: (window.screen && window.screen.width ?"
+            " window.screen.width + 'x' + window.screen.height : ''),"
+            " cores: navigator.hardwareConcurrency || 0 })"
+        )
+    except Exception:
+        return base
+    if not isinstance(info, dict):
+        return base
+    try:
+        cores = int(info.get("cores") or 0)
+    except Exception:
+        cores = 0
+    return with_overrides(
+        base,
+        screen=str(info.get("screen") or ""),
+        navigator_language=str(info.get("lang") or ""),
+        timezone=str(info.get("tz") or ""),
+        hardware_concurrency=cores,
+    )
+
+
+def _build_browser_sentinel_token(page, device_id: str, flow: str, user_agent: str, profile=None) -> str:
+    if profile is None:
+        profile = _browser_profile_from_page(page)
+    generator = _SentinelTokenGenerator(device_id, user_agent, profile)
     req_body = json.dumps(
         {"p": generator.generate_requirements_token(), "id": device_id, "flow": flow},
         separators=(",", ":"),
@@ -5337,9 +5384,15 @@ class ChatGPTBrowserRegister:
         backend_config: Optional[BrowserBackendConfig] = None,
         post_register_in_browser: Optional[Callable[[Any, dict], dict]] = None,
         startup_timeout: int = 45,
+        proxy_region: str = "",
     ):
         self.headless = headless
         self.proxy = proxy
+        # 地理一致的画像：Chrome 上下文的 locale/timezone 与 Sentinel 载荷共用，
+        # 避免「代理出口在 JP、浏览器却说 en-US/UTC」这种自相矛盾。
+        from core.identity_profile import resolve_profile
+
+        self.browser_profile = resolve_profile(proxy_region, seed=str(uuid.uuid4()))
         self.otp_callback = otp_callback
         self.phone_callback = phone_callback
         self.log = log_fn
@@ -5519,9 +5572,16 @@ class ChatGPTBrowserRegister:
                     self.log(f"系统 Chrome 启动失败，改用 Playwright 自带 Chromium: {str(chrome_exc)[:160]}")
                     browser = pw.chromium.launch(**launch_opts)
 
+                profile = self.browser_profile
+                width, _, height = profile.screen.partition("x")
                 context = browser.new_context(
-                    viewport={"width": 1280, "height": 720},
-                    user_agent=_random_chrome_ua(),
+                    viewport={
+                        "width": int(width or 1280),
+                        "height": int(height or 720),
+                    },
+                    user_agent=profile.user_agent,
+                    locale=profile.navigator_language,
+                    timezone_id=profile.timezone,
                 )
                 context.set_default_timeout(90000)
                 self.log("Playwright Chromium 上下文已打开，准备创建页面")

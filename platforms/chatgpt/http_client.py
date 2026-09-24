@@ -27,7 +27,8 @@ class OpenAIHTTPClient(HTTPClient):
     def __init__(
         self,
         proxy_url: Optional[str] = None,
-        config: Optional[RequestConfig] = None
+        config: Optional[RequestConfig] = None,
+        profile: Optional[Any] = None,
     ):
         """
         初始化 OpenAI HTTP 客户端
@@ -41,30 +42,29 @@ class OpenAIHTTPClient(HTTPClient):
         super().__init__(proxy_url, config)
 
         # OpenAI 特定的默认配置
-        # 默认请求头
-        self.default_headers = {
-            "User-Agent": CHATGPT_USER_AGENT,
-            "sec-ch-ua": CHATGPT_SEC_CH_UA,
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-ch-ua-mobile": "?0",
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
-        }
+        # 请求头统一从地理一致的浏览器画像派生（core.identity_profile），
+        # 避免「代理出口在 JP、指纹却说 UTC/en-US」这种自相矛盾。
+        if profile is None:
+            from core.identity_profile import resolve_profile
+
+            profile = resolve_profile()
+        self.browser_profile = profile
+        self.default_headers = profile.headers()
 
     def get_chatgpt_headers(self, referer: str = "https://chatgpt.com/login") -> Dict[str, str]:
         """Headers for the chatgpt.com NextAuth API boundary."""
+        profile = getattr(self, "browser_profile", None)
+        if profile is None:
+            from core.identity_profile import resolve_profile
+
+            profile = resolve_profile()
         return {
-            "User-Agent": CHATGPT_USER_AGENT,
-            "sec-ch-ua": CHATGPT_SEC_CH_UA,
-            "sec-ch-ua-platform": '"Windows"',
+            "User-Agent": profile.user_agent,
+            "sec-ch-ua": profile.sec_ch_ua,
+            "sec-ch-ua-platform": '"%s"' % profile.platform,
             "sec-ch-ua-mobile": "?0",
             "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
+            "accept-language": profile.accept_language,
             "sec-fetch-site": "same-origin",
             "sec-fetch-mode": "cors",
             "sec-fetch-dest": "empty",
@@ -224,7 +224,8 @@ def create_http_client(
 
 def create_openai_client(
     proxy_url: Optional[str] = None,
-    config: Optional[RequestConfig] = None
+    config: Optional[RequestConfig] = None,
+    profile: Optional[Any] = None,
 ) -> OpenAIHTTPClient:
     """
     创建 OpenAI HTTP 客户端工厂函数
@@ -236,4 +237,4 @@ def create_openai_client(
     Returns:
         OpenAIHTTPClient 实例
     """
-    return OpenAIHTTPClient(proxy_url, config)
+    return OpenAIHTTPClient(proxy_url, config, profile)

@@ -350,13 +350,15 @@ class _SentinelTokenGenerator:
 
 
 
-    def __init__(self, device_id: str, user_agent: str):
+    def __init__(self, device_id: str, user_agent: str, profile=None):
 
         self.device_id = device_id or str(uuid.uuid4())
 
         self.user_agent = user_agent
 
         self.sid = str(uuid.uuid4())
+
+        self.profile = profile
 
 
 
@@ -397,12 +399,27 @@ class _SentinelTokenGenerator:
     def _config(self) -> list:
 
         perf_now = 1000 + random.random() * 49000
+        profile = getattr(self, "profile", None)
+        if profile is not None:
+            # 与出口 IP 一致：分辨率/时区/locale 都从画像取。
+            screen = profile.screen
+            date_string = profile.js_date_string()
+            navigator_language = profile.navigator_language
+            hardware_concurrency = profile.hardware_concurrency
+        else:
+            screen = "1920x1080"
+            date_string = time.strftime(
+                "%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)",
+                time.gmtime(),
+            )
+            navigator_language = "en-US"
+            hardware_concurrency = random.choice([4, 8, 12, 16])
 
         return [
 
-            "1920x1080",
+            screen,
 
-            time.strftime("%a, %d %b %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
+            date_string,
 
             4294705152,
 
@@ -416,9 +433,9 @@ class _SentinelTokenGenerator:
 
             None,
 
-            "en-US",
+            navigator_language,
 
-            "en-US,en",
+            navigator_language,
 
             random.random(),
 
@@ -434,7 +451,7 @@ class _SentinelTokenGenerator:
 
             "",
 
-            random.choice([4, 8, 12, 16]),
+            hardware_concurrency,
 
             int(time.time() * 1000 - perf_now),
 
@@ -542,11 +559,22 @@ class RegistrationEngine:
 
         self.preflight_location = str(preflight_location or "").strip().upper()
 
+        # 地理一致的浏览器画像：时区 / locale / UA 跟随代理出口地区，
+        # 硬件字段按会话种子变化，避免所有账号共用同一指纹。
+        from core.identity_profile import resolve_profile
 
+        self._profile_seed = str(task_uuid or uuid.uuid4())
+        self.browser_profile = resolve_profile(
+            self.preflight_location,
+            seed=self._profile_seed,
+        )
 
         # 创建 HTTP 客户端
 
-        self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
+        self.http_client = OpenAIHTTPClient(
+            proxy_url=proxy_url,
+            profile=self.browser_profile,
+        )
 
 
 
@@ -1045,7 +1073,10 @@ class RegistrationEngine:
 
         try:
 
-            self.http_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
+            self.http_client = OpenAIHTTPClient(
+                proxy_url=self.proxy_url,
+                profile=getattr(self, "browser_profile", None),
+            )
 
             return self._init_session()
 
@@ -1134,7 +1165,7 @@ class RegistrationEngine:
 
             ua = self.http_client.default_headers.get("User-Agent", "")
 
-            generator = _SentinelTokenGenerator(did, ua)
+            generator = _SentinelTokenGenerator(did, ua, getattr(self, "browser_profile", None))
 
             sent_p = generator.generate_requirements_token()
 
@@ -2484,7 +2515,10 @@ class RegistrationEngine:
 
             # 1. 创建新 HTTP client + session
 
-            login_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
+            login_client = OpenAIHTTPClient(
+                proxy_url=self.proxy_url,
+                profile=getattr(self, "browser_profile", None),
+            )
 
             login_session = login_client.session
 
@@ -2530,7 +2564,7 @@ class RegistrationEngine:
 
                 ua = login_client.default_headers.get("User-Agent", "")
 
-                generator = _SentinelTokenGenerator(did, ua)
+                generator = _SentinelTokenGenerator(did, ua, getattr(self, "browser_profile", None))
 
                 sent_p = generator.generate_requirements_token()
 
@@ -2743,7 +2777,7 @@ class RegistrationEngine:
 
                     ua2 = login_client.default_headers.get("User-Agent", "")
 
-                    gen2 = _SentinelTokenGenerator(did, ua2)
+                    gen2 = _SentinelTokenGenerator(did, ua2, getattr(self, "browser_profile", None))
 
                     sp2 = gen2.generate_requirements_token()
 

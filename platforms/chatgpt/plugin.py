@@ -748,6 +748,7 @@ class ChatGPTPlatform(BasePlatform):
                     ("chatgpt_browser_startup_timeout", "browser_startup_timeout"),
                     45,
                 ),
+                proxy_region=str((ctx.extra or {}).get("proxy_route_country") or ""),
             )
 
         def _run_browser_register(worker, ctx, artifacts):
