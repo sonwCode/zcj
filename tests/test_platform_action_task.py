@@ -1265,6 +1265,17 @@ def test_chatgpt_register_task_leases_distinct_pool_proxies_per_concurrent_attem
                 self.acquired.append(value)
                 return value
 
+        # Production resolves the route through the tier-reporting variants
+        # (next_route peeks, acquire_route leases) so the decision can record which
+        # tier supplied it. The fake stands in for ProxyPool, so it has to expose the
+        # same interface - without these the registration path dies with an
+        # AttributeError before it ever attempts a registration.
+        def next_route(self, region=""):
+            return self.get_next(region), "pool"
+
+        def acquire_route(self, region=""):
+            return self.acquire_next(region), "pool"
+
         def release(self, url):
             with self._lock:
                 self.released.append(url)
