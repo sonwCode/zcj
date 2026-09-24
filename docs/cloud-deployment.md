@@ -155,7 +155,39 @@ dry-run、分批和关闭开关。
   `OPAI_DEBUG_WORKSPACE_DIR`（默认 `debug/workspace_step2`，相对路径）。
   文件名带时间戳，**会一直累积**。不需要排障就把它指到 `/tmp` 或定期清理。
 
-## 10. 横向扩容
+## 10. 部署前预检
+
+`scripts/cloud_preflight.py` 把"只在服务器上才复现"的问题在启动前查一遍。
+只读、不联网，有 FAIL 时退出码非零：
+
+```bash
+python3 scripts/cloud_preflight.py          # 完整报告
+python3 scripts/cloud_preflight.py --quiet  # 只在有警告/失败时输出
+```
+
+入口脚本默认会在启动前跑一次（`--quiet`），结果进容器日志；
+设 `ZCJ_PREFLIGHT=0` 可关掉。它失败不阻止启动——硬性拦截在入口脚本的 guard 里。
+
+覆盖的检查：
+
+| 检查 | 为什么 |
+| --- | --- |
+| Python 版本 ≥ 3.10 | 代码用了 `X \| None` 语法 |
+| 核心依赖可导入 | fastapi / sqlmodel / sqlalchemy / curl_cffi |
+| **时区库 33 个地区全部可解析** | 缺 tzdata 会让载荷时区退化成 UTC，与出口 IP 矛盾，且只在精简镜像上复现 |
+| `APP_PASSWORD` | 为空等于所有 `/api` 接口无鉴权 |
+| `UVICORN_WORKERS` | 多 worker 会重复派发任务 |
+| X display | 设了 `DISPLAY` 但 socket 不存在 → 有头浏览器起不来 |
+| Chrome/Chromium | 浏览器路径需要 |
+| `/dev/shm` ≥ 256MB | Docker 默认 64MB，Chrome 会崩 |
+| 数据库目录可写 | 挂载卷权限 |
+| 磁盘剩余 ≥ 2GB | 任务事件表持续增长 |
+| 日志保留未关闭 | 全关掉就是无限增长 |
+| VNC 有密码且绑回环 | 否则等于开放远程接管 |
+
+`tests/test_cloud_preflight.py` 覆盖了每个 FAIL/WARN 分支（15 个测试）。
+
+## 11. 横向扩容
 
 因为调度器是进程内单例，扩容单位是**容器**，不是 worker：
 

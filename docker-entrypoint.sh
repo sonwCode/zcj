@@ -84,6 +84,14 @@ else
     log "VNC 未启用（需要时设 VNC_ENABLED=1 与 VNC_PASSWORD）。"
 fi
 
+# --- 部署前预检 -------------------------------------------------------------
+# 只读、不联网，把环境问题打进日志而不是让它变成线上才发现的静默退化
+# （缺 tzdata 导致时区退化成 UTC、/dev/shm 太小导致 Chrome 崩、磁盘快满等）。
+# 硬性拦截在上面几个 guard 里，这里失败也不阻止启动。
+if [ "${ZCJ_PREFLIGHT:-1}" = "1" ] && [ -f scripts/cloud_preflight.py ]; then
+    python3 scripts/cloud_preflight.py --quiet || true
+fi
+
 log "启动 uvicorn: ${APP_HOST}:${APP_PORT}（单进程，优雅退出 ${APP_GRACEFUL_SHUTDOWN_SECONDS}s）"
 exec uvicorn main:app \
     --host "${APP_HOST}" \
