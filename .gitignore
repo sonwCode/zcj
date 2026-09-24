@@ -57,6 +57,7 @@ docs/*
 !docs/telemetry-and-runtime.md
 !docs/optimization-roadmap.md
 !docs/chatgpt-free-registration-flow.md
+!docs/registration-logic-optimization.md
 
 # macOS
 .DS_Store
