@@ -43,6 +43,16 @@ def ensure_oauth_browser_reuse(ctx: RegistrationContext, message: str) -> None:
         raise BrowserReuseRequiredError(message)
 
 
+def manual_otp_enabled(ctx: RegistrationContext) -> bool:
+    """Manual OTP fallback is opt-in per task, then globally."""
+    import os
+
+    raw = ctx.extra.get("manual_otp_fallback")
+    if raw is None:
+        raw = os.getenv("ZCJ_MANUAL_OTP", "")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
 def build_otp_callback(
     ctx: RegistrationContext,
     *,
@@ -51,11 +61,38 @@ def build_otp_callback(
     code_pattern: str | None = None,
     wait_message: str = "等待验证码...",
     success_label: str = "验证码",
+    manual_fallback: bool = False,
+    manual_timeout: int | None = None,
 ):
     mailbox = getattr(ctx.platform, "mailbox", None)
     mail_acct = getattr(ctx.identity, "mailbox_account", None)
     if not mailbox or not mail_acct:
         return None
+
+    def _wait_manual(reason: str) -> str:
+        from core.manual_otp import manual_otp_broker
+
+        window = int(manual_timeout or timeout or 300)
+        extra = ctx.extra
+        request = manual_otp_broker.open(
+            task_id=str(extra.get("task_uuid") or extra.get("task_id") or ""),
+            email=str(getattr(ctx.identity, "email", "") or ""),
+            platform=str(getattr(ctx, "platform_name", "") or ""),
+            keyword=keyword,
+            timeout=window,
+            note=reason[:200],
+        )
+        ctx.log(
+            "已转入人工验证码通道: "
+            f"email={request.email} 窗口={window}s request={request.request_id}；"
+            "请在任务面板提交验证码"
+        )
+        code = manual_otp_broker.wait(request.request_id, timeout=window)
+        if code:
+            ctx.log(f"人工验证码已提交: {code}")
+            return code
+        ctx.log("人工验证码通道已关闭（超时或任务取消）")
+        return ""
 
     def otp_cb():
         ctx.log(wait_message)
@@ -64,9 +101,17 @@ def build_otp_callback(
             kwargs["timeout"] = timeout
         if code_pattern:
             kwargs["code_pattern"] = code_pattern
-        code = mailbox.wait_for_code(mail_acct, **kwargs)
+        try:
+            code = mailbox.wait_for_code(mail_acct, **kwargs)
+        except Exception as exc:
+            if not manual_fallback:
+                raise
+            return _wait_manual(f"自动取码失败: {exc}")
         if code:
             ctx.log(f"{success_label}: {code}")
+            return code
+        if manual_fallback:
+            return _wait_manual("自动取码未返回结果")
         return code
 
     return otp_cb

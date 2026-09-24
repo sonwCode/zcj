@@ -11,6 +11,7 @@ from .helpers import (
     ensure_mailbox_identity,
     ensure_oauth_browser_reuse,
     ensure_oauth_executor_allowed,
+    manual_otp_enabled,
 )
 from .models import RegistrationArtifacts, RegistrationContext, RegistrationResult
 
@@ -57,6 +58,8 @@ class BrowserRegistrationFlow:
                 code_pattern=self.adapter.otp_spec.code_pattern,
                 wait_message=self.adapter.otp_spec.wait_message,
                 success_label=self.adapter.otp_spec.success_label,
+                manual_fallback=manual_otp_enabled(ctx),
+                manual_timeout=self.adapter.otp_spec.timeout,
             )
         if self.adapter.link_spec:
             artifacts.verification_link_callback = build_link_callback(
@@ -109,6 +112,8 @@ class ProtocolMailboxFlow:
                 code_pattern=self.adapter.otp_spec.code_pattern,
                 wait_message=self.adapter.otp_spec.wait_message,
                 success_label=self.adapter.otp_spec.success_label,
+                manual_fallback=manual_otp_enabled(ctx),
+                manual_timeout=self.adapter.otp_spec.timeout,
             )
         if self.adapter.link_spec:
             artifacts.verification_link_callback = build_link_callback(
