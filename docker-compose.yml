@@ -3,12 +3,37 @@ services:
     build: .
     container_name: zcj-register
     ports:
+      # 只发布 API。noVNC 默认不启动；要远程接管浏览器时再单独映射 6080 到回环。
       - "0.0.0.0:8001:8000"
     environment:
       DISPLAY: ":99"
       ACCOUNT_MANAGER_DATABASE_URL: "sqlite:////app/data/account_manager.db"
       # 必填：留空会让所有 /api 接口无需鉴权，因此这里强制要求设置。
       APP_PASSWORD: "${ZCJ_APP_PASSWORD:?ZCJ_APP_PASSWORD must be set}"
+      # 有头浏览器的桌面尺寸。留默认即可；调大只会让 screen 更常见，
+      # 但所有账号仍共用同一个值——要真正的差异请用 headless。
+      XVFB_SCREEN: "${ZCJ_XVFB_SCREEN:-1920x1080x24}"
+      # 需要人工接管浏览器时取消注释，并把 6080 映射到本机回环。
+      # VNC_ENABLED: "1"
+      # VNC_PASSWORD: "${ZCJ_VNC_PASSWORD:?ZCJ_VNC_PASSWORD must be set}"
+      # VNC_BIND: "127.0.0.1"
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    # Chrome 在容器里默认只有 64MB /dev/shm，页面一多就崩。启动参数里已经有
+    # --disable-dev-shm-usage 兜底，但把 shm 放大能少走那条退化路径。
+    shm_size: "1gb"
+    # 必须大于 APP_GRACEFUL_SHUTDOWN_SECONDS（默认 30s），否则 docker stop
+    # 会在 10s 时直接 SIGKILL，正在跑的注册被腰斩。
+    stop_grace_period: 45s
+    # 云主机上给个内存上限，避免浏览器泄漏把整台机器拖垮。
+    deploy:
+      resources:
+        limits:
+          memory: ${ZCJ_MEMORY_LIMIT:-4g}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/api/ready || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3

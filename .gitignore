@@ -58,6 +58,7 @@ docs/*
 !docs/optimization-roadmap.md
 !docs/chatgpt-free-registration-flow.md
 !docs/registration-logic-optimization.md
+!docs/cloud-deployment.md
 
 # macOS
 .DS_Store
