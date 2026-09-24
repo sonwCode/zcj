@@ -193,7 +193,9 @@ def stats_diagnostics():
     from core.vault import vault_status
 
     try:
-        preflight = run_preflight().to_dict()
+        # 带上 sentinel：注册路径对 ChatGPT 会跑这项检查，诊断端点若省略，
+        # 哨兵失效时会一边报"前置检查通过"一边让注册全部失败。
+        preflight = run_preflight(sentinel=True).to_dict()
     except Exception as exc:
         preflight = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     return {
