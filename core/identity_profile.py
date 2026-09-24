@@ -128,13 +128,21 @@ class BrowserProfile:
         label = self.timezone_label or now.tzname() or "Coordinated Universal Time"
         return now.strftime("%a %b %d %Y %H:%M:%S ") + "GMT" + offset + " (" + label + ")"
 
-    def headers(self) -> dict:
-        """Default request headers, including the full client-hint set.
+    def headers(self, *, navigation: bool = False, referer: str = "", origin: str = "") -> dict:
+        """Request headers, including the full client-hint set.
 
-        A real Chrome sends the whole ``sec-ch-ua*`` family; sending only a subset is
-        itself a distinguishing signal, so every hint the browser would emit is present.
+        A real Chrome sends the whole ``sec-ch-ua*`` family, so every hint the browser
+        would emit is present. ``Accept-Encoding`` carries ``zstd`` because Chrome 123+
+        negotiates it, and omitting it while claiming 142 is a version tell.
+        ``Connection`` is deliberately absent: the transport is HTTP/2, where that
+        header is meaningless and a real Chrome never sends it.
+
+        ``navigation=True`` switches the ``Sec-Fetch-*`` group to a top-level document
+        navigation (document/navigate/none, plus user and upgrade-insecure-requests)
+        and the ``priority`` hint to ``u=0``. XHR requests use empty/cors/same-origin
+        with ``u=1``.
         """
-        return {
+        headers = {
             "User-Agent": self.user_agent,
             "sec-ch-ua": self.sec_ch_ua,
             "sec-ch-ua-full-version-list": self.sec_ch_ua_full_version_list,
@@ -144,14 +152,31 @@ class BrowserProfile:
             "sec-ch-ua-bitness": _Q + "64" + _Q,
             "sec-ch-ua-model": _Q + _Q,
             "sec-ch-ua-mobile": "?0",
-            "Accept": "application/json",
             "Accept-Language": self.accept_language,
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
         }
+        if navigation:
+            headers["Accept"] = (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,image/apng,*/*;q=0.8"
+            )
+            headers["Sec-Fetch-Dest"] = "document"
+            headers["Sec-Fetch-Mode"] = "navigate"
+            headers["Sec-Fetch-Site"] = "none"
+            headers["Sec-Fetch-User"] = "?1"
+            headers["Upgrade-Insecure-Requests"] = "1"
+            headers["priority"] = "u=0, i"
+        else:
+            headers["Accept"] = "application/json"
+            headers["Sec-Fetch-Dest"] = "empty"
+            headers["Sec-Fetch-Mode"] = "cors"
+            headers["Sec-Fetch-Site"] = "same-origin"
+            headers["priority"] = "u=1, i"
+        if referer:
+            headers["Referer"] = referer
+        if origin:
+            headers["Origin"] = origin
+        return headers
 
 
 # region -> (navigator_language, accept_language, timezone, timezone_label)

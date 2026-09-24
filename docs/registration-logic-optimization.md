@@ -427,6 +427,63 @@ _CHROME_TARGETS = {
 ZCJ 目前只有 Chrome 一个家族；扩展需要 curl_cffi 侧有对应目标（它有 Safari 与 Firefox
 目标，但都是 macOS），属于下一步。
 
+## 14. P0-4（本轮新发现）：协议路径的请求头比浏览器路径少一整层
+
+同样是看 `Regert888/gpt-auto-register` 的 `auth_flow.py::_common_headers` /
+`_navigation_headers` / `warmup` 之后发现的。ZCJ 的**浏览器**路径其实已经有这些头
+（`browser_register.py::_build_headers`、`_generate_datadog_trace_headers`、
+`upgrade-insecure-requests`），但**协议**路径一个都没有 —— 两条路径的"浏览器伪装"
+程度不一致，而协议路径是主力。
+
+### 修掉的具体问题
+
+| # | 问题 | 说明 |
+| --- | --- | --- |
+| 1 | `Accept-Encoding` 缺 `zstd` | Chrome 123+ 才协商 zstd；声称 142 却只发 `gzip, deflate, br` 是版本破绽 |
+| 2 | 发了 `Connection: keep-alive` | 传输是 HTTP/2，这个头在 h2 下无意义，真实 Chrome 不发 |
+| 3 | 缺 `priority` | Chrome 会发 `priority: u=1, i`（XHR）/ `u=0, i`（导航） |
+| 4 | 缺 Datadog RUM 追踪头 | 参考实现记录：缺少时**验证码会静默不下发** |
+| 5 | 缺 `oai-device-id` | `auth.openai.com` 侧补设备标识可提升状态机连续性 |
+| 6 | 缺预热请求 | 见下，影响最大的一条 |
+| 7 | 导航头与 XHR 头混用 | `Sec-Fetch-*` 两组值不同，原来只有一组 |
+
+### 预热（warmup）：参考实现的实测数据
+
+`/api/auth/signin/openai` 依据 chatgpt.com 的 cookie 决定返回什么：
+
+- 有**服务端下发**的 `oai-did` → 返回 `auth.openai.com/authorize` URL
+- 没有 → 返回 NextAuth 页面，到 `authorize/continue` 必然 409 `invalid_state`
+
+| 场景 | 实测结果 |
+| --- | --- |
+| 无 `oai-did` | 5 轮 **5/5 全 409** |
+| 有 `oai-did` | 17 轮中仅 3 次 409 |
+| warmup 手搓头漏 client hints | **403 率 4/5** |
+| 补齐 client hints | **5/5 通过** |
+| warmup 单次无重试 + `timeout=15` | 失败率 **19%**（成功轮耗时 3.4~10.9s，15s 卡边缘） |
+
+ZCJ 原来直接打 provider API，完全跳过预热；只在发现 cookie 缺失时自造一个 UUID。
+自造的和服务端下发的并不等价。现在补了预热：**3 次重试、`timeout=40`、检查
+`status_code`**（只 catch 异常会把 403 当成功 —— 参考实现踩过这个坑），并且用导航头
+而不是 XHR 头。失败不抛异常，退回旧路径。
+
+### 实现
+
+- `identity_profile.headers()` 增加 `navigation=` 参数，输出 XHR / 导航两套 `Sec-Fetch-*`
+  与 `priority`；补 `zstd`；去掉 `Connection`；支持 `referer` / `origin`
+- `http_client.datadog_rum_headers()`：trace id 每会话稳定、span id 每请求新生成
+  （与真实 RUM agent 一致），注入 `default_headers` 与 `get_chatgpt_headers()`
+- `get_chatgpt_headers()` 的 `Origin` 从 `Referer` 推导（不同源会触发 invalid_state），
+  并在 `auth.openai.com` 域下补 `oai-device-id`
+- `OpenAIHTTPClient.device_id` 由 `register.py` 在拿到 `oai-did` 后写入
+- `register.py::_warmup_chatgpt_session()` 在 `_start_oauth` 之前执行
+
+### 验证
+
+导航头 20 项 / XHR 头 16 项断言通过：`zstd` 存在、`Connection` 不存在、
+`priority` 分别为 `u=1, i` 与 `u=0, i`、`Sec-Fetch-Dest` 分别为 `empty` 与 `document`。
+哨兵自检 4 地区 × 3 目标全部 12/12。
+
 ## 12. 落地状态（本次实施）
 
 三个待拍板点的决策：**不引 Node 运行时**（不 vendor OpenAI 的 `sdk.js`，改为把指纹做

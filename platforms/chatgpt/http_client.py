@@ -4,12 +4,32 @@ from typing import Any, Dict, Optional, Tuple
 from core.http_client import HTTPClient, HTTPClientError, RequestConfig
 from .constants import ERROR_MESSAGES
 import logging
+import secrets
 logger = logging.getLogger(__name__)
 
 # 浏览器画像统一由 core.identity_profile 派生（impersonate 目标决定 OS，UA 与
 # client hints 从同一目标派生）。这里原本硬编码了 Windows UA + chrome142 的
 # impersonate，而 curl_cffi 的 chrome142 目标实际是 macOS Tahoe —— TLS/HTTP2
 # 指纹说 macOS、请求头说 Windows，已移除以免被再次误用。
+
+
+def datadog_rum_headers(trace_id: str = "") -> Dict[str, str]:
+    """Datadog RUM 追踪头。
+
+    真实浏览器上 OpenAI 前端会带一套 RUM 遥测头；参考实现（turb / Regert888）在
+    每个请求上都注入，并记录到「缺少时验证码会静默不下发」。trace id 每会话稳定、
+    span id 每请求新生成，与真实 RUM agent 的行为一致。
+    """
+    trace_hex = (str(trace_id or secrets.token_hex(8))).rjust(16, "0")[-16:]
+    parent_hex = secrets.token_hex(8)
+    return {
+        "traceparent": "00-0000000000000000" + trace_hex + "-" + parent_hex + "-01",
+        "tracestate": "dd=s:1;o:rum",
+        "x-datadog-origin": "rum",
+        "x-datadog-parent-id": str(int(parent_hex, 16)),
+        "x-datadog-sampling-priority": "1",
+        "x-datadog-trace-id": str(int(trace_hex, 16)),
+    }
 
 class OpenAIHTTPClient(HTTPClient):
     """
@@ -43,7 +63,10 @@ class OpenAIHTTPClient(HTTPClient):
 
         # 请求头统一从地理一致的浏览器画像派生（core.identity_profile），
         # 避免「代理出口在 JP、指纹却说 UTC/en-US」这种自相矛盾。
+        self.device_id = ""
+        self._rum_trace_id = secrets.token_hex(8)
         self.default_headers = profile.headers()
+        self.default_headers.update(datadog_rum_headers(self._rum_trace_id))
 
     def get_chatgpt_headers(self, referer: str = "https://chatgpt.com/login") -> Dict[str, str]:
         """Headers for the chatgpt.com NextAuth API boundary."""
@@ -52,25 +75,25 @@ class OpenAIHTTPClient(HTTPClient):
             from core.identity_profile import resolve_profile
 
             profile = resolve_profile()
-        hints = profile.headers()
-        return {
-            "User-Agent": hints["User-Agent"],
-            "sec-ch-ua": hints["sec-ch-ua"],
-            "sec-ch-ua-full-version-list": hints["sec-ch-ua-full-version-list"],
-            "sec-ch-ua-platform": hints["sec-ch-ua-platform"],
-            "sec-ch-ua-platform-version": hints["sec-ch-ua-platform-version"],
-            "sec-ch-ua-arch": hints["sec-ch-ua-arch"],
-            "sec-ch-ua-bitness": hints["sec-ch-ua-bitness"],
-            "sec-ch-ua-model": hints["sec-ch-ua-model"],
-            "sec-ch-ua-mobile": hints["sec-ch-ua-mobile"],
-            "accept": "*/*",
-            "accept-language": profile.accept_language,
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-dest": "empty",
-            "referer": referer,
-            "priority": "u=1, i",
-        }
+        # Origin 必须与 Referer 同源，否则 auth.openai.com 的状态机接口容易返回
+        # invalid_state / 走风控分支。
+        origin = ""
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(referer or "")
+            if parsed.scheme and parsed.netloc:
+                origin = parsed.scheme + "://" + parsed.netloc
+        except Exception:
+            origin = ""
+        headers = profile.headers(referer=referer, origin=origin)
+        headers["Accept"] = "*/*"
+        headers.update(datadog_rum_headers(getattr(self, "_rum_trace_id", "")))
+        # auth.openai.com 侧补设备标识，提升状态机连续性。
+        device_id = str(getattr(self, "device_id", "") or "")
+        if device_id and "auth.openai.com" in origin:
+            headers["oai-device-id"] = device_id
+        return headers
 
     def check_nextauth_access(self) -> tuple[bool, int]:
         """Confirm that the route can reach ChatGPT's NextAuth API."""

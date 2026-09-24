@@ -849,6 +849,65 @@ class RegistrationEngine:
 
 
 
+    def _warmup_chatgpt_session(self) -> bool:
+
+        """GET chatgpt.com 首页，让服务端下发 oai-did 等 cookie。
+
+        参考实现实测（26 轮 / 40+ 出口 IP）：``/api/auth/signin/openai`` 依据
+        chatgpt.com 的 cookie 决定返回什么 —— 有**服务端下发**的 ``oai-did`` 才返回
+        ``auth.openai.com/authorize`` URL，否则返回 NextAuth 页面，到
+        ``authorize/continue`` 必然 409 ``invalid_state``（无 oai-did 的 5 轮 5/5 全 409）。
+        旧实现直接打 provider API，跳过了这一步。
+
+        必须看 ``status_code``：只 catch 异常会把 403 当成成功。超时放宽到 40s，
+        因为成功轮实测耗时 3.4~10.9s，15s 卡在边缘。
+
+        失败不抛异常 —— 拿不到就退回自造 Device ID 的旧路径，只是成功率更低。
+        """
+        from .constants import CHATGPT_APP
+
+        try:
+
+            headers = self.http_client.browser_profile.headers(
+                navigation=True, referer=CHATGPT_APP + "/", origin=CHATGPT_APP
+            )
+
+        except Exception:
+
+            headers = {"User-Agent": str(getattr(self, "_user_agent", "") or "")}
+
+        for attempt in range(3):
+
+            try:
+
+                resp = self.session.get(CHATGPT_APP + "/", headers=headers, timeout=40)
+                status = int(getattr(resp, "status_code", 0) or 0)
+                did = str(self.session.cookies.get("oai-did", "") or "")
+
+                if status == 200 and did:
+
+                    self._log("chatgpt.com 预热成功，服务端已下发 oai-did")
+
+                    return True
+
+                self._log(
+                    f"chatgpt.com 预热未拿到 oai-did: HTTP {status}（第 {attempt + 1}/3 次）",
+                    "warning",
+                )
+
+            except Exception as exc:
+
+                self._log(
+                    f"chatgpt.com 预热异常: {str(exc)[:120]}（第 {attempt + 1}/3 次）",
+                    "warning",
+                )
+
+            time.sleep(min(2 ** attempt, 4))
+
+        return False
+
+
+
     def _start_oauth(self) -> bool:
 
         """通过 chatgpt.com NextAuth 发起 OAuth 流程"""
@@ -859,6 +918,10 @@ class RegistrationEngine:
             from urllib.parse import urlencode
 
             self._log("通过 chatgpt.com NextAuth 发起 OAuth...")
+
+            # 0. 预热，让服务端下发 oai-did（详见 _warmup_chatgpt_session）。
+
+            self._warmup_chatgpt_session()
 
 
 
@@ -885,6 +948,14 @@ class RegistrationEngine:
             if oai_did:
 
                 self._device_id = str(oai_did)
+
+                try:
+
+                    self.http_client.device_id = str(oai_did)
+
+                except Exception:
+
+                    pass
 
             self._log(f"chatgpt.com oai-did: {'yes' if oai_did else 'no'}")
 
