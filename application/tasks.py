@@ -28,6 +28,7 @@ from core.proxy_utils import mask_proxy_url
 from core.registration.persistence import evaluate_persistence
 from core.registration.preflight import run_preflight
 from core.registration.retry_policy import decide_for_failure
+from core.registration.resume import find_resumable_accounts, resume_enabled
 from core.registration_logging import classify_registration_log
 from core.registry import get
 from infrastructure.platform_runtime import PlatformRuntime
@@ -3055,7 +3056,30 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     )
                 else:
                     logger.log(f"使用手动代理: {mask_proxy_url(resolved_proxy)}")
-            account = platform.register(email=email, password=password)
+            resume_candidate = None
+            if resume_registration_enabled:
+                try:
+                    resume_candidates = find_resumable_accounts(
+                        platform_name,
+                        email=str(email or ""),
+                        limit=1,
+                        exclude_ids=resumed_account_ids,
+                    )
+                    if resume_candidates:
+                        resume_candidate = resume_candidates[0]
+                except Exception as resume_exc:
+                    logger.log(f"续跑账号查找失败（忽略）: {resume_exc}", level="warning")
+            if resume_candidate is not None:
+                # 账号已建好且带 token，只是后续阶段失败；重新注册只会再烧一个邮箱。
+                account = resume_candidate.account
+                resumed_account_ids.add(resume_candidate.account_id)
+                logger.log(
+                    f"发现可续跑账号 #{resume_candidate.account_id} "
+                    f"{resume_candidate.email}（{resume_candidate.reason}），"
+                    "跳过重新注册，直接续跑后续阶段"
+                )
+            else:
+                account = platform.register(email=email, password=password)
             if resolved_proxy:
                 account_extra = dict(getattr(account, "extra", {}) or {})
                 account_extra.setdefault("auth_proxy_url", resolved_proxy)
@@ -3670,6 +3694,10 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             # 当用户选择并发 5、目标 1 时，至少允许 5 个 worker 被提交，
             # 但仍受邮箱池、号码池和上面的安全并发上限约束。
             max_attempts = max(max_attempts, concurrency)
+
+        # 续跑：本次任务里已经尝试续跑过的账号不再重复挑，避免死循环。
+        resumed_account_ids: set[int] = set()
+        resume_registration_enabled = resume_enabled(extra) and platform_name == "chatgpt"
 
         def _hero_phone_alive() -> bool:
             if not (herosms_enabled and hero_reuse_to_max):
