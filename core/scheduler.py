@@ -227,7 +227,24 @@ class Scheduler:
                 cleanup_invalid_synced_accounts(limit=500)
             except Exception as exc:
                 print(f"[Scheduler] Sub2 清理跳过: {exc}", flush=True)
-        return {"validity": check_results, "remote_cleanup_enabled": auto_delete}
+
+        # 任务事件表只增不减：一次注册就能写上百条日志，服务器连续跑会把磁盘吃满。
+        # 挂在既有的维护周期里，失败不影响主流程。
+        retention_result: dict = {}
+        try:
+            from core.retention import run_retention_cycle
+
+            retention_result = run_retention_cycle()
+            deleted = int(retention_result.get("deleted_total") or 0)
+            if deleted:
+                print(f"[Scheduler] 任务日志清理: 删除 {deleted} 条历史事件", flush=True)
+        except Exception as exc:
+            print(f"[Scheduler] 任务日志清理跳过: {exc}", flush=True)
+        return {
+            "validity": check_results,
+            "remote_cleanup_enabled": auto_delete,
+            "retention": retention_result,
+        }
 
     def _run_probation_cycle(self):
         if not self._probation_cycle_lock.acquire(blocking=False):

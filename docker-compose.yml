@@ -13,6 +13,10 @@ services:
       # 有头浏览器的桌面尺寸。留默认即可；调大只会让 screen 更常见，
       # 但所有账号仍共用同一个值——要真正的差异请用 headless。
       XVFB_SCREEN: "${ZCJ_XVFB_SCREEN:-1920x1080x24}"
+      # 任务事件表只增不减（一次注册上百条日志），这里给保留窗口和硬上限。
+      # 任一项设成 0 就关闭对应的一半；全 0 等于完全不做清理。
+      ZCJ_TASK_EVENT_RETENTION_DAYS: "${ZCJ_TASK_EVENT_RETENTION_DAYS:-14}"
+      ZCJ_TASK_EVENT_MAX_ROWS: "${ZCJ_TASK_EVENT_MAX_ROWS:-200000}"
       # 需要人工接管浏览器时取消注释，并把 6080 映射到本机回环。
       # VNC_ENABLED: "1"
       # VNC_PASSWORD: "${ZCJ_VNC_PASSWORD:?ZCJ_VNC_PASSWORD must be set}"

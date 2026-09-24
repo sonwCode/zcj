@@ -115,7 +115,47 @@ ssh -L 6080:127.0.0.1:6080 user@server
 本仓库的 Dockerfile 仍然把它显式列出来，避免哪天换基础镜像时静默退化。
 哨兵自检新增 `timezone_data` 一项，缺数据会直接报失败而不是悄悄放过。
 
-## 9. 横向扩容
+## 9. 磁盘增长（长期运行的主要风险）
+
+`task_events` 表**每写一行日志就插一条记录**，而 `TaskLogger.log()` 每条都单独
+`commit()`。`browser_register.py` 一个文件里就有 200+ 处 `log()` 调用，
+一次注册轻轻松松上百条事件。而 `TaskLogsRepository` 只有读方法——
+**从来没有任何东西删除过这张表**。
+
+服务器连续跑下去，两件事会同时发生：
+
+1. SQLite 主文件无限增长；
+2. WAL 模式下 `-wal` 文件跟着涨，而且因为没开 `auto_vacuum`，
+   删了行也不会把空间还给文件系统。
+
+现在由 `core/retention.py` 在既有维护周期里清理：
+
+| 环境变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ZCJ_TASK_EVENT_RETENTION_DAYS` | `14` | 按时间保留；设 0 关闭 |
+| `ZCJ_TASK_EVENT_MAX_ROWS` | `200000` | 硬行数上限，超了删最旧的；设 0 关闭 |
+| `ZCJ_RETENTION_VACUUM` | 未设置 | 设 1 才在清理后跑完整 `VACUUM` 归还磁盘 |
+
+几个刻意的选择：
+
+* **分批删除**（默认 5000 一批），不会为了清理把写锁占很久；
+* **不动正在跑的任务的事件**——前端正在看这些进度，删了只丢历史不省磁盘；
+* **不清理 `task_logs`**——那是账号的成功/失败记录，是数据不是日志；
+* **`VACUUM` 默认关闭**——它要独占锁重写整个库，放在实时服务上要自己确认时机。
+
+`tests/test_task_event_retention.py` 覆盖了窗口、上限、运行中任务保护、
+dry-run、分批和关闭开关。
+
+### 另外两处会写盘的地方
+
+* `platforms/chatgpt/browser_register.py` 的 `_dump_debug()` 会在失败时往
+  `/tmp` 写截图和 HTML。前缀是固定的（如 `chatgpt_password_fail`），
+  所以是覆盖而不是堆积；但 `/tmp` 在容器里属于可写层，重启才清。
+* `platforms/chatgpt/cpa_session.py` 会把截图和 JSON 写到
+  `OPAI_DEBUG_WORKSPACE_DIR`（默认 `debug/workspace_step2`，相对路径）。
+  文件名带时间戳，**会一直累积**。不需要排障就把它指到 `/tmp` 或定期清理。
+
+## 10. 横向扩容
 
 因为调度器是进程内单例，扩容单位是**容器**，不是 worker：
 
