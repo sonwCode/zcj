@@ -129,7 +129,7 @@ def classify_failure(
     if by_status:
         return Attribution(by_status, _LABELS[by_status], by_status in _RETRYABLE, stage)
 
-        haystack = f"{message or empty} {error_code or empty}".lower()
+    haystack = f"{message or empty} {error_code or empty}".lower()
     if haystack.strip():
         for code, keywords in _RULES:
             if any(keyword.lower() in haystack for keyword in keywords):
