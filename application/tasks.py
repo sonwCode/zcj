@@ -27,6 +27,7 @@ from core.proxy_strategy import describe_decision, resolve_proxy
 from core.proxy_utils import mask_proxy_url
 from core.registration.persistence import evaluate_persistence
 from core.registration.preflight import run_preflight
+from core.registration.retry_policy import decide_for_failure
 from core.registration_logging import classify_registration_log
 from core.registry import get
 from infrastructure.platform_runtime import PlatformRuntime
@@ -3502,24 +3503,25 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             error = error_text
             if error_code and error_code.lower() not in error.lower():
                 error = f"{error_code}: {error}"
+            pipeline_stage = "registration"
             if account is not None and email_account_created:
                 try:
                     account_extra = dict(getattr(account, "extra", {}) or {})
                     account_overview = dict(account_extra.get("account_overview") or {})
-                    current_stage = str(
+                    pipeline_stage = str(
                         (account_overview.get("registration_pipeline") or {}).get("current_stage")
                         or "registration"
                     )
                     if _is_terminal_registration_account_error(error):
                         _mark_terminal_registration_account(
                             account,
-                            stage=current_stage,
+                            stage=pipeline_stage,
                             error=error,
                         )
                     else:
                         _registration_pipeline_update(
                             account,
-                            current_stage,
+                            pipeline_stage,
                             "failed",
                             error=error,
                         )
@@ -3530,6 +3532,25 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         level="warning",
                     )
             logger.record_error(error)
+            # 归因驱动重试：不再用一刀切的重试预算，而是按失败原因决定
+            # 是否重试、退避多久、换代理还是换邮箱、从哪个阶段续跑。
+            retry_action = decide_for_failure(
+                error,
+                stage=pipeline_stage,
+                error_code=error_code,
+                attempt=index + 1,
+                max_attempts=max_attempts,
+            )
+            logger.log(
+                "重试判定: "
+                + retry_action.reason
+                + ("；将重试" if retry_action.retry else "；不再重试")
+                + (f"，退避 {retry_action.backoff_seconds:.0f}s" if retry_action.backoff_seconds else "")
+                + ("，换代理" if retry_action.rotate_proxy else "")
+                + ("，换邮箱" if retry_action.rotate_mailbox else "")
+                + (f"，从 {retry_action.resume_stage} 续跑" if retry_action.resume_stage else ""),
+                level="warning" if retry_action.retry else "error",
+            )
             logger.log(f"✗ 注册失败: {error}", level="error")
             failure_email = str(
                 getattr(account, "email", "")
@@ -3537,7 +3558,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 or email
                 or ""
             )
-            _save_task_log(platform_name, failure_email, "failed", error=error)
+            _save_task_log(
+                platform_name,
+                failure_email,
+                "failed",
+                error=error,
+                detail={"stage": pipeline_stage, "retry": retry_action.to_dict()},
+            )
             return error
         finally:
             # 归还 SMS 槽位：``swapped_or_dead`` 为 True 表示原号在跑过程中被

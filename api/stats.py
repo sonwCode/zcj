@@ -8,6 +8,7 @@ from sqlmodel import Session, select, func
 
 from core.db import TaskLog, ProxyModel, AccountModel, AccountOverviewModel, engine
 from core.registration.attribution import attribution_table, summarize_attributions
+from core.registration.retry_policy import retry_policy_table
 
 router = APIRouter(prefix="/stats", tags=["stats"])
 
@@ -179,6 +180,7 @@ def stats_attribution(days: int = 7, platform: str = "", limit: int = 200):
         "total_failures": total,
         "categories": buckets,
         "table": attribution_table(),
+        "retry_policy": retry_policy_table(),
     }
 
 
