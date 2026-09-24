@@ -1,22 +1,29 @@
-"""Geo-coherent browser identity profile.
+"""Geo- and platform-coherent browser identity profile.
 
 The protocol registration path used to ship a *constant* fingerprint: a fixed
 User-Agent, a fixed ``Accept-Language: en-US``, and a Sentinel ``p`` payload that
 always claimed ``1920x1080`` / ``GMT+0000 (Coordinated Universal Time)`` / ``en-US``.
-That contradicts the proxy exit country (IP says JP, JS says UTC/en-US) and makes
-every account share one identity, which is trivially clusterable.
+That contradicts the proxy exit country (the IP says JP while the JS says UTC/en-US)
+and makes every account share one identity, which is trivially clusterable.
 
-This module resolves one profile per registration session from the proxy exit
-region, and every consumer derives from it:
+It also contradicted *itself*. ``curl_cffi`` impersonates a specific browser build,
+and its Chrome targets are not all Windows: every target from ``chrome119`` up is
+macOS (``chrome142`` is macOS Tahoe). The old code impersonated ``chrome142`` while
+sending ``Windows NT 10.0; Win64; x64`` and ``sec-ch-ua-platform: "Windows"``, so the
+TLS/HTTP2 fingerprint said macOS and the headers said Windows.
 
-* protocol request headers (``platforms/chatgpt/http_client.py``)
-* the Sentinel ``p`` payload (``platforms/chatgpt/register.py``)
-* the browser launch (locale / timezone / user agent)
+This module resolves one profile per session and keeps every layer consistent:
 
-Region-derived fields (timezone, locale, language, UA) stay stable for a region so
-they always agree with the exit IP. Hardware-shaped fields (screen, CPU count,
-device memory) vary deterministically per session seed so accounts are not
-byte-identical.
+* the ``impersonate`` target decides the OS, and the OS decides the UA and the
+  ``sec-ch-ua-platform`` hint
+* the region decides timezone, locale and ``Accept-Language`` so they agree with the
+  proxy exit IP
+* the Chrome "GREASE" brand is pinned per major version, because Chrome randomises
+  that token per build and a stale value for a claimed version is a contradiction
+* the full client-hint set is emitted, since a real Chrome sends more than
+  ``sec-ch-ua``/``platform``/``mobile``
+* hardware-shaped fields vary deterministically per session seed so accounts are not
+  byte-identical
 """
 from __future__ import annotations
 
@@ -26,7 +33,44 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 DEFAULT_REGION = "US"
-CHROME_VERSION = os.environ.get("ZCJ_CHATGPT_CHROME_VERSION", "142")
+DEFAULT_IMPERSONATE = os.environ.get("ZCJ_CHATGPT_IMPERSONATE", "chrome142")
+
+_Q = chr(34)
+
+
+def _ch(brand: str, version: str) -> str:
+    """Render one ``sec-ch-ua`` brand token: ``"Brand";v="1"``."""
+    return _Q + brand + _Q + ";v=" + _Q + version + _Q
+
+
+# impersonate -> (major, os_family, ua_platform_token, platform_version)
+#
+# The OS for each target comes from the installed curl_cffi fingerprint table, not
+# from guesswork: chrome119 and up are all macOS there, so a Windows UA is incoherent
+# with them. Only targets with a sourced GREASE brand are listed.
+_CHROME_TARGETS: dict[str, tuple[str, str, str, str]] = {
+    "chrome136": ("136", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "15"),
+    "chrome142": ("142", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "26"),
+    "chrome146": ("146", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "26"),
+    "chrome150": ("150", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "26"),
+}
+
+# Chrome randomises the "GREASE" brand token per build. Claiming one version while
+# sending another version's token is a self-contradiction, so the token is pinned per
+# major version instead of hardcoded once.
+_GREASE_BRANDS: dict[str, tuple[str, str]] = {
+    "136": ("Not.A/Brand", "99"),
+    "142": ("Not/A)Brand", "8"),
+    "146": ("Not-A.Brand", "24"),
+    "150": ("Not;A=Brand", "8"),
+}
+
+_SCREENS_BY_OS: dict[str, tuple[str, ...]] = {
+    "macOS": ("1440x900", "1512x982", "1728x1117", "2560x1600", "1920x1080"),
+    "Windows": ("1920x1080", "2560x1440", "1536x864", "1680x1050"),
+}
+_CORES = (4, 8, 12, 16)
+_MEMORY = (4, 8, 16)
 
 
 @dataclass(frozen=True)
@@ -34,6 +78,8 @@ class BrowserProfile:
     """One coherent browser identity for a single registration session."""
 
     region: str
+    impersonate: str
+    os_family: str
     user_agent: str
     accept_language: str
     navigator_language: str
@@ -42,6 +88,9 @@ class BrowserProfile:
     screen: str
     platform: str
     sec_ch_ua: str
+    sec_ch_ua_full_version_list: str
+    sec_ch_ua_platform_version: str
+    sec_ch_ua_arch: str
     chrome_version: str
     hardware_concurrency: int
     device_memory: int
@@ -49,12 +98,15 @@ class BrowserProfile:
     def to_dict(self) -> dict:
         return {
             "region": self.region,
+            "impersonate": self.impersonate,
+            "os_family": self.os_family,
             "user_agent": self.user_agent,
             "accept_language": self.accept_language,
             "navigator_language": self.navigator_language,
             "timezone": self.timezone,
             "screen": self.screen,
             "platform": self.platform,
+            "sec_ch_ua": self.sec_ch_ua,
             "hardware_concurrency": self.hardware_concurrency,
             "device_memory": self.device_memory,
         }
@@ -63,7 +115,7 @@ class BrowserProfile:
         """Render ``Date.toString()`` in the profile timezone.
 
         JavaScript produces ``Mon Jan 01 2024 12:00:00 GMT+0900 (Japan Standard Time)``.
-        The previous implementation emitted ``Mon, 01 Jan 2024 ... GMT+0000`` — both the
+        The previous implementation emitted ``Mon, 01 Jan 2024 ... GMT+0000`` - both the
         field order and the timezone were wrong, so the payload disagreed with the IP.
         """
         try:
@@ -77,11 +129,20 @@ class BrowserProfile:
         return now.strftime("%a %b %d %Y %H:%M:%S ") + "GMT" + offset + " (" + label + ")"
 
     def headers(self) -> dict:
-        """Default request headers derived from this profile."""
+        """Default request headers, including the full client-hint set.
+
+        A real Chrome sends the whole ``sec-ch-ua*`` family; sending only a subset is
+        itself a distinguishing signal, so every hint the browser would emit is present.
+        """
         return {
             "User-Agent": self.user_agent,
             "sec-ch-ua": self.sec_ch_ua,
-            "sec-ch-ua-platform": '"%s"' % self.platform,
+            "sec-ch-ua-full-version-list": self.sec_ch_ua_full_version_list,
+            "sec-ch-ua-platform": _Q + self.platform + _Q,
+            "sec-ch-ua-platform-version": _Q + self.sec_ch_ua_platform_version + _Q,
+            "sec-ch-ua-arch": _Q + self.sec_ch_ua_arch + _Q,
+            "sec-ch-ua-bitness": _Q + "64" + _Q,
+            "sec-ch-ua-model": _Q + _Q,
             "sec-ch-ua-mobile": "?0",
             "Accept": "application/json",
             "Accept-Language": self.accept_language,
@@ -130,10 +191,6 @@ _REGIONS: dict[str, tuple[str, str, str, str]] = {
     "MY": ("en-MY", "en-MY,en;q=0.9,ms;q=0.8", "Asia/Kuala_Lumpur", "Malaysia Time"),
 }
 
-_SCREENS = ("1920x1080", "2560x1440", "1536x864", "1440x900", "1680x1050")
-_CORES = (4, 8, 12, 16)
-_MEMORY = (4, 8, 16)
-
 
 def normalize_region(region: str | None) -> str:
     value = str(region or "").strip().upper()
@@ -142,8 +199,19 @@ def normalize_region(region: str | None) -> str:
     return value if value in _REGIONS else DEFAULT_REGION
 
 
-def known_regions() -> list[str]:
+def known_regions() -> list:
     return sorted(_REGIONS)
+
+
+def known_impersonate_targets() -> list:
+    return sorted(_CHROME_TARGETS)
+
+
+def resolve_impersonate(target: str | None = "") -> str:
+    value = str(target or "").strip()
+    if value in _CHROME_TARGETS:
+        return value
+    return DEFAULT_IMPERSONATE if DEFAULT_IMPERSONATE in _CHROME_TARGETS else "chrome142"
 
 
 def _seed_int(seed: str) -> int:
@@ -151,30 +219,45 @@ def _seed_int(seed: str) -> int:
     return int(hashlib.sha256(material).hexdigest()[:12], 16)
 
 
-def _build(region: str, seed: str) -> BrowserProfile:
+def _build(region: str, seed: str, target: str) -> BrowserProfile:
     navigator_language, accept_language, tz, tz_label = _REGIONS[region]
+    version, os_family, ua_token, platform_version = _CHROME_TARGETS[target]
+    grease_name, grease_ver = _GREASE_BRANDS[version]
     n = _seed_int(seed)
+
     user_agent = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (" + ua_token + ") "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        f"Chrome/{CHROME_VERSION}.0.0.0 Safari/537.36"
+        "Chrome/" + version + ".0.0.0 Safari/537.36"
     )
-    sec_ch_ua = (
-        f'"Chromium";v="{CHROME_VERSION}", '
-        f'"Google Chrome";v="{CHROME_VERSION}", '
-        '"Not_A Brand";v="99"'
-    )
+    sec_ch_ua = ", ".join((
+        _ch("Chromium", version),
+        _ch(grease_name, grease_ver),
+        _ch("Google Chrome", version),
+    ))
+    sec_ch_ua_full = ", ".join((
+        _ch("Chromium", version + ".0.0.0"),
+        _ch(grease_name, grease_ver + ".0.0.0"),
+        _ch("Google Chrome", version + ".0.0.0"),
+    ))
+    screens = _SCREENS_BY_OS.get(os_family) or _SCREENS_BY_OS["macOS"]
+
     return BrowserProfile(
         region=region,
+        impersonate=target,
+        os_family=os_family,
         user_agent=user_agent,
         accept_language=accept_language,
         navigator_language=navigator_language,
         timezone=tz,
         timezone_label=tz_label,
-        screen=_SCREENS[n % len(_SCREENS)],
-        platform="Windows",
+        screen=screens[n % len(screens)],
+        platform=os_family,
         sec_ch_ua=sec_ch_ua,
-        chrome_version=CHROME_VERSION,
+        sec_ch_ua_full_version_list=sec_ch_ua_full,
+        sec_ch_ua_platform_version=platform_version,
+        sec_ch_ua_arch="arm" if (n >> 4) % 2 else "x86",
+        chrome_version=version,
         hardware_concurrency=_CORES[(n >> 8) % len(_CORES)],
         device_memory=_MEMORY[(n >> 16) % len(_MEMORY)],
     )
@@ -185,17 +268,19 @@ def resolve_profile(
     *,
     seed: str | None = "",
     proxy_url: str | None = "",
+    impersonate: str | None = "",
     allow_network: bool = False,
 ) -> BrowserProfile:
     """Resolve one coherent profile for a session.
 
-    ``region`` is the proxy exit country (ISO-3166 alpha-2), normally supplied by
-    the task layer which already probes the route. When it is missing the default
-    region is used — we deliberately do *not* perform a network lookup here, so
-    this stays a pure function that the offline preflight can call.
+    ``region`` is the proxy exit country (ISO-3166 alpha-2), normally supplied by the
+    task layer which already probes the route. When it is missing the default region is
+    used - we deliberately do *not* perform a network lookup here, so this stays a pure
+    function that the offline preflight can call.
     """
     normalized = normalize_region(region)
-    return _build(normalized, str(seed or proxy_url or normalized))
+    target = resolve_impersonate(impersonate)
+    return _build(normalized, str(seed or proxy_url or normalized), target)
 
 
 def with_overrides(
@@ -208,8 +293,8 @@ def with_overrides(
 ) -> BrowserProfile:
     """Overlay values observed from a live browser onto a resolved profile.
 
-    Reading the values back from the page guarantees the Sentinel payload agrees
-    with what the browser actually reports.
+    Reading the values back from the page guarantees the Sentinel payload agrees with
+    what the browser actually reports.
     """
     changes: dict = {}
     if screen and "x" in screen:
@@ -228,4 +313,5 @@ def profile_for_extra(extra: dict | None, *, seed: str = "") -> BrowserProfile:
     """Convenience for callers that only have the task ``extra`` mapping."""
     data = extra or {}
     region = str(data.get("proxy_route_country") or data.get("region") or "")
-    return resolve_profile(region, seed=seed)
+    target = str(data.get("browser_impersonate") or "")
+    return resolve_profile(region, seed=seed, impersonate=target)

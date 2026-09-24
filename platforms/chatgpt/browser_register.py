@@ -5574,12 +5574,16 @@ class ChatGPTBrowserRegister:
 
                 profile = self.browser_profile
                 width, _, height = profile.screen.partition("x")
+                # 刻意不覆盖 user_agent：真实浏览器的 UA 必须和它自己的 TLS/HTTP2
+                # 指纹同源。画像里的 UA 是按 curl_cffi 的 impersonate 目标推导的
+                # （chrome119+ 是 macOS），硬套到 Linux/Windows 上跑的 Chrome 反而
+                # 制造新的矛盾。这里只对齐与 IP 相关的 locale/时区，以及视口；
+                # 页面真实的 UA 随后由 _browser_profile_from_page 回读覆盖画像。
                 context = browser.new_context(
                     viewport={
                         "width": int(width or 1280),
                         "height": int(height or 720),
                     },
-                    user_agent=profile.user_agent,
                     locale=profile.navigator_language,
                     timezone_id=profile.timezone,
                 )

@@ -6,17 +6,10 @@ from .constants import ERROR_MESSAGES
 import logging
 logger = logging.getLogger(__name__)
 
-CHATGPT_BROWSER_VERSION = "142"
-CHATGPT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    f"Chrome/{CHATGPT_BROWSER_VERSION}.0.0.0 Safari/537.36"
-)
-CHATGPT_SEC_CH_UA = (
-    f'"Chromium";v="{CHATGPT_BROWSER_VERSION}", '
-    f'"Google Chrome";v="{CHATGPT_BROWSER_VERSION}", '
-    '"Not_A Brand";v="99"'
-)
+# 浏览器画像统一由 core.identity_profile 派生（impersonate 目标决定 OS，UA 与
+# client hints 从同一目标派生）。这里原本硬编码了 Windows UA + chrome142 的
+# impersonate，而 curl_cffi 的 chrome142 目标实际是 macOS Tahoe —— TLS/HTTP2
+# 指纹说 macOS、请求头说 Windows，已移除以免被再次误用。
 
 class OpenAIHTTPClient(HTTPClient):
     """
@@ -37,18 +30,19 @@ class OpenAIHTTPClient(HTTPClient):
             proxy_url: 代理 URL
             config: 请求配置
         """
-        if config is None:
-            config = RequestConfig(impersonate=f"chrome{CHATGPT_BROWSER_VERSION}")
-        super().__init__(proxy_url, config)
-
-        # OpenAI 特定的默认配置
-        # 请求头统一从地理一致的浏览器画像派生（core.identity_profile），
-        # 避免「代理出口在 JP、指纹却说 UTC/en-US」这种自相矛盾。
+        # 画像必须先于 config 解析：impersonate 目标决定了 OS，而 UA 与 client hints
+        # 都从同一个目标派生，二者因此不可能互相矛盾。
         if profile is None:
             from core.identity_profile import resolve_profile
 
             profile = resolve_profile()
         self.browser_profile = profile
+        if config is None:
+            config = RequestConfig(impersonate=profile.impersonate)
+        super().__init__(proxy_url, config)
+
+        # 请求头统一从地理一致的浏览器画像派生（core.identity_profile），
+        # 避免「代理出口在 JP、指纹却说 UTC/en-US」这种自相矛盾。
         self.default_headers = profile.headers()
 
     def get_chatgpt_headers(self, referer: str = "https://chatgpt.com/login") -> Dict[str, str]:
@@ -58,11 +52,17 @@ class OpenAIHTTPClient(HTTPClient):
             from core.identity_profile import resolve_profile
 
             profile = resolve_profile()
+        hints = profile.headers()
         return {
-            "User-Agent": profile.user_agent,
-            "sec-ch-ua": profile.sec_ch_ua,
-            "sec-ch-ua-platform": '"%s"' % profile.platform,
-            "sec-ch-ua-mobile": "?0",
+            "User-Agent": hints["User-Agent"],
+            "sec-ch-ua": hints["sec-ch-ua"],
+            "sec-ch-ua-full-version-list": hints["sec-ch-ua-full-version-list"],
+            "sec-ch-ua-platform": hints["sec-ch-ua-platform"],
+            "sec-ch-ua-platform-version": hints["sec-ch-ua-platform-version"],
+            "sec-ch-ua-arch": hints["sec-ch-ua-arch"],
+            "sec-ch-ua-bitness": hints["sec-ch-ua-bitness"],
+            "sec-ch-ua-model": hints["sec-ch-ua-model"],
+            "sec-ch-ua-mobile": hints["sec-ch-ua-mobile"],
             "accept": "*/*",
             "accept-language": profile.accept_language,
             "sec-fetch-site": "same-origin",

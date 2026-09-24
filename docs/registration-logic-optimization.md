@@ -335,6 +335,98 @@ turb 修过一个坑：线程池 `max_workers` 变了要**重建池**，否则�
 - `7836246/gpt-auto-register`（494★，Selenium + 接码 + Plus 试用）
 - `lxf746/any-auto-register`（3.3k★，ZCJ 的上游同源项目）
 
+## 13. P0-3（本轮新发现）：impersonate 目标与 UA / OS 互相矛盾
+
+这一条是看了 `Regert888/gpt-auto-register`（556★）的 `fingerprint.py`（717 行）之后
+回头查自己的代码才发现的，属于**自己和自己矛盾**，比 P0-1 的「和代理出口矛盾」更隐蔽。
+
+### 证据：curl_cffi 的 Chrome 目标不是同一个 OS
+
+读本机安装的 `curl_cffi 0.16.3` 的指纹表 `curl_cffi/fingerprints.py`（38 个目标）：
+
+| impersonate | 版本 | OS |
+| --- | --- | --- |
+| `chrome99` … `chrome116` | 99–116 | Windows 10 |
+| `chrome119` … `chrome150` | 119–150 | macOS（Sonoma / Sequoia / Tahoe） |
+
+**`chrome119` 及以后的每一个 Chrome 目标都是 macOS**，其中 `chrome142` 是 macOS Tahoe。
+
+### 问题
+
+ZCJ 原本（且在我上一轮改完之后仍然）这样发请求：
+
+```python
+RequestConfig(impersonate="chrome142")          # TLS/HTTP2 指纹 = macOS Tahoe
+User-Agent: Mozilla/5.0 (Windows NT 10.0; ...)   # 请求头 = Windows
+sec-ch-ua-platform: "Windows"                    # client hint = Windows
+```
+
+TLS 指纹说 macOS、HTTP 头说 Windows。CF 不需要任何启发式就能看到这个矛盾。
+**这一条是上一轮引入 `identity_profile` 时漏掉的**：画像的时区/locale 已经跟代理走了，
+但 OS 仍然是被硬编码的 Windows。
+
+### 第二个问题：GREASE 品牌与版本不匹配
+
+Chrome 的 `sec-ch-ua` 里有一个随版本变化的 GREASE 品牌 token，ZCJ 只硬编码了一个值：
+
+```python
+'"Not_A Brand";v="99"'   # 声称 Chrome 142，却用着更老版本的 token
+```
+
+各版本的真实取值（两条独立来源一致）：
+
+| Chrome | GREASE 品牌 |
+| --- | --- |
+| 136 | `"Not.A/Brand";v="99"` |
+| 142 | `"Not/A)Brand";v="8"` |
+| 146 | `"Not-A.Brand";v="24"` |
+| 150 | `"Not;A=Brand";v="8"` |
+
+### 第三个问题：client hints 只发了三分之一
+
+真实 Chrome 会发完整的一组，ZCJ 只发了 `sec-ch-ua` / `-platform` / `-mobile`。
+少发的 hint 本身就是特征。
+
+### 设计
+
+把**`impersonate` 目标作为画像的唯一真相来源**，OS 由它决定，UA 与 client hints 再从
+OS 派生，三者因此不可能互相矛盾：
+
+```python
+_CHROME_TARGETS = {
+    # impersonate -> (major, os_family, ua_platform_token, platform_version)
+    "chrome136": ("136", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "15"),
+    "chrome142": ("142", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "26"),
+    "chrome146": ("146", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "26"),
+    "chrome150": ("150", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "26"),
+}
+```
+
+只收录有可靠 GREASE 取值的目标；默认 `chrome142`（与项目原有版本选择一致），
+可用 `ZCJ_CHATGPT_IMPERSONATE` 或 `extra.browser_impersonate` 覆盖。
+`OpenAIHTTPClient` 的 `RequestConfig(impersonate=...)` 现在也取自画像，
+不再写死。
+
+### 顺带修掉的浏览器路径隐患
+
+浏览器路径原本把画像的 UA 硬套到 `browser.new_context(user_agent=...)`。真实 Chrome
+跑在 Linux/Windows 上，套一个 macOS UA 会**制造**同类矛盾（UA 说 macOS、TLS 说本机）。
+已改为不覆盖 UA —— 真实浏览器的 UA 必须和它自己的 TLS 指纹同源；只对齐与 IP 相关的
+`locale` / `timezone_id` 和视口，页面真实 UA 随后由 `_browser_profile_from_page` 回读。
+
+### 自检
+
+`sentinel_check.py` 新增第 12 项 `client_hints`：断言 `sec-ch-ua` 里的版本与 UA 的
+`Chrome/NN` 一致、`sec-ch-ua-platform` 与画像 OS 一致、且 UA 的 OS token 与
+`sec-ch-ua-platform` 不冲突。5 个地区 × 4 个目标的 20 种组合全部通过。
+
+### 遗留
+
+`Regert888` 的指纹库还有 Safari(macOS) / iOS Safari / Firefox 三个浏览器家族，
+按 30/15/35/20 的权重轮换，且非 Chromium 家族**一个 client hint 都不发**。
+ZCJ 目前只有 Chrome 一个家族；扩展需要 curl_cffi 侧有对应目标（它有 Safari 与 Firefox
+目标，但都是 macOS），属于下一步。
+
 ## 12. 落地状态（本次实施）
 
 三个待拍板点的决策：**不引 Node 运行时**（不 vendor OpenAI 的 `sdk.js`，改为把指纹做

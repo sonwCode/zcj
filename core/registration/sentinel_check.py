@@ -143,6 +143,24 @@ def run_sentinel_self_test(profile=None) -> SentinelReport:
     ))
 
     checks.append(SentinelCheck("user_agent", str(payload[4] or "") == profile.user_agent, "UA 与画像一致"))
+
+    # client hints 必须与 UA 同版本、同 OS。curl_cffi 的 chrome119 及以上目标都是
+    # macOS，若 UA 说 Windows 而 TLS/HTTP2 指纹说 macOS，就是 CF 一眼可辨的矛盾。
+    hints = profile.headers()
+    match = re.search(r"Chrome/(\d+)", str(profile.user_agent or ""))
+    ua_version = match.group(1) if match else ""
+    hint_version_ok = bool(ua_version) and (";v=" + chr(34) + ua_version + chr(34)) in str(hints.get("sec-ch-ua", ""))
+    hint_platform_ok = hints.get("sec-ch-ua-platform") == chr(34) + str(profile.platform) + chr(34)
+    ua_os_ok = True
+    if profile.platform == "macOS":
+        ua_os_ok = "Macintosh" in str(profile.user_agent)
+    elif profile.platform == "Windows":
+        ua_os_ok = "Windows NT" in str(profile.user_agent)
+    checks.append(SentinelCheck(
+        "client_hints",
+        hint_version_ok and hint_platform_ok and ua_os_ok,
+        "sec-ch-ua v%s / platform %s / UA %s" % (ua_version or chr(34), hints.get("sec-ch-ua-platform"), profile.platform),
+    ))
     checks.append(SentinelCheck("sdk_url", str(payload[5] or "") == SENTINEL_SDK_URL, f"SDK {SENTINEL_SDK_URL}"))
     checks.append(SentinelCheck(
         "locale",
