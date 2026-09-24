@@ -46,6 +46,10 @@ class TaskLogsRepository:
         """Return task events after a cursor, oldest first, for SSE replay."""
         if not task_id:
             return []
+        # SSE 每秒轮询这里；先 flush 才能保证刚写的事件立刻可见。
+        from core.task_event_writer import flush_pending_events
+
+        flush_pending_events()
         bounded = min(max(int(limit or 0), 1), 500)
         with Session(engine) as session:
             rows = session.exec(

@@ -110,6 +110,8 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     from services.task_runtime import task_runtime
     task_runtime.start()
+    from core.task_event_writer import task_event_writer
+    task_event_writer.start()
     from services.solver_manager import start_async
     start_async()
     from core.lifecycle import lifecycle_manager
@@ -121,6 +123,9 @@ async def lifespan(app: FastAPI):
     _scheduler.stop()
     from services.task_runtime import task_runtime as _task_runtime
     _task_runtime.stop()
+    # 关停时把缓冲区里剩下的事件落盘，别丢最后一批日志。
+    from core.task_event_writer import task_event_writer as _event_writer
+    _event_writer.stop()
     from services.solver_manager import stop
     stop()
 

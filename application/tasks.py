@@ -620,6 +620,10 @@ def list_tasks(*, platform: str = "", status: str = "", page: int = 1, page_size
 
 
 def list_task_events(task_id: str, *, since: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+    # 事件可能还在缓冲区里；读之前先落盘，否则调用方会看到滞后的日志。
+    from core.task_event_writer import flush_pending_events
+
+    flush_pending_events()
     limit = min(max(limit, 1), 500)
     with Session(engine) as session:
         q = (
@@ -634,6 +638,15 @@ def list_task_events(task_id: str, *, since: int = 0, limit: int = 200) -> list[
 
 
 def append_task_event(task_id: str, message: str, *, event_type: str = "log", level: str = "info", detail: dict | None = None) -> dict[str, Any]:
+    """Write one event immediately.
+
+    Used for state transitions (created / cancelled / interrupted) rather than the
+    per-line hot path. The pending buffer is flushed first so a state event cannot
+    jump ahead of log lines that were emitted before it.
+    """
+    from core.task_event_writer import flush_pending_events
+
+    flush_pending_events()
     with Session(engine) as session:
         event = TaskEventModel(
             task_id=task_id,
@@ -805,13 +818,27 @@ class TaskLogger:
             merged_detail["subtask_id"] = sid
         if slabel and "subtask_label" not in merged_detail:
             merged_detail["subtask_label"] = slabel
-        append_task_event(
-            self.task_id,
-            message,
-            event_type=event_type,
-            level=level,
-            detail=merged_detail or None,
-        )
+        # 热路径：一次注册上百条日志，逐条 commit 在并发下会形成写锁排队
+        # （实测 8 线程 328 事件/秒，合批后 4906）。进缓冲区由 flusher 合批提交；
+        # 所有读方都会先 flush，所以前端不会漏事件。
+        from core.task_event_writer import buffering_enabled, task_event_writer
+
+        if buffering_enabled():
+            task_event_writer.enqueue(
+                self.task_id,
+                message,
+                event_type=event_type,
+                level=level,
+                detail=merged_detail or None,
+            )
+        else:
+            append_task_event(
+                self.task_id,
+                message,
+                event_type=event_type,
+                level=level,
+                detail=merged_detail or None,
+            )
         prefix = f"[task:{self.task_id}]"
         if sid:
             prefix += f"[{sid}]"
