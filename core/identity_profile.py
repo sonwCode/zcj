@@ -12,18 +12,22 @@ macOS (``chrome142`` is macOS Tahoe). The old code impersonated ``chrome142`` wh
 sending ``Windows NT 10.0; Win64; x64`` and ``sec-ch-ua-platform: "Windows"``, so the
 TLS/HTTP2 fingerprint said macOS and the headers said Windows.
 
-This module resolves one profile per session and keeps every layer consistent:
+Every value in ``_CHROME_TARGETS`` was **measured**, not looked up: the installed
+``curl_cffi`` was pointed at a local echo server and the headers it actually sent were
+read back. Two things that were guessed wrong before and are now measured:
 
-* the ``impersonate`` target decides the OS, and the OS decides the UA and the
-  ``sec-ch-ua-platform`` hint
-* the region decides timezone, locale and ``Accept-Language`` so they agree with the
-  proxy exit IP
-* the Chrome "GREASE" brand is pinned per major version, because Chrome randomises
-  that token per build and a stale value for a claimed version is a contradiction
-* the full client-hint set is emitted, since a real Chrome sends more than
-  ``sec-ch-ua``/``platform``/``mobile``
-* hardware-shaped fields vary deterministically per session seed so accounts are not
-  byte-identical
+* the OS - which decides the UA and the ``sec-ch-ua-platform`` hint
+* the Chrome "GREASE" brand **and its position** - Chrome rotates both per build
+  (136 and 142 put it third, 146 second, 150 first), so pinning one spelling at one
+  position is wrong for most versions
+
+Only the hints ``curl_cffi`` itself sends are emitted. Chrome sends the wider
+``sec-ch-ua-*`` family only after a server opts in with ``Accept-CH``, so sending them
+by default would be its own deviation.
+
+The remaining layers stay coherent per session: the region decides timezone, locale and
+``Accept-Language`` so they agree with the proxy exit IP, and hardware-shaped fields
+vary deterministically per seed so accounts are not byte-identical.
 """
 from __future__ import annotations
 
@@ -37,35 +41,40 @@ DEFAULT_IMPERSONATE = os.environ.get("ZCJ_CHATGPT_IMPERSONATE", "chrome142")
 
 _Q = chr(34)
 
-
-def _ch(brand: str, version: str) -> str:
-    """Render one ``sec-ch-ua`` brand token: ``"Brand";v="1"``."""
-    return _Q + brand + _Q + ";v=" + _Q + version + _Q
-
-
-# impersonate -> (major, os_family, ua_platform_token, platform_version)
+# impersonate -> measured values for that target.
 #
-# The OS for each target comes from the installed curl_cffi fingerprint table, not
-# from guesswork: chrome119 and up are all macOS there, so a Windows UA is incoherent
-# with them. Only targets with a sourced GREASE brand are listed.
-_CHROME_TARGETS: dict[str, tuple[str, str, str, str]] = {
-    "chrome136": ("136", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "15"),
-    "chrome142": ("142", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "26"),
-    "chrome146": ("146", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "26"),
-    "chrome150": ("150", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "26"),
+# ``sec_ch_ua`` is the exact header the installed curl_cffi sends for this target.
+# Keep it in sync by re-running the local echo probe if curl_cffi is upgraded;
+# ``sentinel_check`` will flag a version mismatch inside the profile, and
+# ``scripts/probe_curl_cffi_headers.py`` regenerates this table.
+_CHROME_TARGETS: dict[str, dict[str, str]] = {
+    "chrome136": {
+        "version": "136",
+        "os_family": "macOS",
+        "ua_token": "Macintosh; Intel Mac OS X 10_15_7",
+        "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+    },
+    "chrome142": {
+        "version": "142",
+        "os_family": "macOS",
+        "ua_token": "Macintosh; Intel Mac OS X 10_15_7",
+        "sec_ch_ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+    },
+    "chrome146": {
+        "version": "146",
+        "os_family": "macOS",
+        "ua_token": "Macintosh; Intel Mac OS X 10_15_7",
+        "sec_ch_ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+    },
+    "chrome150": {
+        "version": "150",
+        "os_family": "macOS",
+        "ua_token": "Macintosh; Intel Mac OS X 10_15_7",
+        "sec_ch_ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+    },
 }
 
-# Chrome randomises the "GREASE" brand token per build. Claiming one version while
-# sending another version's token is a self-contradiction, so the token is pinned per
-# major version instead of hardcoded once.
-_GREASE_BRANDS: dict[str, tuple[str, str]] = {
-    "136": ("Not.A/Brand", "99"),
-    "142": ("Not/A)Brand", "8"),
-    "146": ("Not-A.Brand", "24"),
-    "150": ("Not;A=Brand", "8"),
-}
-
-_SCREENS_BY_OS: dict[str, tuple[str, ...]] = {
+_SCREENS_BY_OS: dict[str, tuple] = {
     "macOS": ("1440x900", "1512x982", "1728x1117", "2560x1600", "1920x1080"),
     "Windows": ("1920x1080", "2560x1440", "1536x864", "1680x1050"),
 }
@@ -88,9 +97,6 @@ class BrowserProfile:
     screen: str
     platform: str
     sec_ch_ua: str
-    sec_ch_ua_full_version_list: str
-    sec_ch_ua_platform_version: str
-    sec_ch_ua_arch: str
     chrome_version: str
     hardware_concurrency: int
     device_memory: int
@@ -129,13 +135,13 @@ class BrowserProfile:
         return now.strftime("%a %b %d %Y %H:%M:%S ") + "GMT" + offset + " (" + label + ")"
 
     def headers(self, *, navigation: bool = False, referer: str = "", origin: str = "") -> dict:
-        """Request headers, including the full client-hint set.
+        """Request headers, matching what the impersonated build would send.
 
-        A real Chrome sends the whole ``sec-ch-ua*`` family, so every hint the browser
-        would emit is present. ``Accept-Encoding`` carries ``zstd`` because Chrome 123+
-        negotiates it, and omitting it while claiming 142 is a version tell.
-        ``Connection`` is deliberately absent: the transport is HTTP/2, where that
-        header is meaningless and a real Chrome never sends it.
+        Only the three client hints curl_cffi itself emits are included; the wider
+        ``sec-ch-ua-*`` family is opt-in via ``Accept-CH`` and sending it by default
+        would be its own deviation. ``Accept-Encoding`` carries ``zstd`` because
+        Chrome 123+ negotiates it. ``Connection`` is deliberately absent: the transport
+        is HTTP/2, where a real Chrome never sends it.
 
         ``navigation=True`` switches the ``Sec-Fetch-*`` group to a top-level document
         navigation (document/navigate/none, plus user and upgrade-insecure-requests)
@@ -145,12 +151,7 @@ class BrowserProfile:
         headers = {
             "User-Agent": self.user_agent,
             "sec-ch-ua": self.sec_ch_ua,
-            "sec-ch-ua-full-version-list": self.sec_ch_ua_full_version_list,
             "sec-ch-ua-platform": _Q + self.platform + _Q,
-            "sec-ch-ua-platform-version": _Q + self.sec_ch_ua_platform_version + _Q,
-            "sec-ch-ua-arch": _Q + self.sec_ch_ua_arch + _Q,
-            "sec-ch-ua-bitness": _Q + "64" + _Q,
-            "sec-ch-ua-model": _Q + _Q,
             "sec-ch-ua-mobile": "?0",
             "Accept-Language": self.accept_language,
             "Accept-Encoding": "gzip, deflate, br, zstd",
@@ -180,7 +181,7 @@ class BrowserProfile:
 
 
 # region -> (navigator_language, accept_language, timezone, timezone_label)
-_REGIONS: dict[str, tuple[str, str, str, str]] = {
+_REGIONS: dict[str, tuple] = {
     "US": ("en-US", "en-US,en;q=0.9", "America/New_York", "Eastern Standard Time"),
     "CA": ("en-CA", "en-CA,en;q=0.9,fr-CA;q=0.8", "America/Toronto", "Eastern Standard Time"),
     "GB": ("en-GB", "en-GB,en;q=0.9", "Europe/London", "Greenwich Mean Time"),
@@ -246,25 +247,16 @@ def _seed_int(seed: str) -> int:
 
 def _build(region: str, seed: str, target: str) -> BrowserProfile:
     navigator_language, accept_language, tz, tz_label = _REGIONS[region]
-    version, os_family, ua_token, platform_version = _CHROME_TARGETS[target]
-    grease_name, grease_ver = _GREASE_BRANDS[version]
+    spec = _CHROME_TARGETS[target]
+    version = spec["version"]
+    os_family = spec["os_family"]
     n = _seed_int(seed)
 
     user_agent = (
-        "Mozilla/5.0 (" + ua_token + ") "
+        "Mozilla/5.0 (" + spec["ua_token"] + ") "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/" + version + ".0.0.0 Safari/537.36"
     )
-    sec_ch_ua = ", ".join((
-        _ch("Chromium", version),
-        _ch(grease_name, grease_ver),
-        _ch("Google Chrome", version),
-    ))
-    sec_ch_ua_full = ", ".join((
-        _ch("Chromium", version + ".0.0.0"),
-        _ch(grease_name, grease_ver + ".0.0.0"),
-        _ch("Google Chrome", version + ".0.0.0"),
-    ))
     screens = _SCREENS_BY_OS.get(os_family) or _SCREENS_BY_OS["macOS"]
 
     return BrowserProfile(
@@ -278,10 +270,7 @@ def _build(region: str, seed: str, target: str) -> BrowserProfile:
         timezone_label=tz_label,
         screen=screens[n % len(screens)],
         platform=os_family,
-        sec_ch_ua=sec_ch_ua,
-        sec_ch_ua_full_version_list=sec_ch_ua_full,
-        sec_ch_ua_platform_version=platform_version,
-        sec_ch_ua_arch="arm" if (n >> 4) % 2 else "x86",
+        sec_ch_ua=spec["sec_ch_ua"],
         chrome_version=version,
         hardware_concurrency=_CORES[(n >> 8) % len(_CORES)],
         device_memory=_MEMORY[(n >> 16) % len(_MEMORY)],

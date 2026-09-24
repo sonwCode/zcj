@@ -365,47 +365,65 @@ TLS 指纹说 macOS、HTTP 头说 Windows。CF 不需要任何启发式就能看
 **这一条是上一轮引入 `identity_profile` 时漏掉的**：画像的时区/locale 已经跟代理走了，
 但 OS 仍然是被硬编码的 Windows。
 
-### 第二个问题：GREASE 品牌与版本不匹配
+### 第二个问题：GREASE 品牌与版本不匹配（而且我第一次改错了）
 
 Chrome 的 `sec-ch-ua` 里有一个随版本变化的 GREASE 品牌 token，ZCJ 只硬编码了一个值：
 
 ```python
-'"Not_A Brand";v="99"'   # 声称 Chrome 142，却用着更老版本的 token
+'"Not_A Brand";v="99"'   # 声称 Chrome 142
 ```
 
-各版本的真实取值（两条独立来源一致）：
+两个公开项目对 142 的取值**互相矛盾**：`Regert888` 的注释说是 `"Not/A)Brand";v="8"`，
+`TongjiRabbit` 的表说是 `"Not_A Brand";v="99"`。而 `TongjiRabbit` 还把 `chrome142` 和
+**Windows UA** 配在一起 —— 但 curl_cffi 的 chrome142 是 macOS，说明它这张表整体不可信。
 
-| Chrome | GREASE 品牌 |
+**所以不猜，直接量**：把 curl_cffi 指向本地回环的 echo server，读回它真正发出去的头。
+（不访问外网、不需要 Chrome、不需要凭据。）实测：
+
+| Chrome | 实际 `sec-ch-ua` |
 | --- | --- |
-| 136 | `"Not.A/Brand";v="99"` |
-| 142 | `"Not/A)Brand";v="8"` |
-| 146 | `"Not-A.Brand";v="24"` |
-| 150 | `"Not;A=Brand";v="8"` |
+| 136 | `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"` |
+| 142 | `"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"` |
+| 146 | `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"` |
+| 150 | `"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"` |
 
-### 第三个问题：client hints 只发了三分之一
+两个关键结论：
 
-真实 Chrome 会发完整的一组，ZCJ 只发了 `sec-ch-ua` / `-platform` / `-mobile`。
-少发的 hint 本身就是特征。
+1. **ZCJ 原来的 `"Not_A Brand";v="99"` 其实是对的** —— 我按 `Regert888` 的注释"改错"了，
+   本轮按实测值改回来。公开项目的注释不能当证据。
+2. **GREASE 的位置也在变**（136/142 第三位、146 第二位、150 第一位），
+   所以只 pin 一个 token 不够，必须按目标存整串。
+
+### 第三个问题：client hints 多发了一半（原本以为"只发了三分之一"）
+
+原来以为"真实 Chrome 会发完整的一组"，于是补上了
+`sec-ch-ua-full-version-list` / `-arch` / `-bitness` / `-model` / `-platform-version`。
+实测发现 **curl_cffi 只发 `sec-ch-ua` / `-platform` / `-mobile` 三个** —— 这也符合真实
+行为：完整那组要服务端用 `Accept-CH` 主动协商，默认请求里不发。**多发反而是破绽**，
+已全部撤掉。
 
 ### 设计
 
-把**`impersonate` 目标作为画像的唯一真相来源**，OS 由它决定，UA 与 client hints 再从
-OS 派生，三者因此不可能互相矛盾：
+把**`impersonate` 目标作为画像的唯一真相来源**，而且表里的值全部来自实测：
 
 ```python
 _CHROME_TARGETS = {
-    # impersonate -> (major, os_family, ua_platform_token, platform_version)
-    "chrome136": ("136", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "15"),
-    "chrome142": ("142", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "26"),
-    "chrome146": ("146", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "26"),
-    "chrome150": ("150", "macOS", "Macintosh; Intel Mac OS X 10_15_7", "26"),
+    "chrome142": {
+        "version": "142",
+        "os_family": "macOS",
+        "ua_token": "Macintosh; Intel Mac OS X 10_15_7",
+        "sec_ch_ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+    },
+    # ...
 }
 ```
 
-只收录有可靠 GREASE 取值的目标；默认 `chrome142`（与项目原有版本选择一致），
-可用 `ZCJ_CHATGPT_IMPERSONATE` 或 `extra.browser_impersonate` 覆盖。
-`OpenAIHTTPClient` 的 `RequestConfig(impersonate=...)` 现在也取自画像，
-不再写死。
+默认 `chrome142`（与项目原有版本选择一致），可用 `ZCJ_CHATGPT_IMPERSONATE` 或
+`extra.browser_impersonate` 覆盖。`OpenAIHTTPClient` 的 `RequestConfig(impersonate=...)`
+现在也取自画像，不再写死。
+
+配套 `scripts/probe_curl_cffi_headers.py`：重跑一次即可核对整张表，不一致就退出码非零，
+所以升级 curl_cffi 时可以直接拿它当门禁，不会再出现"代码里的值和实际发出的值漂移"。
 
 ### 顺带修掉的浏览器路径隐患
 
@@ -416,9 +434,15 @@ _CHROME_TARGETS = {
 
 ### 自检
 
-`sentinel_check.py` 新增第 12 项 `client_hints`：断言 `sec-ch-ua` 里的版本与 UA 的
-`Chrome/NN` 一致、`sec-ch-ua-platform` 与画像 OS 一致、且 UA 的 OS token 与
-`sec-ch-ua-platform` 不冲突。5 个地区 × 4 个目标的 20 种组合全部通过。
+两层校验：
+
+1. **画像内部自洽** —— `sentinel_check.py` 第 12 项 `client_hints`：断言 `sec-ch-ua`
+   里的版本与 UA 的 `Chrome/NN` 一致、`sec-ch-ua-platform` 与画像 OS 一致、
+   且 UA 的 OS token 与 `sec-ch-ua-platform` 不冲突。
+   6 个地区 × 4 个目标 = 24 种组合，哨兵自检全部 12/12。
+2. **画像与 curl_cffi 实际行为一致** —— `scripts/probe_curl_cffi_headers.py`：
+   把 curl_cffi 指向本地 echo server，逐目标比对 UA / `sec-ch-ua` / `sec-ch-ua-platform`。
+   当前 curl_cffi 0.16.3 下 4/4 完全一致，退出码 0。
 
 ### 遗留
 
