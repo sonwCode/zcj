@@ -33,6 +33,19 @@ RESUMABLE_STATUSES = {"pending_verification", "manual_phone_required"}
 TERMINAL_STAGES = {"account_created"}
 
 
+def _stage_is_terminal(value: Any) -> bool:
+    """Honour the explicit terminal marker written by the pipeline.
+
+    ``_mark_terminal_registration_account`` writes ``detail.terminal = True`` for a
+    failure the remote side has already made permanent. Relying on the account
+    status alone to catch that would be indirect, so the marker is read directly.
+    """
+    if not isinstance(value, dict):
+        return False
+    detail = value.get("detail")
+    return isinstance(detail, dict) and detail.get("terminal") is True
+
+
 @dataclass(frozen=True)
 class ResumeCandidate:
     account_id: int
@@ -81,16 +94,20 @@ def plan_resume(overview: dict, *, status: str = "") -> tuple[bool, str, str]:
     """Decide whether one stored account can be resumed, and from where."""
     normalized = str(status or "").strip().lower()
     if normalized not in RESUMABLE_STATUSES:
-        return False, "", f"状态 {normalized or "unknown"} 不可续跑"
+        return False, "", "状态 " + (normalized or "unknown") + " 不可续跑"
 
-    pipeline = dict((overview or {}).get("registration_pipeline") or {})
+    data = overview or {}
+    if str(data.get("validity_status") or "").strip().lower() == "invalid":
+        return False, "", "远端已判定失效"
+
+    pipeline = dict(data.get("registration_pipeline") or {})
     stages = dict(pipeline.get("stages") or {})
     failed = first_failed_stage(stages)
     if not failed:
         return False, "", "没有失败阶段"
-    if failed in TERMINAL_STAGES:
-        return False, "", f"{failed} 为终态失败"
-    return True, failed, f"从 {failed} 续跑"
+    if failed in TERMINAL_STAGES or _stage_is_terminal(stages.get(failed)):
+        return False, "", failed + " 为终态失败"
+    return True, failed, "从 " + failed + " 续跑"
 
 
 def find_resumable_accounts(
