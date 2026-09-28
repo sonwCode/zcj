@@ -27,13 +27,32 @@ def _format_value(value: Any) -> str:
 
 
 def _format_reset_at(value: Any) -> str:
+    """Render a Unix-seconds timestamp as local ``MM/DD HH:MM``.
+
+    This is a *display* helper fed straight from upstream payloads (the Codex usage
+    ``overview`` blob), so it has to be total: it must never raise. Bad input is not
+    hypothetical - a millisecond epoch (``1767225600000``), a large sentinel such as
+    ``999999999999999``, or ``float("inf")`` all blow up inside ``fromtimestamp`` with
+    ``ValueError`` / ``OverflowError`` / ``OSError`` respectively. Because
+    ``build_account_display_summary`` runs in the row-to-record mapper, one bad field
+    would fail the whole account read rather than just drop a label.
+
+    Out-of-range values therefore render as an empty string, the same as "no value".
+    """
+    if isinstance(value, bool):
+        # ``True`` is an ``int``; it is never a timestamp.
+        return ""
     try:
         timestamp = int(value or 0)
-    except (TypeError, ValueError):
-        timestamp = 0
+    except (TypeError, ValueError, OverflowError):
+        return ""
     if timestamp <= 0:
         return ""
-    return datetime.fromtimestamp(timestamp, timezone.utc).astimezone().strftime("%m/%d %H:%M")
+    try:
+        moment = datetime.fromtimestamp(timestamp, timezone.utc).astimezone()
+    except (ValueError, OverflowError, OSError):
+        return ""
+    return moment.strftime("%m/%d %H:%M")
 
 
 def _format_maybe_timestamp(value: Any) -> str:
@@ -110,7 +129,7 @@ def _quota_period_label(limit: dict[str, Any] | None, *, plan_type: str = "") ->
     window = _safe_dict(_safe_dict(limit).get("primary_window"))
     try:
         window_seconds = int(window.get("limit_window_seconds") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         window_seconds = 0
 
     if window_seconds >= 28 * 24 * 60 * 60:

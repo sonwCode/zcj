@@ -11,7 +11,14 @@ import uuid
 from typing import Any, Callable, Optional
 from urllib.parse import urljoin, urlparse
 
-from camoufox.sync_api import Camoufox
+try:
+  from camoufox.sync_api import Camoufox
+except ImportError:  # 离线/协议-only 环境：把失败推迟到真正打开浏览器时
+  # camoufox 是浏览器后端的硬依赖，但模块级 import 会让「只用协议路径」的部署
+  # 或离线测试环境连纯辅助函数都无法 import。open_browser_backend 已把
+  # camoufox_class=None 定义为「后端不可用」并抛出明确 RuntimeError，
+  # 所以推迟到首次使用既保留了错误信息，又恢复了本模块的可导入性。
+  Camoufox = None  # type: ignore[assignment]
 
 from .._browser_backend import BrowserBackendConfig, open_browser_backend
 from .constants import (
@@ -2142,18 +2149,20 @@ def _fetch_chatgpt_session_from_page(page, cookies_dict: dict, log, timeout: int
     raise RuntimeError(f"ChatGPT session 未返回 accessToken: {last_error}")
 
 
-def _random_chrome_ua() -> str:
-    patch = random.randint(0, 220)
+def _fallback_browser_ua() -> str:
+    """Last-resort UA for the Camoufox (Firefox) backend.
+
+    Only reached when the live page cannot report ``navigator.userAgent``, which means
+    the browser is already unhealthy. It still must not claim to be Chrome on Windows:
+    the value is embedded in the Sentinel payload, which is meant to describe the real
+    browser, and the transport under it is Firefox. A Chrome/Windows string here would
+    be the same fingerprint-vs-header disagreement fixed elsewhere in this module.
+    """
+    patch = random.randint(0, 20)
     return (
-        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/136.0.7103.{patch} Safari/537.36"
+        f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) "
+        f"Gecko/20100101 Firefox/135.{patch}"
     )
-
-
-def _infer_sec_ch_ua(user_agent: str) -> str:
-    match = re.search(r"Chrome/(\d+)", str(user_agent or ""))
-    major = str(match.group(1) if match else "136")
-    return f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not.A/Brand";v="99"'
 
 
 def _build_browser_headers(
@@ -2166,12 +2175,21 @@ def _build_browser_headers(
     navigation: bool = False,
     extra_headers: dict | None = None,
 ) -> dict:
+    # 这些请求是 page.evaluate 里的 fetch()，由**真实浏览器**发出。两条硬约束：
+    #
+    # 1. Sec-* 是 forbidden request header（见 Fetch 规范与 MDN），浏览器会丢弃脚本
+    #    传入的值并替换成自己的。Firefox（Camoufox 就是 Firefox）本来就不发
+    #    sec-ch-ua*，这里再塞一组 Chrome 的 client hints 既不可能生效，又会让读代码
+    #    的人以为正在发 Chrome 提示头。真要发，只能换浏览器内核，不是加请求头。
+    # 2. user-agent 不是 forbidden header，是能被真正写上去的 —— 所以这里塞一个
+    #    Chrome/Windows 的合成 UA，会**真的覆盖**掉 Firefox 自己的 UA，让传输层指纹
+    #    （Firefox）和请求头（Chrome/Windows）打架。这与启动处「刻意不覆盖
+    #    user_agent」的取舍互相矛盾，见本文件 _open_playwright 附近的注释。
+    #
+    # 因此这里不再伪造这两类头，交给浏览器用自己的身份发。accept-language 同理：
+    # 它由浏览器上下文的 locale 决定（创建 context 时已按画像的 navigator_language
+    # 设置），写死 en-US 只会和代理出口地区打架。这里只保留协议语义字段。
     headers = {
-        "user-agent": user_agent or _random_chrome_ua(),
-        "accept-language": "en-US,en;q=0.9",
-        "sec-ch-ua": _infer_sec_ch_ua(user_agent),
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
         "accept": accept,
     }
     if referer:
@@ -2312,7 +2330,7 @@ def _decode_jwt_payload(token: str) -> dict:
 class _SentinelTokenGenerator:
     def __init__(self, device_id: str, user_agent: str, profile=None):
         self.device_id = device_id or str(uuid.uuid4())
-        self.user_agent = user_agent or _random_chrome_ua()
+        self.user_agent = user_agent or _fallback_browser_ua()
         self.sid = str(uuid.uuid4())
         self.profile = profile
 
@@ -2546,7 +2564,7 @@ def _send_browser_email_otp(page) -> dict:
             "sec-fetch-site": "same-origin",
             "sec-fetch-mode": "cors",
             "sec-fetch-dest": "empty",
-            "accept-language": "en-US,en;q=0.9",
+            # accept-language 由浏览器上下文的 locale 决定，写死会和代理出口打架。
         },
         redirect="follow",
     )
@@ -2649,7 +2667,13 @@ def _complete_oauth_with_session(cookies_dict: dict, oauth_start, proxy: str | N
                 "referer": consent_url,
                 "origin": OPENAI_AUTH,
                 "content-type": "application/json",
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+                # 会话是按 chrome131 建的（macOS，见 curl_cffi 指纹表），这里却写
+                # Windows Chrome 136：TLS 指纹说 macOS、请求头说 Windows。
+                "user-agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/136.0.0.0 Safari/537.36"
+                ),
             },
             data=json.dumps({"workspace_id": workspace_id}),
             allow_redirects=False,
@@ -2691,7 +2715,12 @@ def _complete_oauth_with_session(cookies_dict: dict, oauth_start, proxy: str | N
                     "referer": consent_url,
                     "origin": OPENAI_AUTH,
                     "content-type": "application/json",
-                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+                    # 同 workspace/select：会话是 chrome131（macOS），UA 不能写 Windows。
+                    "user-agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/136.0.0.0 Safari/537.36"
+                    ),
                 },
                 data=json.dumps(org_body),
                 allow_redirects=False,
@@ -2923,9 +2952,9 @@ def _do_codex_oauth(
             client_id=CODEX_CLIENT_ID,
         )
     try:
-        user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip() or _random_chrome_ua()
+        user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip() or _fallback_browser_ua()
     except Exception:
-        user_agent = _random_chrome_ua()
+        user_agent = _fallback_browser_ua()
     device_id = str(cookies_dict.get("oai-did") or uuid.uuid4())
     log(f"  Codex OAuth 授权链接: {oauth_start.auth_url}")
     log(f"  OAuth state={oauth_start.state[:20]}...")
@@ -4936,9 +4965,9 @@ def _submit_about_you_via_page(page, log) -> dict:
 def _browser_registration_flow(page, email: str, password: str, otp_callback, phone_callback, log) -> dict:
     device_id = str(uuid.uuid4())
     try:
-        user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip() or _random_chrome_ua()
+        user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip() or _fallback_browser_ua()
     except Exception:
-        user_agent = _random_chrome_ua()
+        user_agent = _fallback_browser_ua()
 
     _seed_browser_device_id(page, device_id)
     try:

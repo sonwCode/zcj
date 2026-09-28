@@ -11,6 +11,7 @@ from typing import Any
 from sqlmodel import Session, select
 
 from core.account_graph import (
+    coerce_int,
     load_account_graphs,
     patch_account_graph,
     recover_lifecycle_status_for_valid_account,
@@ -41,6 +42,32 @@ def _iso_from_ts(value: int | float) -> str:
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+def _format_jwt_claim(value: Any, tzinfo: timezone) -> str:
+    """Format a JWT ``exp``/``iat`` claim, never raising.
+
+    The claims come from an upstream-issued token, so they are untrusted: a
+    millisecond epoch or a corrupt/oversized number raises inside
+    ``fromtimestamp`` (``ValueError`` / ``OSError`` / ``OverflowError``). This runs
+    in the middle of the refresh-and-upload flow, where such an exception is
+    swallowed as a generic sync error *after* the token was already refreshed -
+    the upload is lost and the log misleads. A formatting failure must not have
+    that authority, so bad input degrades to an empty string.
+    """
+    if value in (None, "") or isinstance(value, bool):
+        return ""
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if timestamp <= 0:
+        return ""
+    try:
+        moment = datetime.fromtimestamp(timestamp, tz=tzinfo)
+    except (ValueError, OverflowError, OSError):
+        return ""
+    return moment.strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +794,7 @@ def flag_expiring_trials(
 
     for overview in overviews:
         summary = overview.get_summary()
-        trial_end = int(summary.get("trial_end_time") or 0)
+        trial_end = coerce_int(summary.get("trial_end_time"))
         if not trial_end:
             results["skipped"] += 1
             continue
@@ -961,8 +988,14 @@ def refresh_and_sync_cpa(
                 account_id = auth_info.get("chatgpt_account_id", "")
                 exp = jwt_payload.get("exp", 0)
                 iat = jwt_payload.get("iat", 0)
-                expired_str = datetime.fromtimestamp(exp, tz=tz8).strftime("%Y-%m-%dT%H:%M:%S+08:00") if exp else ""
-                last_refresh = datetime.fromtimestamp(iat, tz=tz8).strftime("%Y-%m-%dT%H:%M:%S+08:00") if iat else _utcnow_iso()
+                # exp/iat 来自上游签发的 JWT，是不可信输入。原来的写法只挡了
+                # 0/None（`if exp else`），越界值（毫秒时间戳、损坏或伪造的 claim）
+                # 会在 fromtimestamp 里抛 ValueError/OSError/OverflowError。这里在
+                # 整个刷新+上传流程的 try 内，异常会被吞成 results["error"] 并把
+                # 日志写成"异常"——**上传已经在半途失败**，操作者却会以为是认证/
+                # 网络问题。格式化失败不应该有这个权限：越界就退化成空串/当前时间。
+                expired_str = _format_jwt_claim(exp, tz8)
+                last_refresh = _format_jwt_claim(iat, tz8) or _utcnow_iso()
 
                 token_data = {
                     "access_token": access_token,

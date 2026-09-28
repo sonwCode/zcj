@@ -44,6 +44,11 @@ Copy-Item .env.example .env
 python -m uvicorn main:app --host 0.0.0.0 --port 8001
 ```
 
+> **可选依赖**：GoPay 相关功能（`platforms/gopay/`）依赖一个**不随本仓库分发**的
+> 协议 SDK。它要么放在 `platforms/gopay-deploy/app/src/`（该路径已在 `.gitignore`
+> 中排除，所以全新克隆里没有），要么用 `pip install -e` 安装成可导入的 `opai`。
+> 缺失时**只有 GoPay 功能受影响**，报错会直接指出期望路径；不用 GoPay 可以忽略。
+
 前端开发：
 
 ```powershell

@@ -2285,7 +2285,11 @@ class ChatGPTPlatform(BasePlatform):
                             "accept": "application/json",
                             "origin": "https://auth.openai.com",
                             "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-                            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                            "user-agent": (
+                                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/150.0.0.0 Safari/537.36"
+                            ),
                             "cookie": cookie_header,
                         }
                         workspace_id = ""

@@ -4,7 +4,7 @@ from typing import Any
 
 from sqlmodel import Session
 
-from core.account_graph import load_account_graphs, sync_account_graph
+from core.account_graph import coerce_int, load_account_graphs, sync_account_graph
 from core.base_platform import Account as PlatformAccount
 from core.base_platform import AccountStatus
 from core.db import AccountModel
@@ -116,6 +116,6 @@ def build_platform_account(session: Session, model: AccountModel) -> PlatformAcc
         region=str(_overview_value(graph, "region", "") or ""),
         token=resolve_primary_token(model, graph),
         status=status,
-        trial_end_time=int(_overview_value(graph, "trial_end_time", 0) or 0),
+        trial_end_time=coerce_int(_overview_value(graph, "trial_end_time", 0)),
         extra=build_platform_extra(model, graph),
     )

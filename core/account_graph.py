@@ -87,6 +87,24 @@ def _safe_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+def coerce_int(value: Any, default: int = 0) -> int:
+    """Coerce a value read out of the stored account graph to an int.
+
+    The graph is persisted JSON, so its fields are only as trustworthy as whatever wrote
+    them: a row from an older version, a legacy import, or a hand-edited column can hold
+    a string where the current code writes a number. That is the same stance
+    ``_load_json`` takes over legacy rows, and it matters here because the re-sync below
+    feeds the *stored* overview straight back through the normazliser on startup - one
+    unparseable ``trial_end_time`` must not abort the sync or an account listing.
+    """
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _safe_list(value: Any) -> list[Any]:
     return list(value) if isinstance(value, list) else []
 
@@ -272,7 +290,7 @@ def _normalize_overview_summary(
     payload = _safe_dict(summary)
     payload["platform"] = platform
 
-    trial_end_time = int(payload.get("trial_end_time") or 0)
+    trial_end_time = coerce_int(payload.get("trial_end_time"))
     payload["trial_end_time"] = trial_end_time
     payload["cashier_url"] = _text(payload.get("cashier_url"))
     payload["region"] = _text(payload.get("region"))

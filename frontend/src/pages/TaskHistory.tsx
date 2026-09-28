@@ -63,6 +63,9 @@ export default function TaskHistory() {
 
   useEffect(() => {
     load()
+    // load is redefined every render and closes over exactly platform/status,
+    // so listing it here would re-fire this effect on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [platform, status])
 
   const handleTerminate = async (task: any) => {

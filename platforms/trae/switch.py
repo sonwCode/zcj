@@ -52,7 +52,7 @@ def _atomic_write(filepath: str, content: str):
     except Exception:
         try:
             os.close(fd)
-        except:
+        except Exception:
             pass
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -205,9 +205,9 @@ def get_trae_user_info(token: str) -> dict | None:
             "https://api-sg-central.trae.ai/cloudide/api/v3/common/GetUserToken",
             headers={
                 "Authorization": f"Cloud-IDE-JWT {token}",
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                             "Chrome/145.0.0.0 Safari/537.36"
+                             "Chrome/124.0.0.0 Safari/537.36"
             },
             json={},
             impersonate="chrome124",

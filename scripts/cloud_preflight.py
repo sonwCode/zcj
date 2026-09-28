@@ -94,10 +94,17 @@ def check_python(report: Report) -> None:
     )
 
 
+# Imported at module scope somewhere on the startup path, so a missing one means the
+# service does not come up at all.  ``requests`` is pulled in by services/solver_manager
+# and ``pydantic`` by the API models; both are easy to lose in a dieted image.
+# ``curl_cffi`` is only imported lazily inside request paths, but it is kept here because
+# the registration path is useless without it.
+REQUIRED_IMPORTS = ("fastapi", "sqlmodel", "sqlalchemy", "pydantic", "requests", "curl_cffi")
+
+
 def check_dependencies(report: Report) -> None:
-    required = ("fastapi", "sqlmodel", "sqlalchemy", "curl_cffi")
     missing = []
-    for name in required:
+    for name in REQUIRED_IMPORTS:
         try:
             __import__(name)
         except Exception:
@@ -150,17 +157,36 @@ def check_timezone_data(report: Report) -> None:
 
 
 def check_auth(report: Report) -> None:
+    """Mirror the rule ``docker-entrypoint.sh`` enforces.
+
+    The entrypoint refuses to start only when the bind address is not loopback and
+    ``APP_PASSWORD`` is empty; a loopback-only deployment is allowed (the entrypoint and
+    ``docs/cloud-deployment.md`` both name ``APP_HOST=127.0.0.1`` as the escape hatch).
+    Reporting FAIL for loopback would contradict the gate this report exists to explain,
+    and would claim the credentials are exposed to "anyone who can reach the port" when
+    the port is not reachable off the host.
+    """
     password = str(os.environ.get("APP_PASSWORD", "") or "").strip()
     insecure_ok = str(os.environ.get("ZCJ_ALLOW_INSECURE", "") or "").strip() == "1"
+    # Unset means the entrypoint default, which is a public bind.
+    host = str(os.environ.get("APP_HOST", "") or "").strip() or "0.0.0.0"
+    loopback = host in ("127.0.0.1", "localhost", "::1")
     if password:
         report.add(PASS, "APP_PASSWORD", "已设置")
     elif insecure_ok:
         report.add(WARN, "APP_PASSWORD", "未设置，且 ZCJ_ALLOW_INSECURE=1", "仅限本机自用。")
+    elif loopback:
+        report.add(
+            WARN,
+            "APP_PASSWORD",
+            "未设置，但只监听 %s" % host,
+            "端口只在本机可达；一旦改成对外监听，必须设置 APP_PASSWORD。",
+        )
     else:
         report.add(
             FAIL,
             "APP_PASSWORD",
-            "未设置",
+            "未设置，且监听 %s" % host,
             "所有 /api 接口无需鉴权，账号口令与平台 Token 对任何能访问端口的人开放。",
         )
 
@@ -178,6 +204,23 @@ def check_single_process(report: Report) -> None:
         report.add(PASS, "进程模型", "单进程")
 
 
+X11_SOCKET_DIR = "/tmp/.X11-unix"
+
+
+def x11_socket_name(display: str) -> str:
+    """Return the socket basename a DISPLAY value really uses, e.g. ":99.0" -> "X99".
+
+    A DISPLAY is ``[host]:display[.screen]``.  The host selects a transport (an empty
+    host means the local unix socket), and the screen picks a screen on that display -
+    neither is part of the socket name.  Appending everything after the colon produced
+    ``X99.0`` and even ``Xlocalhost:99``, so a working display was reported as broken.
+    """
+    value = str(display or "").strip()
+    _, _, tail = value.rpartition(":")
+    number = tail.split(".", 1)[0].strip()
+    return "X" + number
+
+
 def check_display(report: Report) -> None:
     display = str(os.environ.get("DISPLAY", "") or "").strip()
     if not display:
@@ -188,8 +231,7 @@ def check_display(report: Report) -> None:
             "headless 后端不需要；有头后端需要 Xvfb 并设置 DISPLAY。",
         )
         return
-    number = display.lstrip(":")
-    sock = "/tmp/.X11-unix/X%s" % number
+    sock = os.path.join(X11_SOCKET_DIR, x11_socket_name(display))
     if os.path.exists(sock):
         report.add(PASS, "X display", "%s (%s 存在)" % (display, sock))
     else:
@@ -201,25 +243,50 @@ def check_display(report: Report) -> None:
         )
 
 
+def _playwright_browsers_root() -> str:
+    """Where playwright keeps its browsers, matching the Dockerfile."""
+    return str(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "") or "").strip() or "/ms-playwright"
+
+
+def _playwright_chromium() -> str:
+    """Find the Chromium that ``playwright install chromium`` laid down.
+
+    Playwright names the directory after the build - ``chromium-<build>`` (and a separate
+    ``chromium_headless_shell-<build>``) - so a fixed ``chromium/chrome-linux/chrome``
+    path never exists on an image built by this project's Dockerfile, which pins
+    ``PLAYWRIGHT_BROWSERS_PATH=/ms-playwright``.  Globbing the build number keeps this
+    working across playwright releases instead of pinning one.
+    """
+    import glob
+
+    root = _playwright_browsers_root()
+    patterns = (
+        "chromium-*/chrome-linux/chrome",
+        "chromium_headless_shell-*/chrome-linux/headless_shell",
+        "chromium/chrome-linux/chrome",
+    )
+    for pattern in patterns:
+        for hit in sorted(glob.glob(os.path.join(root, pattern))):
+            if os.path.exists(hit):
+                return hit
+    return ""
+
+
 def check_chrome(report: Report) -> None:
     candidates = (
         "google-chrome",
         "google-chrome-stable",
         "chromium",
         "chromium-browser",
-        "/ms-playwright/chromium/chrome-linux/chrome",
     )
     found = ""
     for candidate in candidates:
-        if candidate.startswith("/"):
-            if os.path.exists(candidate):
-                found = candidate
-                break
-        else:
-            located = shutil.which(candidate)
-            if located:
-                found = located
-                break
+        located = shutil.which(candidate)
+        if located:
+            found = located
+            break
+    if not found:
+        found = _playwright_chromium()
     if found:
         report.add(PASS, "浏览器", found)
     else:
@@ -253,9 +320,19 @@ def check_shm(report: Report) -> None:
 
 
 def _database_path() -> str:
+    """Resolve the SQLite file the application will actually open.
+
+    An unset ``ACCOUNT_MANAGER_DATABASE_URL`` means "use the default", not "there is no
+    database to check": falling back to ``core.storage.default_database_url()`` keeps
+    this gate looking at the same file as the application. Returning "" here used to
+    skip the whole SQLite section on the documented default configuration, so a missing
+    or read-only data volume passed the preflight unchallenged.
+    """
     url = str(os.environ.get("ACCOUNT_MANAGER_DATABASE_URL", "") or "").strip()
     if not url:
-        return ""
+        from core.storage import default_database_url
+
+        url = default_database_url()
     if not url.startswith("sqlite"):
         return ""
     return url.split("///")[-1]
@@ -276,10 +353,24 @@ def check_database(report: Report) -> None:
         return
     report.add(PASS, "数据库", directory)
 
-    if os.path.exists(path):
-        report.add(INFO, "数据库文件", "%s (%s)" % (path, _human(os.path.getsize(path))))
-    else:
+    if not os.path.exists(path):
         report.add(INFO, "数据库文件", "尚未创建", "首次启动时初始化。")
+        return
+
+    # A writable directory is not enough: a bind-mounted volume often delivers
+    # ``account_manager.db`` root-owned and read-only while the directory itself is
+    # writable.  SQLite then fails on the first write with "attempt to write a readonly
+    # database" - after the service has already reported a clean start.
+    if not os.access(path, os.W_OK):
+        report.add(
+            FAIL,
+            "数据库文件",
+            "%s 不可写" % path,
+            "SQLite 无法写入该文件（首次写入即失败）。检查挂载卷里该文件的属主与权限。",
+        )
+        return
+
+    report.add(INFO, "数据库文件", "%s (%s)" % (path, _human(os.path.getsize(path))))
 
 
 def check_disk(report: Report) -> None:
@@ -329,17 +420,72 @@ def check_vnc(report: Report) -> None:
         return
     password = str(os.environ.get("VNC_PASSWORD", "") or "").strip()
     bind = str(os.environ.get("VNC_BIND", "127.0.0.1") or "").strip()
-    if not password and str(os.environ.get("ZCJ_ALLOW_INSECURE_VNC", "") or "").strip() != "1":
+    insecure = str(os.environ.get("ZCJ_ALLOW_INSECURE_VNC", "") or "").strip() == "1"
+    if not password and not insecure:
         report.add(
             FAIL,
             "VNC",
             "已启用但无密码",
             "x11vnc 会以 -nopw 启动，任何能连上端口的人都能接管已登录的浏览器会话。",
         )
+    elif not password:
+        # The entrypoint logs a warning here rather than refusing, and check_auth treats
+        # the analogous ZCJ_ALLOW_INSECURE the same way.  Reporting a clean PASS used to
+        # hide the case an operator most needs to see: VNC up, no password.
+        report.add(
+            WARN,
+            "VNC",
+            "已启用但无密码，且 ZCJ_ALLOW_INSECURE_VNC=1",
+            "x11vnc 以 -nopw 启动；仅在本机自用、且端口不可达时才可接受。",
+        )
     elif bind not in ("127.0.0.1", "localhost"):
         report.add(WARN, "VNC", "监听 %s" % bind, "建议只绑回环，通过 SSH 端口转发访问。")
     else:
         report.add(PASS, "VNC", "已启用，只监听 %s" % bind)
+
+
+def check_vault(report: Report) -> None:
+    """Report whether credentials are actually encrypted at rest.
+
+    ``core/vault.py`` transparently encrypts stored passwords, provider keys, mailbox
+    tokens and proxy credentials, and its failure mode is pass-through.  That is silent
+    on the write path - a missing PyNaCl makes ``encrypt_value`` return the plaintext -
+    so an image without it, or a read-only data volume, would store every credential in
+    the clear while the service looked healthy.  ``vault_status()`` already reports it,
+    but only behind an authenticated API; surface it here, before startup.
+    """
+    try:
+        from core.vault import vault_status
+
+        status = vault_status()
+    except Exception as exc:
+        report.add(WARN, "凭据加密", "无法读取状态: %s" % exc)
+        return
+
+    if status.get("enabled"):
+        report.add(
+            PASS,
+            "凭据加密",
+            "%s（密钥来源 %s）" % (status.get("backend") or "unknown", status.get("key_source") or "unknown"),
+        )
+        return
+
+    reason = str(status.get("reason") or "").strip()
+    if status.get("disabled"):
+        report.add(
+            WARN,
+            "凭据加密",
+            "已显式关闭（ZCJ_VAULT_DISABLED）",
+            "账号口令、平台 Token 与代理凭据将以明文写入数据库，请确认这是有意为之。",
+        )
+        return
+
+    report.add(
+        FAIL,
+        "凭据加密",
+        "未生效%s" % (("：" + reason) if reason else ""),
+        "所有敏感字段会以明文写入数据库。检查 PyNaCl 是否可导入，以及数据库目录能否写入密钥文件。",
+    )
 
 
 def run_checks() -> Report:
@@ -356,6 +502,7 @@ def run_checks() -> Report:
     check_disk(report)
     check_retention(report)
     check_vnc(report)
+    check_vault(report)
     return report
 
 

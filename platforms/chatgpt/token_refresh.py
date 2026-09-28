@@ -100,7 +100,15 @@ class TokenRefreshManager:
                     self.SESSION_URL,
                     headers={
                         "accept": "application/json",
-                        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                        # UA 必须与 _create_session 的 impersonate 目标同 OS：
+                        # curl_cffi 的 chrome120 是 macOS（fingerprints.py），写 Windows
+                        # 会与 TLS 指纹打架 —— 而这段代码正是为了绕开 Cloudflare
+                        # 挑战才重试的，指纹自相矛盾只会让挑战更容易出现。
+                        "user-agent": (
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"
+                        )
                     },
                     timeout=30
                 )
@@ -150,7 +158,7 @@ class TokenRefreshManager:
             if expires_str:
                 try:
                     expires_at = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
-                except:
+                except Exception:
                     pass
 
             result.success = True

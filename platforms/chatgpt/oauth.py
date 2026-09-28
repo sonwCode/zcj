@@ -180,8 +180,11 @@ def _post_form(
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        # impersonate="chrome" resolves to curl_cffi's chrome150, which ships as
+        # macOS Tahoe - a Windows UA here would contradict the TLS/HTTP2 fingerprint
+        # sent underneath it (see tests/test_chatgpt_fingerprint_ua_agreement.py).
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
     }
 
     try:

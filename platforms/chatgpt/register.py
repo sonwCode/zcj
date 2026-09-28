@@ -1533,15 +1533,9 @@ class RegistrationEngine:
 
         try:
 
-            ua = self.http_client.default_headers.get("User-Agent", "")
-
-            chrome_match = re.search(r"Chrome/(\d+)", ua)
-
-            chrome_major = str(chrome_match.group(1) if chrome_match else "136")
-
-            sec_ch_ua = f'"Chromium";v="{chrome_major}", "Google Chrome";v="{chrome_major}", "Not.A/Brand";v="99"'
-
-
+            # 浏览器身份类请求头一律由 self.browser_profile 派生（见下方 register_headers），
+            # 这里不再从 UA 里重拼 client hints —— 那会和画像矛盾，而且 Safari/Firefox
+            # 画像根本没有 sec-ch-ua 可拼。
 
             candidates = []
 
@@ -1595,23 +1589,22 @@ class RegistrationEngine:
 
 
 
-                register_headers = {
+                # 请求头必须与 warmup / sentinel 用同一份画像：client hints 只由
+                # profile 派生。Safari / Firefox 画像根本不发 sec-ch-ua*，之前无条件
+                # 塞 Chrome 的 sec-ch-ua + sec-ch-ua-platform="Windows" 等于在 UA 说
+                # Safari 的请求里自报 Chrome/Windows；Chrome 画像下本地重拼的 GREASE
+                # 串也和画像差一个词（Not.A/Brand vs Not_A Brand），且重现不出
+                # chrome146/150 的 GREASE 中置/前置顺序。
+                register_headers = self.browser_profile.headers(
+                    referer="https://auth.openai.com/create-account/password",
+                    origin="https://auth.openai.com",
+                )
 
-                    "origin": "https://auth.openai.com",
-
-                    "referer": "https://auth.openai.com/create-account/password",
+                register_headers.update({
 
                     "accept": "application/json",
 
                     "content-type": "application/json",
-
-                    "accept-language": "en-US,en;q=0.9",
-
-                    "sec-ch-ua": sec_ch_ua,
-
-                    "sec-ch-ua-mobile": "?0",
-
-                    "sec-ch-ua-platform": '"Windows"',
 
                     "sec-fetch-dest": "empty",
 
@@ -1621,7 +1614,7 @@ class RegistrationEngine:
 
                     **_generate_datadog_trace_headers(),
 
-                }
+                })
 
                 if self._device_id:
 
@@ -2884,7 +2877,7 @@ class RegistrationEngine:
 
                             try: tv2 = gen2.decrypt_turnstile(tr2, sp2)
 
-                            except: pass
+                            except Exception: pass
 
                         pwd_sentinel = SentinelPayload(p=sp2, t=tv2, c=str(d2.get("token") or ""), flow="login_password")
 

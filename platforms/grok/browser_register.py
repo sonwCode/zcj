@@ -106,7 +106,7 @@ class GrokBrowserRegister:
             clean_code = code.replace("-", "")
             try:
                 page.fill(code_sel, clean_code, force=True)
-            except:
+            except Exception:
                 page.locator(code_sel).press_sequentially(clean_code)
 
             confirm_btn = 'button:has-text("Confirm email")'
@@ -160,7 +160,7 @@ class GrokBrowserRegister:
                 for cb in checkboxes:
                     try:
                         cb.click(force=True)
-                    except:
+                    except Exception:
                         pass
                 
                 submit_btn = 'button:has-text("Complete sign up"), button:has-text("Sign up"), button[type="submit"]'

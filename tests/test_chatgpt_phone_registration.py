@@ -205,6 +205,10 @@ def test_protocol_phone_oauth_uses_nextauth_api_bootstrap():
 
         def get(self, url, **kwargs):
             calls.append(("GET", url, kwargs))
+            if url.rstrip("/") == "https://chatgpt.com":
+                # Step 0: the warm-up page is where the server hands out oai-did.
+                self.cookies.set("oai-did", "warmup-did")
+                return _JsonResponse(200, {})
             if url.endswith("/api/auth/providers"):
                 return _JsonResponse(200, {"openai": {"id": "openai"}})
             if url.endswith("/api/auth/csrf"):
@@ -226,11 +230,16 @@ def test_protocol_phone_oauth_uses_nextauth_api_bootstrap():
     engine.email = "+573001234567"
 
     assert engine._start_oauth() is True
-    assert [call[1] for call in calls[:2]] == [
+
+    # _start_oauth warms the session up first (_warmup_chatgpt_session, step 0), so the
+    # warm-up GET precedes the NextAuth bootstrap it feeds oai-did into.
+    assert calls[0][1] == "https://chatgpt.com/"
+    auth_calls = [call for call in calls if "/api/auth/" in call[1]]
+    assert [call[1] for call in auth_calls[:2]] == [
         "https://chatgpt.com/api/auth/providers",
         "https://chatgpt.com/api/auth/csrf",
     ]
-    _, signin_url, signin_kwargs = calls[2]
+    _, signin_url, signin_kwargs = auth_calls[2]
     assert "ext-passkey-client-capabilities=1111" in signin_url
     assert "login_hint=%2B573001234567" in signin_url
     assert "callbackUrl=https%3A%2F%2Fchatgpt.com%2Flogin" in signin_kwargs["data"]

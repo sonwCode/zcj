@@ -2,7 +2,7 @@
 import json
 import threading
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import UniqueConstraint, event, inspect
 from sqlalchemy.exc import IntegrityError
@@ -465,6 +465,21 @@ def _load_json(value: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _load_int(value: Any, default: int = 0) -> int:
+    """Coerce a value from a legacy row to an int, without trusting its type.
+
+    SQLite column affinity does not enforce a type, so a column declared INTEGER can
+    still hold TEXT written by an older version - ``trial_end_time`` holding a date
+    string, for example. Legacy migrations exist precisely to cope with shapes the
+    current code no longer produces, so this mirrors the adjacent ``_load_json``: never
+    raise, fall back to a default.
+    """
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _accounts_columns() -> set[str]:
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
@@ -500,12 +515,12 @@ def _migrate_legacy_accounts_schema() -> None:
         for row in rows:
             sync_legacy_account_graph(
                 session,
-                account_id=int(row["id"] or 0),
+                account_id=_load_int(row["id"]),
                 platform=str(row["platform"] or ""),
                 lifecycle_status=str(row["status"] or "registered"),
                 region=str(row["region"] or ""),
                 legacy_token=str(row["token"] or ""),
-                trial_end_time=int(row["trial_end_time"] or 0),
+                trial_end_time=_load_int(row["trial_end_time"]),
                 cashier_url=str(row["cashier_url"] or ""),
                 extra=_load_json(str(row["extra_json"] or "{}")),
             )

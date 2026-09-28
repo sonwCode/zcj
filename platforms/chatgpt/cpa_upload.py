@@ -139,10 +139,13 @@ def generate_token_json(account) -> dict:
     if not expired_str and access_token:
         payload = _decode_jwt_payload(access_token)
         exp_timestamp = payload.get("exp")
-        if isinstance(exp_timestamp, int) and exp_timestamp > 0:
-            exp_dt = datetime.fromtimestamp(
-                exp_timestamp, tz=CPA_TIMEZONE)
-            expired_str = exp_dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        # 走本文件已有的全函数化 helper（上面第 113 行对 expired/expires_at 用的就是它）。
+        # 原来的 `isinstance(exp, int) and exp > 0` 只挡了非整数和非正数：**超大**的
+        # exp（毫秒时间戳、损坏 claim）能通过检查却在 fromtimestamp 里抛
+        # OverflowError/ValueError，而这个函数没有任何 try 保护，异常会直接冒到
+        # 调用方 —— tasks.py 会把它吞成 "CPA 自动上传异常" 警告，上传静默失败。
+        if isinstance(exp_timestamp, int) and not isinstance(exp_timestamp, bool):
+            expired_str = _format_cpa_timestamp(exp_timestamp) or expired_str
 
     # 3) fallback: /backend-api/me (用 access_token 调)
     if not account_id and access_token:
@@ -191,10 +194,10 @@ def generate_token_json(account) -> dict:
                             access_token = new_at  # 用新 token
                             logger.info(f"[CPA] session 刷新成功: {account_id}")
                             exp2 = p2.get("exp")
-                            if isinstance(exp2, int) and exp2 > 0:
-                                expired_str = datetime.fromtimestamp(
-                                    exp2, tz=CPA_TIMEZONE
-                                ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+                            # 同上：越界的 exp 由 helper 兜底，不再让格式化异常
+                            # 被外面的 except 误报成 "session 刷新失败"。
+                            if isinstance(exp2, int) and not isinstance(exp2, bool):
+                                expired_str = _format_cpa_timestamp(exp2) or expired_str
             except Exception as e:
                 logger.error(f"[CPA] session 刷新失败: {e}")
 

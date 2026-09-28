@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math as _math
 import re
 import threading
 import time
@@ -186,9 +187,12 @@ class SmsActivateProvider(BaseSmsProvider):
         result = self._request("getNumber", service=service_code, country=country_id)
         if result.startswith("ACCESS_NUMBER:"):
             parts = result.split(":")
+            # The API pads its fields, and the activation id travels back to the
+            # provider as a query value: a stray space would be encoded as "+" and
+            # we would poll a different id than the one that was issued.
             return SmsActivation(
-                activation_id=parts[1],
-                phone_number=parts[2],
+                activation_id=parts[1].strip(),
+                phone_number=parts[2].strip(),
                 country=country or self.default_country,
             )
 
@@ -205,7 +209,7 @@ class SmsActivateProvider(BaseSmsProvider):
                 return ""
             result = self._request("getStatus", id=activation_id)
             if result.startswith("STATUS_OK:"):
-                return result.split(":")[1]
+                return result.split(":")[1].strip()
             if result == "STATUS_WAIT_CODE":
                 time.sleep(3)
                 continue
@@ -259,15 +263,35 @@ def _hash_secret(value: str) -> str:
 def _safe_int(value, default: int) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
 def _safe_float(value, default: float) -> float:
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _cache_number(cache: dict, key: str, default):
+    """Read one numeric field out of a persisted SMS cache entry.
+
+    The cache file is written by whichever version ran last, so a field can come back
+    as text or as a JSON ``Infinity``. ``_load_cache`` already guards the ``json.loads``
+    for exactly that reason; the fields it hands on have to be just as safe, because
+    ``int(Infinity)`` raises ``OverflowError`` further down.
+    """
+    if isinstance(default, float):
+        value = _safe_float(cache.get(key), default)
+        return value if _math.isfinite(value) else default
+    return _safe_int(cache.get(key), default)
+
+
+def _normalize_cache_numbers(cache: dict) -> None:
+    """Make the two numeric cache fields safe to use, whatever the file held."""
+    cache["acquired_at"] = _cache_number(cache, "acquired_at", 0.0)
+    cache["use_count"] = _cache_number(cache, "use_count", 0)
 
 
 def _safe_bool(value, default: bool) -> bool:
@@ -674,6 +698,9 @@ class HeroSmsProvider(BaseSmsProvider):
         identity = self._cache_identity(service, country)
         if any(str(cache.get(key) or "") != str(value) for key, value in identity.items()):
             return None
+        # Do this before anything reads the fields: the file is written by whichever
+        # version ran last, and the reads below used to be the first thing to touch it.
+        _normalize_cache_numbers(cache)
         elapsed = time.time() - float(cache.get("acquired_at") or 0)
         if elapsed >= HERO_SMS_PHONE_LIFETIME or cache.get("reuse_stopped"):
             self._clear_cache()
@@ -699,6 +726,7 @@ class HeroSmsProvider(BaseSmsProvider):
                 pass
             return
         serializable = dict(cache)
+        _normalize_cache_numbers(serializable)
         serializable["used_codes"] = sorted(serializable.get("used_codes") or [])
         serializable["attempted_sms_keys"] = sorted(serializable.get("attempted_sms_keys") or [])
         serializable.pop("client", None)

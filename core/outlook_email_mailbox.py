@@ -25,6 +25,21 @@ def _truthy(value: Any) -> bool:
     return _text(value).lower() in {"1", "true", "yes", "on", "y"}
 
 
+def _int_or_zero(value: Any) -> int:
+    """Coerce an upstream value to an int, treating anything unparseable as 0.
+
+    Outlook admin responses are outside our control and are inconsistent about how they
+    serialize ids: 7 and "7" both happen, but so do "12.5" and opaque strings. Zero is
+    already this module sentinel for "no usable id" (see _get_or_create_tag_id), so an
+    unparseable value degrades to that instead of aborting a mailbox poll with a bare
+    ValueError.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _split_names(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         raw_items = [str(item or "") for item in value]
@@ -56,7 +71,7 @@ def _normalize_base_url(value: str) -> str:
 def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         number = default
     return min(max(number, minimum), maximum)
 
@@ -550,29 +565,23 @@ class OutlookEmailMailbox(BaseMailbox):
         normalized = name.strip().lower()
         for tag in self._list_tags():
             if _text(tag.get("name")).lower() == normalized:
-                return int(tag.get("id") or 0)
+                return _int_or_zero(tag.get("id"))
         payload = self._admin_post_json("/api/tags", {"name": name, "color": "#1a1a1a"})
         tag = payload.get("tag") if isinstance(payload.get("tag"), dict) else {}
-        tag_id = int(tag.get("id") or 0)
+        tag_id = _int_or_zero(tag.get("id"))
         if tag_id <= 0:
             raise RuntimeError(f"outlookEmail 创建标签后未返回有效 ID: {name}")
         return tag_id
 
     def _resolve_account_id(self, *, email: str, account_id: str = "") -> int:
-        try:
-            numeric_id = int(str(account_id or "").strip())
-        except (TypeError, ValueError):
-            numeric_id = 0
+        numeric_id = _int_or_zero(str(account_id or "").strip())
         if numeric_id > 0:
             return numeric_id
 
         target = email.strip().lower()
         for item in self._list_accounts():
             if self._account_email(item).lower() == target:
-                try:
-                    return int(item.get("id") or 0)
-                except (TypeError, ValueError):
-                    return 0
+                return _int_or_zero(item.get("id"))
         return 0
 
     def add_tags_to_account(self, *, email: str, account_id: str = "", tag_names: list[str] | None = None) -> list[str]:

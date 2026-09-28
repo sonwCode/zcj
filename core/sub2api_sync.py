@@ -98,10 +98,20 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 
 
 def _as_positive_int(value: Any) -> int:
-    try:
-        result = int(value or 0)
-    except (TypeError, ValueError):
+    """Coerce to a positive int, tolerating whatever the stored state holds.
+
+    ``remote_account_id`` is persisted inside ``overview.legacy_extra.sub2api_sync``,
+    which is copied from a caller-supplied ``account_overview`` payload, so a text or
+    oversized value is reachable. ``int(inf)`` raises ``OverflowError``, which a
+    ``(TypeError, ValueError)`` catch would miss.
+    """
+    if value is None or isinstance(value, bool):
         return 0
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return result if result > 0 else 0
     return result if result > 0 else 0
 
 
@@ -713,7 +723,7 @@ def push_account_to_sub2api(
     group_ids = _positive_int_list(options.get("sub2api_group_ids") or config.get("group_id"))
     group_name = str(options.get("sub2api_group_name") or config.get("group_name") or "free").strip()
     certificate, current_state = _sync_context(extra)
-    if int(current_state.get("remote_account_id") or 0) > 0 and not force_update:
+    if _as_positive_int(current_state.get("remote_account_id")) > 0 and not force_update:
         return True
     local_account_id = _local_account_id(
         str(getattr(account, "platform", "") or ""),
@@ -1006,7 +1016,7 @@ def delete_synced_account(local_account_id: int, *, reason: str = "invalid", log
         state = dict(legacy.get("sub2api_sync") or {})
         email = model.email
 
-    remote_account_id = int(state.get("remote_account_id") or 0)
+    remote_account_id = _as_positive_int(state.get("remote_account_id"))
     if remote_account_id <= 0:
         return False
     try:
@@ -1060,7 +1070,7 @@ def cleanup_invalid_synced_accounts(*, limit: int = 500, log_fn=None) -> dict[st
         validity = str(graph.get("validity_status") or overview.get("validity_status") or "").lower()
         legacy = dict(overview.get("legacy_extra") or {})
         state = dict(legacy.get("sub2api_sync") or {})
-        if int(state.get("remote_account_id") or 0) <= 0:
+        if _as_positive_int(state.get("remote_account_id")) <= 0:
             results["skipped"] += 1
             continue
         if validity == "invalid" or lifecycle in {"invalid", "expired"}:
@@ -1211,7 +1221,7 @@ def repair_misclassified_registry_ineligible_accounts(*, limit: int = 1000) -> i
             reason = str(overview.get("validity_reason") or "").lower()
             if "sub2_ineligible" not in error and "agent registry is not enabled" not in reason:
                 continue
-            if int(state.get("remote_account_id") or 0) > 0:
+            if _as_positive_int(state.get("remote_account_id")) > 0:
                 continue
             state["status"] = "registry_pending"
             state["agent_registry_status"] = "pending"
@@ -1270,7 +1280,7 @@ def backfill_unsynced_accounts(*, limit: int = 500, log_fn=None) -> dict[str, in
             validity = str(graph.get("validity_status") or overview.get("validity_status") or "").lower()
             legacy = dict(overview.get("legacy_extra") or {})
             state = dict(legacy.get("sub2api_sync") or {})
-            if int(state.get("remote_account_id") or 0) > 0:
+            if _as_positive_int(state.get("remote_account_id")) > 0:
                 results["skipped"] += 1
                 continue
             if lifecycle in {"invalid", "expired"} or validity == "invalid":

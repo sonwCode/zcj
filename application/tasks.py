@@ -12,6 +12,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+from sqlalchemy import update
 from sqlmodel import Session, select, func
 
 from core.account_graph import (
@@ -664,9 +665,10 @@ def append_task_event(task_id: str, message: str, *, event_type: str = "log", le
 def mark_incomplete_tasks_interrupted() -> None:
     interrupted_ids: list[str] = []
     with Session(engine) as session:
-        non_terminal = [TASK_STATUS_PENDING] + list(ACTIVE_TASK_STATUSES)
+        # Pending tasks have not started and must survive a service restart. Only
+        # tasks that a worker may have been executing need crash recovery.
         tasks = session.exec(
-            select(TaskModel).where(TaskModel.status.in_(non_terminal))
+            select(TaskModel).where(TaskModel.status.in_(ACTIVE_TASK_STATUSES))
         ).all()
         for task in tasks:
             task.status = TASK_STATUS_INTERRUPTED
@@ -755,10 +757,25 @@ def claim_next_runnable_task(
                 continue
             if account_keys and busy_account_keys.intersection(account_keys):
                 continue
-            task.status = TASK_STATUS_CLAIMED
-            task.started_at = task.started_at or _utcnow()
-            task.updated_at = _utcnow()
-            session.add(task)
+            # Selection above is only a scheduling decision. The conditional
+            # UPDATE is the ownership boundary: another process may have claimed
+            # this row after the SELECT, so only one caller can change pending ->
+            # claimed. A loser continues scanning for another eligible task.
+            claimed_at = _utcnow()
+            claim_result = session.exec(
+                update(TaskModel)
+                .where(
+                    TaskModel.id == task.id,
+                    TaskModel.status == TASK_STATUS_PENDING,
+                )
+                .values(
+                    status=TASK_STATUS_CLAIMED,
+                    started_at=task.started_at or claimed_at,
+                    updated_at=claimed_at,
+                )
+            )
+            if int(getattr(claim_result, "rowcount", 0) or 0) != 1:
+                continue
             session.commit()
             return {
                 "id": task.id,
@@ -1421,7 +1438,31 @@ def execute_task(task_id: str) -> None:
     if not handler:
         logger.finish(TASK_STATUS_FAILED, error=f"未知任务类型: {task_type}")
         return
-    handler(payload, logger)
+    try:
+        handler(payload, logger)
+    except Exception as exc:
+        # A handler normally owns its domain errors, but an unexpected exception
+        # must not leave the task permanently running after its worker exits.
+        error = f"任务执行异常: {exc}"
+        changed = False
+
+        def _fail_active_task(task: TaskModel) -> None:
+            nonlocal changed
+            if task.status in TERMINAL_TASK_STATUSES:
+                return
+            task.status = TASK_STATUS_FAILED
+            task.finished_at = _utcnow()
+            task.error = error
+            changed = True
+
+        _mutate_task(task_id, _fail_active_task)
+        if changed:
+            logger.log(
+                error,
+                level="error",
+                event_type="state",
+                detail={"status": TASK_STATUS_FAILED, "error": error},
+            )
 
 
 def _resolve_sms_provider_for_task(extra: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -2956,13 +2997,24 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             )
             return next_entry
 
-        resolved_proxy = _resolve_registration_proxy_for_platform(
-            platform_name,
-            explicit_proxy=proxy,
-            proxy_getter=lambda: proxy_pool.acquire_route(proxy_region),
-            allow_pool=allow_proxy_pool,
-            region=proxy_region,
-        )
+        # 这一段（以及到 ``try:`` 为止的代码）都在外层 try/finally
+        # 之外，而 SMS 槽已经拿到手了。代理解析/固定会走外部调用（池分配、
+        # 711Proxy pin），一旦抛异常槽位就永久泄漏 —— 泄漏满 concurrency 次后
+        # ``sms_slot_queue.get()`` 会永久阻塞。这里统一兜底：失败即归还槽位再抛。
+        try:
+            resolved_proxy = _resolve_registration_proxy_for_platform(
+                platform_name,
+                explicit_proxy=proxy,
+                proxy_getter=lambda: proxy_pool.acquire_route(proxy_region),
+                allow_pool=allow_proxy_pool,
+                region=proxy_region,
+            )
+        except Exception:
+            if sms_slot_id is not None:
+                with sms_pool_lock:
+                    sms_slot_queue.put(sms_slot_id)
+            logger.clear_subtask()
+            raise
         leased_proxy_url = resolved_proxy
         proxy_pool_lease = bool(
             leased_proxy_url
@@ -2973,13 +3025,29 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             error = "代理池暂时没有可分配代理"
             logger.record_error(error)
             logger.log(f"✗ 注册失败: {error}", level="error")
+            # 这个 return 在下面的 try/finally **之前**，而 SMS 槽已经在 2903 行
+            # ``sms_slot_queue.get()`` 拿到了 —— 直接返回会让槽位永久泄漏。
+            # 泄漏 ``concurrency`` 次之后队列彻底空掉，下一次
+            # ``sms_slot_queue.get()`` 就会永久阻塞（3768 行的守卫只在
+            # ``len(futures) >= concurrency`` 时生效，future 跑完就不再生效）。
+            # 归还槽位：这里没换号也没判死，按正常归还处理。
+            if sms_slot_id is not None:
+                with sms_pool_lock:
+                    sms_slot_queue.put(sms_slot_id)
+            logger.clear_subtask()
             return error
         if platform_name == "chatgpt" and resolved_proxy:
-            pinned_proxy = _pin_chatgpt_registration_proxy(
-                resolved_proxy,
-                region=proxy_region,
-                session_id=f"reg{uuid.uuid4().hex[:8]}",
-            )
+            # pin_711proxy_session 是外部调用，失败不应让已占用的 SMS 槽泄漏。
+            # pin 失败只是退化成非固定路由，注册本身可以继续，故只记录不抛。
+            try:
+                pinned_proxy = _pin_chatgpt_registration_proxy(
+                    resolved_proxy,
+                    region=proxy_region,
+                    session_id=f"reg{uuid.uuid4().hex[:8]}",
+                )
+            except Exception as exc:
+                logger.log(f"711Proxy 路由固定失败，改用原代理继续: {exc}", level="error")
+                pinned_proxy = ""
             if pinned_proxy and pinned_proxy != resolved_proxy:
                 resolved_proxy = pinned_proxy
                 logger.log("711Proxy 注册路由已隔离并固定 180 分钟")

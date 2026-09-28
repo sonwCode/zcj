@@ -11,7 +11,17 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-APP_HOST="${APP_HOST:-0.0.0.0}"
+# 去掉首尾空白后再比较。应用侧读取这些变量一律用 .strip()（core/auth.py 的
+# _get_password() 就是如此）；shell 里若只做 [ -z ] 判断，取值只有空格时会被
+# 当成「已设置」，而应用其实已按空值处理并关闭鉴权。
+strip() {
+    local value="${1:-}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "${value}"
+}
+
+APP_HOST="$(strip "${APP_HOST:-0.0.0.0}")"
 APP_PORT="${APP_PORT:-8000}"
 APP_GRACEFUL_SHUTDOWN_SECONDS="${APP_GRACEFUL_SHUTDOWN_SECONDS:-30}"
 XVFB_DISPLAY="${XVFB_DISPLAY:-:99}"
@@ -28,17 +38,23 @@ fatal() { echo "[entrypoint][FATAL] $*" >&2; exit 1; }
 # lifecycle_manager 四个后台循环。uvicorn 多 worker 会让每个 worker 各起一份，
 # 于是同一个任务被重复派发、同一个账号被并发探测、同一个代理被重复预占。
 # ZCJ 目前只支持单进程，所以这里直接拒绝，而不是让它静默地出错。
-if [ -n "${UVICORN_WORKERS:-}" ] && [ "${UVICORN_WORKERS}" != "1" ]; then
+if [ -n "$(strip "${UVICORN_WORKERS:-}")" ] && [ "$(strip "${UVICORN_WORKERS:-}")" != "1" ]; then
     fatal "UVICORN_WORKERS=${UVICORN_WORKERS} 不受支持：后台调度器是进程内单例，多 worker 会重复派发任务、重复探测账号。请保持单进程，靠增加容器数量横向扩容（每个容器一份独立数据库）。"
 fi
 
 # --- 鉴权 -------------------------------------------------------------------
 # AuthMiddleware 在 APP_PASSWORD 为空时放行所有 /api 请求。容器默认监听 0.0.0.0，
 # 端口一旦发布出去，任何人都能拿到账号口令、平台 Token 和代理凭据。
-if [ -z "${APP_PASSWORD:-}" ]; then
-    if [ "${ZCJ_ALLOW_INSECURE:-0}" = "1" ]; then
+#
+# 判空必须先 strip：core/auth.py 的 _get_password() 会 strip 后再判断，所以只有
+# 空白的 APP_PASSWORD 在应用侧等于未设置（鉴权全关）；这里若用裸 [ -z ] 就会认为
+# 密码已设置而放行启动。compose/env 里多一个空格就能触发。
+#
+# ::1 与 127.0.0.1 同属回环，只在本机可达，故与 check_auth 的判定保持一致。
+if [ -z "$(strip "${APP_PASSWORD:-}")" ]; then
+    if [ "$(strip "${ZCJ_ALLOW_INSECURE:-0}")" = "1" ]; then
         log "[WARN] APP_PASSWORD 为空且 ZCJ_ALLOW_INSECURE=1：所有 /api 接口无需鉴权，仅限本机自用。"
-    elif [ "${APP_HOST}" = "127.0.0.1" ] || [ "${APP_HOST}" = "localhost" ]; then
+    elif [ "${APP_HOST}" = "127.0.0.1" ] || [ "${APP_HOST}" = "localhost" ] || [ "${APP_HOST}" = "::1" ]; then
         log "[WARN] APP_PASSWORD 为空，但只监听 ${APP_HOST}，未对外暴露。"
     else
         fatal "未设置 APP_PASSWORD 却监听 ${APP_HOST}：所有 /api 接口将无需鉴权。请设置 APP_PASSWORD；仅本机自用时显式设 ZCJ_ALLOW_INSECURE=1 或 APP_HOST=127.0.0.1。"
@@ -62,11 +78,11 @@ fi
 # --- VNC（默认关闭） ---------------------------------------------------------
 # noVNC/x11vnc 可以直接接管浏览器会话，等于把已登录的账号送出去。
 # 需要人工盯页面时再 VNC_ENABLED=1，并且必须给密码。
-if [ "${VNC_ENABLED:-0}" = "1" ]; then
-    VNC_BIND="${VNC_BIND:-127.0.0.1}"
+if [ "$(strip "${VNC_ENABLED:-0}")" = "1" ]; then
+    VNC_BIND="$(strip "${VNC_BIND:-127.0.0.1}")"
     VNC_PORT="${VNC_PORT:-6080}"
-    if [ -z "${VNC_PASSWORD:-}" ]; then
-        if [ "${ZCJ_ALLOW_INSECURE_VNC:-0}" = "1" ]; then
+    if [ -z "$(strip "${VNC_PASSWORD:-}")" ]; then
+        if [ "$(strip "${ZCJ_ALLOW_INSECURE_VNC:-0}")" = "1" ]; then
             log "[WARN] VNC 无密码且 ZCJ_ALLOW_INSECURE_VNC=1，仅监听 ${VNC_BIND}。"
             x11vnc -display "${XVFB_DISPLAY}" -nopw -forever -shared -localhost -rfbport 5900 &
         else
@@ -77,6 +93,11 @@ if [ "${VNC_ENABLED:-0}" = "1" ]; then
         chmod 600 "${VNC_PASSFILE}"
         x11vnc -storepasswd "${VNC_PASSWORD}" "${VNC_PASSFILE}" >/dev/null 2>&1
         x11vnc -display "${XVFB_DISPLAY}" -rfbauth "${VNC_PASSFILE}" -forever -shared -localhost -rfbport 5900 &
+    fi
+    # 与 check_vnc 一致：非回环绑定会让 noVNC 页面对外可达——x11vnc 本身只监听回环，
+    # 但 websockify 这一层是真正的暴露面。
+    if [ "${VNC_BIND}" != "127.0.0.1" ] && [ "${VNC_BIND}" != "localhost" ]; then
+        log "[WARN] VNC_BIND=${VNC_BIND} 不是回环：noVNC 页面会对外可达。建议只绑 127.0.0.1，通过 SSH 端口转发访问。"
     fi
     websockify --web=/usr/share/novnc "${VNC_BIND}:${VNC_PORT}" localhost:5900 &
     log "noVNC 已启动: http://${VNC_BIND}:${VNC_PORT}/vnc.html"

@@ -114,7 +114,12 @@ class _Vault:
             else:
                 key = self._read_or_create_key_file()
             if key is None:
-                self._reason = "no usable vault key"
+                # ``_read_or_create_key_file`` records why (for example a
+                # permission error); only fall back to the generic wording when
+                # nothing more specific is known.  The reason is what sends the
+                # operator to the right fix, and the stats API surfaces it too.
+                if not self._reason:
+                    self._reason = "no usable vault key"
                 return
             try:
                 from nacl.secret import SecretBox

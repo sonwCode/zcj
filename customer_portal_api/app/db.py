@@ -12,9 +12,18 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def default_database_path() -> Path:
+    """Where the portal database lives when PORTAL_DATABASE_URL is unset.
+
+    Anchored to this package, not to the process working directory, so a cloud
+    deployment that starts the process somewhere else still stores its data (and the
+    signing key that config.py keeps beside it) in a stable place.
+    """
+    return Path(__file__).resolve().parent.parent / "customer_portal.db"
+
+
 def _default_database_url() -> str:
-    database_path = Path(__file__).resolve().parent.parent / "customer_portal.db"
-    return f"sqlite:///{database_path}"
+    return f"sqlite:///{default_database_path()}"
 
 
 DATABASE_URL = os.getenv("PORTAL_DATABASE_URL", _default_database_url())

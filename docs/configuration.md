@@ -148,4 +148,6 @@ ACCOUNT_MANAGER_DATABASE_URL=postgresql+psycopg://user:pass@host:5432/zcj
 | `PORTAL_REFRESH_TOKEN_TTL_SECONDS` | `2592000`（30 天） | 刷新令牌有效期 |
 | `PORTAL_CORS_ORIGINS` | 空 | 门户 CORS 白名单 |
 | `PORTAL_PAYMENT_SECRET_<CHANNEL>` | 无 | 按渠道的支付回调密钥，如 `PORTAL_PAYMENT_SECRET_TESTCHAN` |
+| `PORTAL_PAYMENT_CALLBACK_SECRETS` | 无 | 多渠道路径的密钥映射，格式 `渠道:密钥,渠道:密钥`；与上一条二选一 |
+| `PORTAL_PAYMENT_ALLOW_UNSIGNED_CALLBACKS` | 关闭 | **危险**：开启后完全不校验支付回调签名，任何人猜到订单号即可伪造支付成功。仅限本地联调 |
 

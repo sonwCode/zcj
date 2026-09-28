@@ -122,8 +122,13 @@ def _generate_paypal_signup_identity() -> dict:
 # 优先选 Firefox 指纹：HAR 实采里浏览器就是 Firefox 135，pm-redirects.stripe.com
 # 等服务对浏览器指纹敏感，Firefox 指纹能正常通过；Chrome 指纹会被 403 拒绝。
 _DEFAULT_IMPERSONATE = "firefox135"
+# UA 必须和上面的 impersonate 目标同一个 OS：curl_cffi 的 firefox135 是
+# Firefox 135.0 / macOS Sonoma（见 curl_cffi/fingerprints.py 的 NATIVE_IMPERSONATE_TARGETS），
+# 而这里原来写的是 Windows NT 10.0 —— TLS/HTTP2 指纹说 macOS、请求头说 Windows，
+# 正是在别处已经移除过的那类自相矛盾。既然是靠指纹通过校验的路径，这种不一致
+# 只会把 403 的风险加回来。所有 firefox* 目标都是 macOS，故按 macOS 写。
 _DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) "
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) "
     "Gecko/20100101 Firefox/135.0"
 )
 

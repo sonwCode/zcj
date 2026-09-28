@@ -259,7 +259,7 @@ class KiroRegister:
                 # 先删掉可能存在的 .domain 版本
                 dot_domain = "." + domain
                 try: self.s.cookies.delete(name, domain=dot_domain, path=path)
-                except: pass
+                except Exception: pass
                 self.s.cookies.set(name,value,domain=domain,path=path)
             else:
                 # 无 Domain 属性: host-only cookie
@@ -273,7 +273,7 @@ class KiroRegister:
         domain = "us-east-1.signin.aws"
         # platform-ubid: 唯一真正由 JS 生成的 cookie
         try: self.s.cookies.delete("platform-ubid", domain=domain, path="/platform")
-        except: pass
+        except Exception: pass
         self.s.cookies.set("platform-ubid", self._platform_ubid,
                            domain=domain, path="/platform")
 
@@ -316,7 +316,7 @@ class KiroRegister:
                 for c in list(self.s.cookies.jar):
                     if c.name == "directory-csrf-token":
                         try: self.s.cookies.delete(c.name, domain=c.domain, path=c.path)
-                        except: pass
+                        except Exception: pass
                 self.s.cookies.set("directory-csrf-token", new_val,
                                    domain=domain, path=dir_csrf_path)
                 self.log(f"  ★ directory-csrf-token 已添加 signupCsrfToken={signup_token[:12]}")
@@ -358,7 +358,7 @@ class KiroRegister:
         if r.status_code!=200:
             self.log(f"  ❌ {r.status_code}: {r.text[:500]}"); return None
         try: d=r.json()
-        except: self.log(f"  ❌ 非JSON: {r.text[:300]}"); return None
+        except Exception: self.log(f"  ❌ 非JSON: {r.text[:300]}"); return None
         if d.get("workflowStateHandle"): self.wsh=d["workflowStateHandle"]
         if d.get("stepId") is not None: self.sid=d["stepId"]
         self.log(f"  → sid={self.sid} wsh={str(self.wsh)[:40]}...")
@@ -418,7 +418,7 @@ class KiroRegister:
             d=r.json()
             self.log(f"  Resp: {json.dumps(d,ensure_ascii=False)[:400]}")
             return d
-        except: return {}
+        except Exception: return {}
 
     # ═══ Step 1: Kiro InitiateLogin ═══
     def step1_kiro_init(self):
@@ -436,7 +436,7 @@ class KiroRegister:
             headers=h,data=body,cookies={"kiro-visitor-id":self.vid})
         if r.status_code!=200: self.log(f"  ❌ {r.status_code}"); return None
         try: d=cbor2.loads(r.content)
-        except: d=r.json()
+        except Exception: d=r.json()
         redir=d.get("redirectUrl")
         if not redir: self.log(f"  ❌ 无redirectUrl: {d}"); return None
         self.log(f"  ✅ {redir[:100]}...")
@@ -561,7 +561,7 @@ class KiroRegister:
                 jp=json.loads(base64.urlsafe_b64decode(pb))
                 self._tes_visitor_id=jp.get("vid")
                 self.log(f"  ✅ visitorId: {self._tes_visitor_id}")
-            except: pass
+            except Exception: pass
             self.s.cookies.set("awsd2c-token",token,
                 domain=".aws.amazon.com",path="/")
             self.s.cookies.set("awsd2c-token-c",token,
@@ -639,7 +639,7 @@ class KiroRegister:
             padded = sign_in_state + "=" * (4 - len(sign_in_state) % 4)
             decoded = json.loads(base64.b64decode(padded))
             self.log(f"  signInState decoded: {decoded}")
-        except: pass
+        except Exception: pass
         return r
 
     # ═══ Step 9: signup execute (registrationCode → get-new-password) ═══
@@ -650,7 +650,7 @@ class KiroRegister:
         self._setup_signin_js_cookies()
         # 确保 awsccc cookie 在 signin.aws 域 (先删旧的避免冲突)
         try: self.s.cookies.delete("awsccc", domain="us-east-1.signin.aws")
-        except: pass
+        except Exception: pass
         awsccc = json.dumps({"e":1,"p":1,"f":1,"a":1,"i":_uuid(),"v":"1"},
                             separators=(",",":"))
         self.s.cookies.set("awsccc",
@@ -748,7 +748,7 @@ class KiroRegister:
         for c in list(self.s.cookies.jar):
             if c.domain and c.domain.startswith(".") and "signin.aws" in c.domain:
                 try: self.s.cookies.delete(c.name, domain=c.domain, path=c.path)
-                except: pass
+                except Exception: pass
 
         # ★ v8: 先发 send-event (HAR entry 96: PAGE_LOAD for CREDENTIAL_COLLECTION)
         fwcim = self._gen_signin_fwcim()
@@ -845,7 +845,7 @@ class KiroRegister:
                 try:
                     self.s.cookies.delete(c.name, domain=c.domain, path=c.path)
                     cleaned += 1
-                except: pass
+                except Exception: pass
         if cleaned:
             self.log(f"  ★ 已清理 {cleaned} 个非裸域名 cookies")
 
@@ -1054,7 +1054,7 @@ class KiroRegister:
             try:
                 whoami = r.json()
                 self.log(f"  ✅ whoAmI: {json.dumps(whoami, ensure_ascii=False)[:200]}")
-            except: pass
+            except Exception: pass
 
         # ── 12c: POST oidc/authentication_result ──
         self.log("  12c: POST oidc/authentication_result...")
@@ -1139,7 +1139,7 @@ class KiroRegister:
         if r.status_code != 200:
             self.log(f"  ❌ ExchangeToken 失败: {r.status_code}")
             try: self.log(f"  {r.text[:500]}")
-            except: self.log(f"  (binary response, len={len(r.content)})")
+            except Exception: self.log(f"  (binary response, len={len(r.content)})")
             return None
         try:
             resp_data = cbor2.loads(r.content)
@@ -1362,7 +1362,7 @@ class KiroRegister:
                 else:
                     self.log(f"  ❌ token 错误: {err_code} - {err.get('error_description','')}")
                     return None
-            except:
+            except Exception:
                 self.log(f"  ❌ token 响应异常: {r.status_code} {r.text[:200]}")
                 return None
             time.sleep(poll_interval)

@@ -12,6 +12,7 @@ from core.datetime_utils import serialize_datetime
 from core.account_display import build_account_display_summary
 from core.db import AccountModel, AccountOverviewModel, engine
 from core.account_graph import (
+    coerce_int,
     compute_account_stats,
     load_account_graphs,
     matches_status_filter,
@@ -70,7 +71,7 @@ def _to_record(model: AccountModel, graph: dict | None = None) -> AccountRecord:
         password=model.password,
         user_id=model.user_id,
         primary_token=resolve_primary_token(model, graph),
-        trial_end_time=int(overview.get("trial_end_time") or 0),
+        trial_end_time=coerce_int(overview.get("trial_end_time")),
         cashier_url=str(overview.get("cashier_url") or ""),
         lifecycle_status=lifecycle_status,
         validity_status=validity_status,

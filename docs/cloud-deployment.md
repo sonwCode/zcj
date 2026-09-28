@@ -173,21 +173,81 @@ python3 scripts/cloud_preflight.py --quiet  # 只在有警告/失败时输出
 | 检查 | 为什么 |
 | --- | --- |
 | Python 版本 ≥ 3.10 | 代码用了 `X \| None` 语法 |
-| 核心依赖可导入 | fastapi / sqlmodel / sqlalchemy / curl_cffi |
+| 核心依赖可导入 | fastapi / sqlmodel / sqlalchemy / pydantic / requests / curl_cffi（前五个缺失会导致服务起不来） |
 | **时区库 33 个地区全部可解析** | 缺 tzdata 会让载荷时区退化成 UTC，与出口 IP 矛盾，且只在精简镜像上复现 |
 | `APP_PASSWORD` | 为空等于所有 `/api` 接口无鉴权 |
 | `UVICORN_WORKERS` | 多 worker 会重复派发任务 |
-| X display | 设了 `DISPLAY` 但 socket 不存在 → 有头浏览器起不来 |
+| X display | 设了 `DISPLAY` 但对应的 socket 不存在 → 有头浏览器起不来（`:99` 与 `:99.0` 指同一个 socket） |
 | Chrome/Chromium | 浏览器路径需要 |
 | `/dev/shm` ≥ 256MB | Docker 默认 64MB，Chrome 会崩 |
-| 数据库目录可写 | 挂载卷权限 |
+| 数据库目录与**已存在的库文件**都可写 | 挂载卷权限；只读的库文件会在首次写入时才报错 |
 | 磁盘剩余 ≥ 2GB | 任务事件表持续增长 |
 | 日志保留未关闭 | 全关掉就是无限增长 |
 | VNC 有密码且绑回环 | 否则等于开放远程接管 |
+| 凭据加密已生效 | vault 失效时会**静默**降级为明文写入（缺 PyNaCl、数据卷不可写） |
 
-`tests/test_cloud_preflight.py` 覆盖了每个 FAIL/WARN 分支（15 个测试）。
+测试分布：`tests/test_cloud_preflight.py`（15 个，AuthMiddleware / 单进程 / 保留策略 /
+VNC / 时区的分支），另有 `tests/test_preflight_database_path.py`、
+`tests/test_preflight_auth_bind.py`、`tests/test_preflight_display.py` 分别覆盖
+数据库路径、监听地址与 X display。
 
-## 11. 横向扩容
+`tests/test_preflight_chrome.py` 覆盖浏览器发现（含 `PLAYWRIGHT_BROWSERS_PATH` 下
+带版本号的目录布局）；`tests/test_preflight_vault.py` 覆盖凭据加密的四种结论
+（正常 / 缺 PyNaCl / 密钥不可写 / 显式关闭）。
+
+`tests/test_preflight_dependencies.py` 覆盖核心依赖清单（逐个屏蔽导入验证会 FAIL）；
+`tests/test_preflight_db_file.py` 覆盖只读库文件必须 FAIL。
+
+`check_python` / `check_shm` 目前**没有**专门的用例
+（它们只做存在性与阈值判断，且依赖具体环境）。
+
+## 11. 可选组件：GoPay 协议 SDK
+
+`platforms/gopay/` 依赖一个**不随本仓库分发**的协议 SDK（包名 `opai`）。
+`.gitignore` 排除了 `platforms/gopay-deploy/`，所以**任何全新克隆（包括服务器）
+都没有它**。
+
+两种提供方式：
+
+1. 把 SDK 放到 `platforms/gopay-deploy/app/src/`（`_opai_loader` 会自动注入 `sys.path`）；
+2. 或 `pip install -e .` 到 site-packages，使其可直接 `import opai`。
+
+缺失时只有 GoPay 相关功能不可用，其余平台不受影响。
+`ensure_opai_on_path()` 会抛出明确错误并给出期望路径，而不是让调用方在几层之后
+撞上一个光秃秃的 `No module named 'opai'`。
+
+部署前想确认，可以跑：
+
+```bash
+python3 -c "from platforms.gopay._opai_loader import opai_available; print(opai_available())"
+```
+
+## 12. 可选组件：客户门户（`customer_portal_api/`）
+
+仓库里的 `customer_portal_api/` 是**独立的第二个 FastAPI 应用**，监听 `8100`。
+**容器不会启动它**——`docker-entrypoint.sh`、`Dockerfile` 与根 `docker-compose.yml`
+都只拉起主服务（8000）。照着本文档部署完，门户是不存在的，需要就要**另外单独起一个进程**。
+
+它有自己的部署材料，不必重复本文档：
+
+- `customer_portal_api/README.md`：本地启动与 Docker 两种方式
+- `customer_portal_api/Dockerfile`、`customer_portal_api/docker-compose.yml`
+- `customer_portal_api/.env.example`：变量模板
+
+在生产上需要注意三点（细节见 `SECURITY.md`「部署加固」）：
+
+1. **不存在出厂口令**：`PORTAL_ADMIN_PASSWORD` 留空时会生成一次性随机口令并打印到
+   启动日志；`PORTAL_JWT_SECRET` 留空时会生成随机密钥并持久化到数据库同目录的
+   `.portal_jwt_secret`。该文件**必须随数据库一起备份**，且不能落在临时文件系统上，
+   否则每次重启换密钥、所有已登录用户被登出。
+2. 支付回调**默认拒绝**：未配置 `PORTAL_PAYMENT_SECRET_<渠道>` 或
+   `PORTAL_PAYMENT_CALLBACK_SECRETS` 时一律 403。
+   `PORTAL_PAYMENT_ALLOW_UNSIGNED_CALLBACKS` 只用于本地联调，**不要在生产开启**。
+3. 默认使用**门户自己的库**（`customer_portal_api/customer_portal.db`）。要让门户与主
+   服务共用同一个 SQLite 库，需显式设置 `PORTAL_DATABASE_URL`；此时两个进程会同时写库，
+   需确认并发写入与备份策略都能覆盖。
+
+## 13. 横向扩容
 
 因为调度器是进程内单例，扩容单位是**容器**，不是 worker：
 

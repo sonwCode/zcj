@@ -50,6 +50,17 @@ data/
 .env
 .env.local
 
+# portal 未配置 PORTAL_JWT_SECRET 时自动生成并持久化的签名密钥。它是活的 JWT
+# 签名密钥（见 SECURITY.md），一旦提交任何人都能伪造管理员令牌。默认情况下它落在
+# 数据库同目录，而 PORTAL_DATABASE_URL 未设置时该目录就是启动时的工作目录，也就是
+# 仓库根目录。
+.portal_jwt_secret
+
+# 凭据保险库的加密密钥（core/vault.py）。没有 ZCJ_VAULT_KEY 时首次使用会自动生成在
+# 数据库同目录，同样可能是仓库根目录。它是用来加解密账号凭据的密钥：一旦提交，
+# 任何人都能解开库里所有平台的 token / 密码。
+.zcj_vault_key
+
 # 文档（仅保留对外文档，其余草稿仍忽略）
 docs/*
 !docs/registration-architecture.md

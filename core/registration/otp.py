@@ -149,8 +149,13 @@ def rank_candidates(
     length: int = DEFAULT_LENGTH,
 ) -> list[OtpCandidate]:
     """Score every plausible code, best first."""
-    body = strip_html(text)
-    subject_text = strip_html(subject)
+    # Addresses are scrubbed before scanning. A mailbox URL or a reply-to often carries
+    # six consecutive digits (user123456@example.com), which the candidate pattern
+    # happily accepts - so a mail with no real code at all yielded a confident,
+    # completely invented one. Scrub here rather than in extract_otp so the diagnostics
+    # from explain_otp describe the same text the decision was made on.
+    body = scrub_emails(strip_html(text))
+    subject_text = scrub_emails(strip_html(subject))
     sender_text = str(sender or "").lower()
     haystack = f"{subject_text} {body}".lower()
 
@@ -158,8 +163,18 @@ def rank_candidates(
     has_verification_phrase = any(hint in haystack for hint in CONTEXT_HINTS)
 
     candidates: list[OtpCandidate] = []
+
+    # The subject is scanned as well as the body. Some providers put the code only
+    # in the subject ("Your OpenAI code is 525210") and leave the body with nothing
+    # but prose - and when the body does carry a six-digit number it is usually an
+    # order id or a timestamp, so returning that instead was worse than returning
+    # nothing: the caller burned the attempt on a code that could never work.
+    subject_matches = list(_candidate_pattern(length).finditer(subject_text))
+
+    body_values: set[str] = set()
     for match in _candidate_pattern(length).finditer(body):
         value = match.group(1)
+        body_values.add(value)
         score = 0.0
         reasons: list[str] = []
 
@@ -198,6 +213,45 @@ def rank_candidates(
         score -= match.start() / 100000.0
 
         candidates.append(OtpCandidate(value, match.start(), score, ",".join(reasons) or "bare"))
+
+    # A code found only in the subject still competes, on a par with a body code
+    # that the subject corroborates. Giving it the same +40 keeps the two paths
+    # consistent: what matters is that the subject vouches for the value, not
+    # which field it was first seen in.
+    for match in subject_matches:
+        value = match.group(1)
+        # A value already found in the body was scored there, with the subject credit
+        # applied. Re-adding it would list the same code twice in explain_otp output.
+        if value in body_values:
+            continue
+        score = 0.0
+        reasons: list[str] = ["subject"]
+        score += 40
+
+        distance, hint, _hint_start = _nearest_hint_distance(haystack, match.start(), match.end())
+        if distance >= 0:
+            score += max(0.0, 30.0 - distance / 10.0)
+            reasons.append(f"near:{hint}")
+
+        if trusted_sender:
+            score += 20
+            reasons.append("sender")
+
+        if has_verification_phrase:
+            score += 10
+            reasons.append("phrase")
+
+        if _YEAR.match(value):
+            score -= 60
+            reasons.append("looks-like-year")
+
+        # Subject codes sort ahead of a body-only tie: the subject is the field a
+        # verification sender writes deliberately, so it outranks incidental digits.
+        score += 1.0
+
+        candidates.append(
+            OtpCandidate(value, -1, score, ",".join(reasons) or "subject")
+        )
 
     candidates.sort(key=lambda item: item.score, reverse=True)
     return candidates

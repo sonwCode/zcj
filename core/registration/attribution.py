@@ -34,6 +34,13 @@ _LABELS = {
     CATEGORY_UNKNOWN: "未知原因",
 }
 
+# Whether a category is worth retrying is owned by retry_policy, which maps each
+# code to a concrete action (rotate the proxy? the mailbox? resume from where?).
+# This set is the mirror of that table: it is what the dashboard shows an operator
+# when a run fails, and it previously disagreed with the engine for two codes -
+# phone_risk and credential_incomplete were reported as not retryable while
+# retry_policy retried both. retry_policy cannot be imported here without a cycle,
+# so tests/test_retry_policy.py asserts the two stay in step.
 _RETRYABLE = {
     CATEGORY_PROXY_BLOCKED,
     CATEGORY_RATE_LIMITED,
@@ -42,6 +49,8 @@ _RETRYABLE = {
     CATEGORY_MAILBOX_ERROR,
     CATEGORY_NETWORK_ERROR,
     CATEGORY_UPSTREAM_ERROR,
+    CATEGORY_PHONE_RISK,
+    CATEGORY_CREDENTIAL_INCOMPLETE,
 }
 
 _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (

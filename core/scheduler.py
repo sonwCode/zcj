@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlmodel import Session, select
 
-from .account_graph import load_account_graphs, patch_account_graph
+from .account_graph import coerce_int, load_account_graphs, patch_account_graph
 from .base_platform import AccountStatus
 from .db import engine, AccountModel
 from .registry import load_all
@@ -296,7 +296,7 @@ class Scheduler:
                 graph = graphs.get(int(acc.id or 0), {})
                 if graph.get("lifecycle_status") != "trial":
                     continue
-                trial_end_time = int((graph.get("overview") or {}).get("trial_end_time") or 0)
+                trial_end_time = coerce_int((graph.get("overview") or {}).get("trial_end_time"))
                 if trial_end_time and trial_end_time < now:
                     acc.updated_at = datetime.now(timezone.utc)
                     patch_account_graph(s, acc, lifecycle_status=AccountStatus.EXPIRED.value)

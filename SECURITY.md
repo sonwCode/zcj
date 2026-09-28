@@ -38,10 +38,16 @@
 ### 部署加固
 
 - **主服务**：公网部署务必设置 `APP_PASSWORD` 启用访问鉴权；noVNC 设置 `VNC_PASSWORD`。
-- **customer_portal_api（独立门户）**：生产环境必须
-  - 修改默认 `PORTAL_JWT_SECRET`（默认 `change-me-in-production` 不可用于生产）
-  - 修改默认管理员密码（默认 `admin123456`，首次登录后立即改密）
-  - 将 `PORTAL_CORS_ORIGINS` 从 `*` 收敛到具体可信域名
+- **customer_portal_api（独立门户）**：门户不再发布任何出厂口令或密钥，`config.py` 把
+  旧默认值（`change-me-in-production`、`admin123456` 等）一律当作未配置处理：
+  - `PORTAL_JWT_SECRET` 未配置时自动生成随机密钥并持久化到 `.portal_jwt_secret`
+    （数据库同目录，0600）。**该文件必须随数据库一起备份且不能丢**——它所在的目录若是
+    临时文件系统，每次重启都会换密钥，所有已登录用户会被登出。
+  - `PORTAL_ADMIN_PASSWORD` 未配置时引导口令是随机生成的，首次启动需从日志中获取。
+  - `PORTAL_CORS_ORIGINS` 默认为空（不挂 CORS 中间件），仅在前后端分离调试时才需显式列出。
+  - 支付回调**默认拒绝**：未配置 `PORTAL_PAYMENT_SECRET_<CHANNEL>` 或
+    `PORTAL_PAYMENT_CALLBACK_SECRETS` 时回调一律 403。切勿为图省事打开
+    `PORTAL_PAYMENT_ALLOW_UNSIGNED_CALLBACKS`——那等于让任何人凭空开通付费订阅。
 - **端口暴露**：8000 / 6080 / 8889 仅在受信任网络开放；公网部署请置于反向代理 + TLS 之后。
 
 ### 数据最小化

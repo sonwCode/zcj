@@ -70,6 +70,32 @@ def _isoformat(value: datetime | None) -> str | None:
     return serialize_datetime(value)
 
 
+def _datetime_from_timestamp(value: object) -> datetime | None:
+    """Turn a JWT ``exp``/``iat`` claim into an aware UTC datetime, or ``None``.
+
+    The claims are decoded from stored tokens, so they are untrusted. The previous
+    inline guard (``isinstance(value, int) and value > 0``) accepted any positive
+    integer, including a millisecond epoch or a corrupt sentinel, which then raised
+    inside ``datetime.fromtimestamp`` (``ValueError`` / ``OverflowError`` /
+    ``OSError``). ``_chatgpt_export_payload`` runs once per selected account and has
+    no surrounding ``try``, so a single bad account aborted the whole bulk export -
+    selecting fifty accounts and getting nothing back. Unusable values now degrade
+    to ``None``, which the caller already renders as an empty field.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if timestamp <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
 def _timestamp_name(prefix: str, suffix: str) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"{prefix}_{timestamp}.{suffix}"
@@ -204,14 +230,8 @@ def _chatgpt_export_payload(item: AccountRecord) -> dict:
     if not workspace_id:
         workspace_id = str(auth_info.get("organization_id", "") or "")
     token_plan_type = _chatgpt_plan_type_from_auth(auth_info)
-    expires_at = None
-    exp_timestamp = payload.get("exp")
-    if isinstance(exp_timestamp, int) and exp_timestamp > 0:
-        expires_at = datetime.fromtimestamp(exp_timestamp, tz=timezone.utc)
-    last_refresh_at = item.updated_at
-    iat_timestamp = payload.get("iat")
-    if isinstance(iat_timestamp, int) and iat_timestamp > 0:
-        last_refresh_at = datetime.fromtimestamp(iat_timestamp, tz=timezone.utc)
+    expires_at = _datetime_from_timestamp(payload.get("exp"))
+    last_refresh_at = _datetime_from_timestamp(payload.get("iat")) or item.updated_at
 
     return {
         "id": item.id,

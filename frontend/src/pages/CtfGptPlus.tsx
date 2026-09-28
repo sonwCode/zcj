@@ -232,7 +232,13 @@ function GeneratePlusModal({
   const [error, setError] = useState("");
   const openedTaskIdsRef = useRef<Set<string>>(new Set());
 
-  const supportedExecutors: string[] = platformMeta?.supported_executors || [];
+  // Must be stable: this value is in the dependency array of the effect below.
+  // A bare `|| []` allocates a new array on every render, so the effect re-ran on
+  // every render instead of only when the platform metadata actually changed.
+  const supportedExecutors = useMemo<string[]>(
+    () => platformMeta?.supported_executors || [],
+    [platformMeta],
+  );
   const registrationOptions = useMemo(
     () => buildRegistrationOptions(platformMeta, language),
     [platformMeta, language],
@@ -1313,7 +1319,6 @@ export default function CtfGptPlus() {
       const updated = Number(result?.updated || 0);
       const total = Array.isArray(result?.items) ? result.items.length : 0;
       const timedOut = Number(result?.timed_out || 0);
-      // eslint-disable-next-line no-console
       console.info(
         `[refreshQuota] ${updated}/${total} 已刷新, ${timedOut} 超时`,
         result,

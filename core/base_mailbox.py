@@ -1375,7 +1375,7 @@ class CFWorkerMailbox(BaseMailbox):
             return self._make_cloud_mail_account(name)
         self._api_mode = "cfworker"
         self._token = token
-        print(f"[CFWorker] 生成邮箱: {email} token={token[:40] if token else 'NONE'}...")
+        print(f"[CFWorker] 生成邮箱: {email} token={'已获取' if token else 'NONE'}")
         return MailboxAccount(
             email=email,
             account_id=token,
@@ -1590,7 +1590,7 @@ class MoeMailMailbox(BaseMailbox):
         password = "Test" + "".join(random.choices(string.digits, k=8)) + "!"
         self._username = username
         self._password = password
-        print(f"[MoeMail] 注册账号: {username} / {password}")
+        print(f"[MoeMail] 注册账号: {username}（口令不回显）")
         with suppress_insecure_request_warning():
             r_reg = s.post(f"{self.api}/api/auth/register",
                 json={"username": username, "password": password, "turnstileToken": ""},

@@ -101,7 +101,7 @@ class OreateaiBrowserRegister:
                     result[field] = sel
                     self.log(f"   找到 {field}: {sel}")
                     break
-                except:
+                except Exception:
                     continue
         return result
 
@@ -282,9 +282,9 @@ class OreateaiBrowserRegister:
                         if credit_match:
                             result["credits"] = int(credit_match.group(1))
                             break
-                except:
+                except Exception:
                     continue
-        except:
+        except Exception:
             pass
 
     def _query_credits_via_api(self, page, result: dict):
@@ -298,7 +298,7 @@ class OreateaiBrowserRegister:
                 data = resp.json()
                 result["credits"] = data.get("credits", data.get("balance", 80))
                 result["api_token"] = data.get("api_key", "")
-        except:
+        except Exception:
             pass
 
     def _close_browser(self):

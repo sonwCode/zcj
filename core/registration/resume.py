@@ -15,7 +15,14 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-# Order matters: a resume re-enters at the first stage that failed.
+# Order matters: a resume re-enters at the first stage that failed, so this tuple must
+# mirror the order the pipeline actually reports them in. workspace_join sits between
+# probation and payment (application/tasks.py, _registration_pipeline_update call sites)
+# and was missing here, which made a failure at that stage look like "no failed stage"
+# at all - the account was neither resumed nor reported, it was silently dropped.
+#
+# post_registration is deliberately absent: the writer's post_registration_stages set
+# names it, but no call site ever emits it as a stage.
 PIPELINE_STAGES = (
     "account_created",
     "phone_verified",
@@ -23,6 +30,7 @@ PIPELINE_STAGES = (
     "persisted",
     "liveness",
     "probation",
+    "workspace_join",
     "payment",
 )
 

@@ -240,7 +240,8 @@ export default function GoPayGptPlus() {
       if (selectedChatgpt.size === 0) {
         body.register_count = registerCount;
       }
-      console.log("[gopay-pay-chatgpt] submit payload:", body);
+      // Deliberately not logged: this body carries the GoPay PIN, the envelope URL
+      // and the SMS provider API keys.
       const res = await apiFetch("/tasks/gopay-pay-chatgpt", {
         method: "POST",
         body: JSON.stringify(body),
@@ -282,7 +283,8 @@ export default function GoPayGptPlus() {
         rebind_country: rebindCountry.trim(),
         rebind_service: rebindService.trim(),
       };
-      console.log("[gopay-register-account] submit payload:", body);
+      // Deliberately not logged: this body carries the GoPay PIN, the envelope URL
+      // and the SMS provider API keys.
       const res = await apiFetch("/tasks/gopay-register-account", {
         method: "POST",
         body: JSON.stringify(body),

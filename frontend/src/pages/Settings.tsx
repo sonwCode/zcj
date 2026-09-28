@@ -889,7 +889,6 @@ export default function Settings({ embedded, defaultTab }: { embedded?: boolean;
   const [saved, setSaved] = useState(false)
   const [providerSaving, setProviderSaving] = useState<Record<string, boolean>>({})
   const [providerSaved, setProviderSaved] = useState<Record<string, boolean>>({})
-  const [_providerDeleting, _setProviderDeleting] = useState<Record<string, boolean>>({})
   const [providerCreating, setProviderCreating] = useState<Record<string, boolean>>({})
   const [solverRunning] = useState<boolean | null>(null)
 
@@ -933,6 +932,8 @@ export default function Settings({ embedded, defaultTab }: { embedded?: boolean;
 
   useEffect(() => {
     loadConfigData()
+    // Mount-only fetch; loadConfigData is not stable, adding it would loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Sync activeTab when defaultTab prop changes (sidebar navigation)
@@ -940,6 +941,9 @@ export default function Settings({ embedded, defaultTab }: { embedded?: boolean;
     if (defaultTab && defaultTab !== activeTab) {
       setActiveTab(defaultTab)
     }
+    // Deliberately keyed on the prop only: reacting to activeTab too would turn
+    // every manual tab switch into a second state update.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [defaultTab])
 
   const save = async () => {
@@ -1075,6 +1079,10 @@ export default function Settings({ embedded, defaultTab }: { embedded?: boolean;
       }
       return next
     })
+  // Keyed on the catalogues the derived list is built from, not on the derived
+  // list itself: the updater returns the same object when nothing changed, but a
+  // fresh derived array would still re-fire this effect on every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mailboxCatalog, captchaCatalog, smsCatalog, providerSettings.mailbox, providerSettings.captcha, providerSettings.sms])
 
   useEffect(() => {
@@ -1100,6 +1108,9 @@ export default function Settings({ embedded, defaultTab }: { embedded?: boolean;
       })
       return changed ? next : current
     })
+  // Same reasoning as above: providerDrivers is derived from these three arrays,
+  // so depending on the arrays is equivalent and keeps the effect stable.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mailboxDrivers, captchaDrivers, smsDrivers])
 
   const getErrorMessage = (error: unknown, fallback: string) => {

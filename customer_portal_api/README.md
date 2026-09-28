@@ -75,12 +75,14 @@ cp customer_portal_api/.env.example customer_portal_api/.env
 
 常用变量：
 
-- `PORTAL_JWT_SECRET`
-- `PORTAL_ADMIN_USERNAME`
-- `PORTAL_ADMIN_PASSWORD`
-- `PORTAL_ADMIN_EMAIL`
-- `PORTAL_START_SOLVER`
-- `ACCOUNT_MANAGER_DATABASE_URL`
+- `PORTAL_JWT_SECRET`：留空则自动生成随机密钥并持久化到数据库同目录的
+  `.portal_jwt_secret`；多实例部署必须显式设置同一个值。
+- `PORTAL_ADMIN_USERNAME` / `PORTAL_ADMIN_PASSWORD` / `PORTAL_ADMIN_EMAIL`：引导管理员账号。
+- `PORTAL_DATABASE_URL`：门户自己的库，默认 `customer_portal_api/customer_portal.db`。
+  想让门户与主服务共用同一个库，就把它显式指到主服务的库文件上。
+- `PORTAL_CORS_ORIGINS`、`PORTAL_PAYMENT_SECRET_<渠道>`：见 `.env.example` 内注释。
+
+完整的 `PORTAL_*` 变量表见 `docs/configuration.md` 第 10 节。
 
 ### 3. 启动服务
 
@@ -97,12 +99,10 @@ python -m uvicorn customer_portal_api.main:app --host 0.0.0.0 --port 8100 --relo
 - Swagger UI: `http://127.0.0.1:8100/docs`
 - OpenAPI JSON: `http://127.0.0.1:8100/openapi.json`
 
-默认管理员账号：
+首次启动会自动写入引导管理员账号（用户名默认 `admin`）。
 
-- 用户名：`admin`
-- 密码：`admin123456`
-
-首次启动会自动写入管理员账号到数据库。
+**不存在出厂密码**：未设置 `PORTAL_ADMIN_PASSWORD` 时会生成一次性随机口令并
+打印到启动日志，请从日志中获取；旧默认值 `admin123456` 已被主动拒绝（见 `tests/test_customer_portal_security.py`）。
 
 ## Docker 部署
 
@@ -119,6 +119,6 @@ docker compose -f customer_portal_api/docker-compose.yml up --build
 ## 设计说明
 
 - 新项目复用当前仓库已有的平台注册和任务执行内核，不重新实现平台插件逻辑
-- 新项目自己的用户、刷新 token、平台授权、订单、订阅、任务归属表会和现有业务表共用同一个 SQLite 数据库
+- 新项目自己的用户、刷新 token、平台授权、订单、订阅、任务归属表默认落在门户独立的 `customer_portal_api/customer_portal.db`；若要和现有业务表共用同一个 SQLite 库，需把 `PORTAL_DATABASE_URL` 显式指向主服务的库文件
 - 用户端注册接口会创建真实注册任务，并通过任务归属表限制用户只能看到自己的任务
 - 支付链路已包含商品种子、下单、提交支付、支付回调、订阅开通和平台注册权限开通

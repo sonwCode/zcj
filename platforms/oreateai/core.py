@@ -28,7 +28,7 @@ class OreateaiBrowserHelper:
             self.session.impersonate = "chrome124"
             self.session.headers.update({
                 "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/124.0.0.0 Safari/537.36"
                 ),
@@ -157,7 +157,7 @@ class OreateaiBrowserHelper:
                 data = r.json()
                 result["credits"] = data.get("credits", data.get("balance", 80))
                 result["api_token"] = data.get("api_token", "")
-        except:
+        except Exception:
             pass
 
         return result
