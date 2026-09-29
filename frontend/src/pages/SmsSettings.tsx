@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
+import { Smartphone, Settings2, TestTube, Star, CheckCircle, XCircle } from 'lucide-react'
+import { Card } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
 import { apiFetch } from '@/lib/utils'
 import { getConfigOptions, invalidateConfigOptionsCache } from '@/lib/app-data'
 import type { ProviderOption, ProviderSetting } from '@/lib/config-options'
@@ -49,12 +52,9 @@ export default function SmsSettings() {
       if (field.category === 'auth') {
         initial[field.key] = field.secret ? '' : (setting?.auth?.[field.key] || '')
       } else if (field.category === 'config') {
-        initial[field.key] = setting?.config?.[field.key] || ''
-      } else {
-        initial[field.key] = setting?.config?.[field.key] || setting?.auth?.[field.key] || ''
+        initial[field.key] = String(setting?.config?.[field.key] ?? (field as any).default ?? '')
       }
     })
-
     setFormData(initial)
     setEditingProvider(providerKey)
   }
@@ -68,65 +68,36 @@ export default function SmsSettings() {
     const config: Record<string, string> = {}
 
     definition.fields?.forEach(field => {
-      const value = formData[field.key] || ''
+      const value = formData[field.key]
       if (field.category === 'auth') {
-        auth[field.key] = value
+        if (value) auth[field.key] = value
       } else if (field.category === 'config') {
-        config[field.key] = value
-      } else {
-        config[field.key] = value
+        if (value) config[field.key] = value
       }
     })
 
     try {
       await apiFetch(`/api/provider-settings/${editingProvider}`, {
-        method: 'POST',
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: editingProvider, auth, config })
+        body: JSON.stringify({ auth, config })
       })
       await invalidateConfigOptionsCache()
-      setEditingProvider(null)
       await load()
+      setEditingProvider(null)
+      setFormData({})
     } catch (err) {
       alert('保存失败: ' + String(err))
     }
   }
 
   const handleTest = async (providerKey: string) => {
-    const definition = catalog.find(p => p.provider_key === providerKey)
-    const setting = settingsMap.get(providerKey)
-    if (!definition) return
-
-    const auth: Record<string, string> = {}
-    const config: Record<string, string> = {}
-
-    definition.fields?.forEach(field => {
-      const value = setting?.auth?.[field.key] || setting?.config?.[field.key] || ''
-      if (field.category === 'auth') {
-        auth[field.key] = value
-      } else {
-        config[field.key] = value
-      }
-    })
-
     setTestingProvider(providerKey)
-
     try {
-      const res = await apiFetch(`/api/provider-settings/${providerKey}/test`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: providerKey, auth, config })
-      })
-      const data = await res.json()
-      setTestResults(prev => new Map(prev).set(providerKey, { 
-        success: data.success, 
-        message: data.message || (data.success ? '测试成功' : '测试失败') 
-      }))
+      const result = await apiFetch(`/api/provider-settings/${providerKey}/test`, { method: 'POST' })
+      setTestResults(new Map(testResults.set(providerKey, { success: true, message: result.message || '测试成功' })))
     } catch (err) {
-      setTestResults(prev => new Map(prev).set(providerKey, { 
-        success: false, 
-        message: String(err) 
-      }))
+      setTestResults(new Map(testResults.set(providerKey, { success: false, message: String(err) })))
     } finally {
       setTestingProvider(null)
     }
@@ -134,41 +105,86 @@ export default function SmsSettings() {
 
   const handleToggle = async (providerKey: string, enabled: boolean) => {
     try {
-      await apiFetch(`/api/provider-settings/${providerKey}`, {
+      await apiFetch(`/api/provider-settings/${providerKey}/toggle`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: providerKey, enabled })
+        body: JSON.stringify({ enabled })
       })
       await invalidateConfigOptionsCache()
       await load()
     } catch (err) {
-      alert('切换状态失败: ' + String(err))
+      alert('切换失败: ' + String(err))
     }
   }
 
-  const handleDelete = async (providerKey: string) => {
-    const providerLabel = catalog.find(p => p.provider_key === providerKey)?.label || providerKey
-    if (!confirm(`确认删除 ${providerLabel} 的配置？`)) return
+  const handleSetDefault = async (providerKey: string) => {
     try {
-      await apiFetch(`/api/provider-settings/${providerKey}`, { method: 'DELETE' })
+      await apiFetch(`/api/provider-settings/${providerKey}/default`, { method: 'POST' })
       await invalidateConfigOptionsCache()
       await load()
     } catch (err) {
-      alert('删除失败: ' + String(err))
+      alert('设为默认失败: ' + String(err))
     }
   }
 
+  if (editingProvider) {
+    const definition = catalog.find(p => p.provider_key === editingProvider)
+    if (!definition) return null
+
+    return (
+      <div className="space-y-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-[var(--text-primary)]">配置 {definition.label}</h2>
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={() => setEditingProvider(null)}>取消</Button>
+            <Button onClick={handleSave}>保存</Button>
+          </div>
+        </div>
+
+        <Card className="p-6">
+          <div className="space-y-4">
+            {definition.fields?.map(field => (
+              <div key={field.key}>
+                <label className="block text-sm font-medium text-[var(--text-primary)] mb-2">
+                  {field.label}
+                  {(field as any).required && <span className="text-red-500 ml-1">*</span>}
+                </label>
+                <input
+                  type={field.secret ? 'password' : 'text'}
+                  value={formData[field.key] || ''}
+                  onChange={e => setFormData({ ...formData, [field.key]: e.target.value })}
+                  placeholder={field.placeholder || field.label}
+                  className="w-full px-3 py-2 bg-[var(--bg-input)] border border-[var(--border)] rounded-md text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                />
+                {(field as any).description && (
+                  <p className="mt-1 text-sm text-[var(--text-muted)]">{(field as any).description}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        </Card>
+      </div>
+    )
+  }
+
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
+      {/* 页面标题 */}
+      <div>
+        <h1 className="flex items-center gap-2 text-xl font-semibold text-[var(--text-primary)]">
+          <Smartphone className="h-5 w-5 text-sky-400" />
+          接码服务
+        </h1>
+        <p className="mt-1 text-sm text-[var(--text-muted)]">
+          配置手机验证码接收服务，支持多个供应商
+        </p>
+      </div>
+
       {error && (
         <div className="rounded border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-300">
           {error}
         </div>
       )}
-
-      <div className="rounded border border-blue-500/20 bg-blue-500/10 px-4 py-3 text-sm text-blue-200">
-        当前接码服务仅用于手机验证码接收。点击"测试"按钮查询余额，不会消耗额度。
-      </div>
 
       {/* 搜索栏 */}
       <div className="flex items-center gap-3">
@@ -176,214 +192,124 @@ export default function SmsSettings() {
           type="text"
           value={searchTerm}
           onChange={e => setSearchTerm(e.target.value)}
-          placeholder="搜索邮箱、token、来源..."
-          className="flex-1 px-4 py-2 bg-[#0f1419] border border-gray-700 rounded text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
+          placeholder="搜索服务..."
+          className="flex-1 px-4 py-2 bg-[var(--bg-input)] border border-[var(--border)] rounded-md text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
         />
-        <div className="text-sm text-gray-400">
-          已显示 {filteredCatalog.filter(p => p.provider_key && settingsMap.has(p.provider_key)).length} / 
-          补链接数 {filteredCatalog.length}
+        <div className="text-sm text-[var(--text-muted)]">
+          {filteredCatalog.filter(p => p.provider_key && settingsMap.has(p.provider_key)).length} / {filteredCatalog.length}
         </div>
       </div>
 
-      {/* 表格 */}
-      <div className="bg-white rounded shadow overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-50 border-b border-gray-200">
-            <tr>
-              <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wide">
-                <input type="checkbox" className="w-4 h-4" />
-              </th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wide">ID</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wide">邮箱</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wide">来源</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wide">Token</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wide">2FA</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wide">Codex</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wide">创建时间</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wide">操作</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-100">
-            {filteredCatalog.map(provider => {
-              if (!provider.provider_key) return null
-              const setting = settingsMap.get(provider.provider_key)
-              const isEnabled = setting?.enabled ?? false
-              const isTesting = testingProvider === provider.provider_key
-              const testResult = testResults.get(provider.provider_key)
-              const hasConfig = setting && (
-                (setting.auth && Object.keys(setting.auth).length > 0) ||
-                (setting.config && Object.keys(setting.config).length > 0)
-              )
+      {/* 卡片网格 */}
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        {filteredCatalog.map(provider => {
+          if (!provider.provider_key) return null
+          const setting = settingsMap.get(provider.provider_key)
+          const isEnabled = setting?.enabled ?? false
+          const isDefault = setting?.is_default ?? false
+          const isConfigured = setting ? (
+            (setting.auth && Object.keys(setting.auth).length > 0) ||
+            (setting.config && Object.keys(setting.config).length > 0)
+          ) : false
+          const isTesting = testingProvider === provider.provider_key
+          const testResult = testResults.get(provider.provider_key)
 
-              return (
-                <tr key={provider.provider_key} className="hover:bg-gray-50 transition-colors">
-                  <td className="px-4 py-3">
-                    <input type="checkbox" className="w-4 h-4" />
-                  </td>
-                  <td className="px-4 py-3 text-gray-900 font-mono text-xs">
-                    #{provider.provider_key}
-                  </td>
-                  <td className="px-4 py-3 text-gray-900 font-medium">
-                    {provider.label}
-                  </td>
-                  <td className="px-4 py-3 text-gray-600">
-                    {provider.description || '-'}
-                  </td>
-                  <td className="px-4 py-3">
-                    {hasConfig ? (
-                      <span className="text-green-600 font-medium">已配置</span>
-                    ) : (
-                      <span className="text-gray-400">-</span>
+          return (
+            <Card key={provider.provider_key} className="p-5">
+              <div className="flex items-start justify-between mb-4">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 rounded-lg bg-[var(--bg-card)] border border-[var(--border)]">
+                    <Smartphone className="h-5 w-5 text-sky-400" />
+                  </div>
+                  <div>
+                    <div className="font-medium text-[var(--text-primary)]">{provider.label}</div>
+                    {provider.description && (
+                      <div className="text-sm text-[var(--text-muted)] mt-0.5">{provider.description}</div>
                     )}
-                  </td>
-                  <td className="px-4 py-3">
-                    <span className={`inline-block px-2 py-1 text-xs rounded ${
-                      isEnabled ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
-                    }`}>
-                      {isEnabled ? '启用' : '关闭'}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3">
-                    {testResult && (
-                      <span className={testResult.success ? 'text-green-600' : 'text-red-600'}>
-                        {testResult.success ? '成功' : '失败'}
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-4 py-3 text-gray-500 text-xs">
-                    {setting ? new Date().toISOString().split('T')[0] : '-'}
-                  </td>
-                  <td className="px-4 py-3">
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => handleEdit(provider.provider_key!)}
-                        className="text-blue-600 hover:text-blue-700 font-medium"
-                      >
-                        编辑
-                      </button>
-                      <button
-                        onClick={() => handleTest(provider.provider_key!)}
-                        disabled={isTesting || !hasConfig}
-                        className="text-blue-600 hover:text-blue-700 font-medium disabled:text-gray-400"
-                      >
-                        {isTesting ? '测试中' : '测试'}
-                      </button>
-                      {isEnabled ? (
-                        <button
-                          onClick={() => handleToggle(provider.provider_key!, false)}
-                          className="text-gray-600 hover:text-gray-700 font-medium"
-                        >
-                          关闭
-                        </button>
-                      ) : (
-                        <button
-                          onClick={() => handleToggle(provider.provider_key!, true)}
-                          className="text-green-600 hover:text-green-700 font-medium"
-                        >
-                          启用
-                        </button>
-                      )}
-                      {setting && (
-                        <button
-                          onClick={() => handleDelete(provider.provider_key!)}
-                          className="text-red-600 hover:text-red-700 font-medium"
-                        >
-                          删除
-                        </button>
-                      )}
-                    </div>
-                  </td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
+                  </div>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={isEnabled}
+                    onChange={e => handleToggle(provider.provider_key!, e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer dark:bg-gray-700 peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                </label>
+              </div>
+
+              <div className="flex items-center gap-2 mb-4">
+                {isConfigured ? (
+                  <>
+                    <CheckCircle className="h-4 w-4 text-[var(--tone-success)]" />
+                    <span className="text-sm text-[var(--tone-success)]">已配置</span>
+                  </>
+                ) : (
+                  <>
+                    <XCircle className="h-4 w-4 text-[var(--tone-danger)]" />
+                    <span className="text-sm text-[var(--tone-danger)]">未配置</span>
+                  </>
+                )}
+                {isDefault && (
+                  <>
+                    <Star className="h-4 w-4 text-amber-400 fill-amber-400" />
+                    <span className="text-sm text-amber-400">默认</span>
+                  </>
+                )}
+              </div>
+
+              {testResult && (
+                <div className={`mb-4 p-3 rounded-md text-sm ${
+                  testResult.success
+                    ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                    : 'bg-red-500/10 text-red-400 border border-red-500/20'
+                }`}>
+                  {testResult.message}
+                </div>
+              )}
+
+              <div className="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handleEdit(provider.provider_key!)}
+                  className="flex-1"
+                >
+                  <Settings2 className="h-3.5 w-3.5 mr-1.5" />
+                  编辑
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handleTest(provider.provider_key!)}
+                  disabled={isTesting || !isConfigured}
+                  className="flex-1"
+                >
+                  <TestTube className="h-3.5 w-3.5 mr-1.5" />
+                  {isTesting ? '测试中...' : '测试'}
+                </Button>
+                {!isDefault && isConfigured && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => handleSetDefault(provider.provider_key!)}
+                    title="设为默认"
+                  >
+                    <Star className="h-3.5 w-3.5" />
+                  </Button>
+                )}
+              </div>
+            </Card>
+          )
+        })}
       </div>
 
-      {/* 编辑弹窗 */}
-      {editingProvider && (() => {
-        const definition = catalog.find(p => p.provider_key === editingProvider)
-        if (!definition) return null
-        const setting = settingsMap.get(editingProvider)
-
-        return (
-          <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-            <div className="bg-white rounded-lg w-full max-w-2xl max-h-[90vh] overflow-y-auto shadow-2xl">
-              <div className="px-6 py-4 border-b border-gray-200 flex justify-between items-center bg-gray-50">
-                <h3 className="text-lg font-semibold text-gray-900">
-                  编辑配置 - {definition.label}
-                </h3>
-                <button 
-                  onClick={() => setEditingProvider(null)} 
-                  className="text-gray-400 hover:text-gray-600 transition-colors"
-                >
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
-              </div>
-              <div className="px-6 py-4 space-y-4">
-                {definition.fields?.map(field => {
-                  const secretPreserved = field.secret && Boolean(setting?.auth_preview?.[field.key])
-                  
-                  return (
-                    <div key={field.key}>
-                      <label className="block text-sm font-medium text-gray-700 mb-1.5">
-                        {field.label}
-                        {field.secret && <span className="text-red-500 ml-1">*</span>}
-                      </label>
-                      {field.type === 'textarea' ? (
-                        <textarea
-                          value={formData[field.key] || ''}
-                          onChange={e => setFormData({ ...formData, [field.key]: e.target.value })}
-                          placeholder={secretPreserved ? '已保存，留空保持不变' : (field.placeholder || '')}
-                          className="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                          rows={4}
-                        />
-                      ) : field.type === 'toggle' ? (
-                        <label className="flex items-center gap-2 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={formData[field.key] === 'true' || formData[field.key] === '1'}
-                            onChange={e => setFormData({ ...formData, [field.key]: e.target.checked ? 'true' : 'false' })}
-                            className="w-4 h-4 text-blue-600"
-                          />
-                          <span className="text-sm text-gray-600">{field.hint || field.label}</span>
-                        </label>
-                      ) : (
-                        <input
-                          type={field.secret ? 'password' : 'text'}
-                          value={formData[field.key] || ''}
-                          onChange={e => setFormData({ ...formData, [field.key]: e.target.value })}
-                          placeholder={secretPreserved ? '已保存，留空保持不变' : (field.placeholder || '')}
-                          className="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                        />
-                      )}
-                      {field.hint && field.type !== 'toggle' && (
-                        <p className="text-xs text-gray-500 mt-1">{field.hint}</p>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
-              <div className="px-6 py-4 border-t border-gray-200 flex justify-end gap-3 bg-gray-50">
-                <button
-                  onClick={() => setEditingProvider(null)}
-                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded hover:bg-gray-50 transition-colors"
-                >
-                  取消
-                </button>
-                <button
-                  onClick={handleSave}
-                  className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded hover:bg-blue-700 transition-colors"
-                >
-                  保存配置
-                </button>
-              </div>
-            </div>
-          </div>
-        )
-      })()}
+      {filteredCatalog.length === 0 && (
+        <div className="text-center py-12 text-[var(--text-muted)]">
+          未找到匹配的服务
+        </div>
+      )}
     </div>
   )
 }
