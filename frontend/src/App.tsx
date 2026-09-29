@@ -24,6 +24,8 @@ import {
   UserPlus,
   CreditCard,
   Network,
+  Cable,
+  Boxes,
   ShieldAlert,
   Inbox,
   Route as RouteIcon,
@@ -35,6 +37,11 @@ const Dashboard = lazy(() => import("@/pages/Dashboard"));
 const Accounts = lazy(() => import("@/pages/Accounts"));
 const SmsPoolBlacklist = lazy(() => import("@/pages/SmsPoolBlacklist"));
 const Register = lazy(() => import("@/pages/RegisterWorkbench"));
+const RegisterCenter = lazy(() => import("@/pages/RegisterCenter"));
+const OtherRegisterWorkbench = lazy(() => import("@/pages/OtherRegisterWorkbench"));
+const Tasks = lazy(() => import("@/pages/Tasks"));
+const Integrations = lazy(() => import("@/pages/Integrations"));
+const SmsSettings = lazy(() => import("@/pages/SmsSettings"));
 const Proxies = lazy(() => import("@/pages/Proxies"));
 const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
 const TaskHistory = lazy(() => import("@/pages/TaskHistory"));
@@ -82,13 +89,16 @@ const NAV_ITEMS: NavItem[] = [
   { path: "/", labelKey: "nav.dashboard", icon: LayoutDashboard, exact: true, group: "总览" },
   { path: "/accounts/chatgpt", label: "账号池", icon: Users, group: "账号" },
   { path: "/register", label: "注册中心", icon: UserPlus, group: "账号" },
-  { path: "/history", label: "任务日志", icon: ClipboardList, group: "账号" },
+  { path: "/register-other", label: "多平台注册", icon: Boxes, group: "账号" },
+  { path: "/tasks", label: "任务中心", icon: ClipboardList, group: "账号" },
+  { path: "/history", label: "任务历史", icon: ClipboardList, group: "账号" },
   { path: "/plus-manager", label: "Plus 管理", icon: CreditCard, group: "Plus" },
   { path: "/ctf-gpt-plus", label: "CTF Plus", icon: CreditCard, group: "Plus" },
   { path: "/gopay-gpt-plus", label: "GoPay Plus", icon: CreditCard, group: "Plus" },
   { path: "/proxies", label: "代理池", icon: Network, group: "工具" },
   { path: "/accounts/sms-pool", label: "号码黑名单", icon: ShieldAlert, group: "工具" },
   { path: "/microsoft-mailboxes", label: "微软邮箱", icon: Inbox, group: "工具" },
+  { path: "/integrations", label: "功能适配", icon: Cable, group: "工具" },
   { path: "/proxy-nodes", label: "代理节点", icon: RouteIcon, group: "工具" },
   { path: "/settings", labelKey: "nav.settings", icon: SettingsIcon, group: "系统" },
 ];
@@ -113,31 +123,38 @@ function Sidebar({
 
   const navLinkClass = (active: boolean) =>
     cn(
-      "group sub2-nav-link",
-      active && "sub2-nav-link-active",
-      collapsed && "sub2-nav-link-collapsed",
+      "group flex items-center gap-3 rounded-lg px-3 py-2 text-[13px] font-medium transition-colors",
+      active
+        ? "bg-[var(--accent-soft)] text-[var(--text-primary)]"
+        : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]",
+      collapsed && "justify-center px-0",
     );
 
   const iconClass = (active: boolean) =>
-    cn("sub2-nav-icon", active && "sub2-nav-icon-active");
+    cn(
+      "h-[18px] w-[18px] shrink-0",
+      active
+        ? "text-[var(--accent)]"
+        : "text-[var(--text-muted)] group-hover:text-[var(--text-secondary)]",
+    );
 
   return (
     <aside
       className={cn(
-        "sub2-sidebar flex h-screen flex-col transition-[width] duration-200",
-        collapsed ? "w-[72px]" : "w-64",
+        "app-sidebar flex h-screen flex-col transition-[width] duration-200",
+        collapsed ? "w-16" : "w-[220px]",
       )}
     >
       {/* Header */}
       <div
         className={cn(
-          "sub2-sidebar-header flex shrink-0 items-center",
+          "flex h-12 shrink-0 items-center border-b border-[var(--border)] px-3",
           collapsed ? "justify-center" : "justify-between",
         )}
       >
         {!collapsed && (
           <div className="flex min-w-0 flex-1 items-center gap-3">
-            <div className="sub2-brand-mark h-9 w-9 shrink-0 text-[13px] font-black">
+            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[var(--accent)] text-[11px] font-bold text-white">
               Z
             </div>
             <div className="min-w-0">
@@ -151,14 +168,14 @@ function Sidebar({
           </div>
         )}
         {collapsed && (
-          <div className="sub2-brand-mark h-9 w-9 text-[13px] font-black">
+          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-[var(--accent)] text-[11px] font-bold text-white">
             Z
           </div>
         )}
       </div>
 
       {/* Nav */}
-      <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
+      <nav className="flex-1 overflow-y-auto px-2 py-3">
         {NAV_ITEMS.map(({ path, labelKey, label: itemLabel, icon: Icon, exact, group }, index) => {
           const active = exact
             ? location.pathname === path
@@ -168,7 +185,7 @@ function Sidebar({
           return (
             <div key={path}>
               {showGroup && (
-                <div className="sub2-section-title">
+                <div className="sidebar-section-label">
                   {group}
                 </div>
               )}
@@ -185,7 +202,7 @@ function Sidebar({
           );
         })}
         {!collapsed && isSettings && (
-          <div className="sub2-settings-rail space-y-1">
+          <div className="ml-[21px] mt-0.5 space-y-px border-l border-[var(--border)] pl-3">
             {SETTINGS_NAV_ITEMS.map((item) => {
               const active = currentTab === item.hash;
               return (
@@ -193,8 +210,10 @@ function Sidebar({
                   key={item.hash}
                   to={`/settings?tab=${item.hash}`}
                   className={cn(
-                    "sub2-settings-link",
-                    active && "sub2-settings-link-active",
+                    "relative block rounded-md px-2.5 py-1.5 text-[13px] transition-colors",
+                    active
+                      ? "text-[var(--accent)] font-medium bg-[var(--accent-soft)]"
+                      : "text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]",
                   )}
                 >
                   {t(item.labelKey)}
@@ -206,13 +225,13 @@ function Sidebar({
       </nav>
 
       {/* Footer */}
-      <div className="sub2-sidebar-footer shrink-0 px-3 py-3">
-        <SchedulerHealth compact={collapsed} className={cn(collapsed ? "mx-auto mb-2" : "mb-3 min-w-0 w-full")} />
-        <div className={cn("flex gap-1", collapsed ? "flex-col items-center" : "items-center")}>
+      <div className="shrink-0 border-t border-[var(--border)] px-2 py-1.5">
+        <SchedulerHealth compact={collapsed} className={cn(collapsed ? "mx-auto mb-2" : "mb-2 w-full")} />
+        <div className="flex items-center gap-1">
         <button
           onClick={toggleTheme}
           className={cn(
-            "sub2-icon-button",
+            "flex items-center justify-center rounded-md p-2 text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)]",
           )}
           title={
             theme === "light"
@@ -241,7 +260,7 @@ function Sidebar({
         )}
         <button
           onClick={toggleLanguage}
-          className="sub2-icon-button"
+          className="flex items-center justify-center rounded-md p-2 text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)]"
           title={t("sidebar.languageToggle")}
         >
           <Languages className="h-4 w-4" />
@@ -249,7 +268,7 @@ function Sidebar({
         {!compactViewport && (
           <button
             onClick={() => setCollapsed(!collapsed)}
-            className="sub2-icon-button"
+            className="flex items-center justify-center rounded-md p-2 text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)]"
             title={collapsed ? t("sidebar.expand") : t("sidebar.collapse")}
           >
             {collapsed ? (
@@ -298,7 +317,7 @@ function Shell({
   }, []);
 
   return (
-    <div className="sub2-app-frame flex h-screen overflow-hidden">
+    <div className="flex h-screen overflow-hidden bg-[var(--bg-base)]">
       <Sidebar
         theme={theme}
         toggleTheme={toggleTheme}
@@ -306,8 +325,8 @@ function Shell({
         compactViewport={compactViewport}
         setCollapsed={setCollapsed}
       />
-      <main className="sub2-main">
-        <div className="sub2-content">
+      <main className="flex-1 overflow-y-auto">
+        <div className="mx-auto w-full max-w-[1600px] px-4 py-5 sm:px-6 lg:px-8">
           <UpdateBanner />
           <Suspense fallback={<RouteFallback />}>
             <Routes>
@@ -316,12 +335,17 @@ function Shell({
               <Route path="/accounts/sms-pool" element={<SmsPoolBlacklist />} />
               <Route path="/accounts/:platform" element={<Accounts />} />
               <Route path="/register" element={<Register />} />
+              <Route path="/register-center" element={<RegisterCenter />} />
+              <Route path="/register-other" element={<OtherRegisterWorkbench />} />
+              <Route path="/tasks" element={<Tasks />} />
               <Route path="/ctf-gpt-plus" element={<CtfGptPlus />} />
               <Route path="/gopay-gpt-plus" element={<GoPayGptPlus />} />
               <Route path="/plus-manager" element={<PlusManager />} />
               <Route path="/history" element={<TaskHistory />} />
               <Route path="/proxies" element={<Proxies />} />
               <Route path="/microsoft-mailboxes" element={<MicrosoftMailboxes />} />
+              <Route path="/integrations" element={<Integrations />} />
+              <Route path="/sms-settings" element={<SmsSettings />} />
               <Route path="/proxy-nodes" element={<ProxyPoolSettings />} />
               <Route
                 path="/settings"

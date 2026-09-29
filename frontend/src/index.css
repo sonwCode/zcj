@@ -5,6 +5,7 @@
    compact admin-console density.
    ================================================================ */
 
+/* 参考前端压缩包的视觉令牌，当前 zcj 组件继续复用同名变量。 */
 :root {
   color-scheme: dark;
 
@@ -138,6 +139,56 @@ body::before {
 #root {
   min-height: 100vh;
   isolation: isolate;
+}
+
+/* 参考压缩包的导航层：保留当前功能皮肤，同时复用参考壳层的层级与响应式语义。 */
+.app-sidebar {
+  --bg-surface: #111827;
+  --bg-hover: rgba(255, 255, 255, 0.07);
+  --border: rgba(255, 255, 255, 0.11);
+  --text-primary: #f8fafc;
+  --text-secondary: #cbd5e1;
+  --text-muted: #94a3b8;
+  --accent: #60a5fa;
+  --accent-soft: rgba(96, 165, 250, 0.14);
+  --accent-edge: rgba(96, 165, 250, 0.28);
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  background: var(--bg-surface);
+  box-shadow: 1px 0 0 rgba(15, 23, 42, 0.18);
+}
+
+.light .app-sidebar {
+  --bg-surface: #ffffff;
+  --bg-hover: #f1f5f9;
+  --border: #e2e8f0;
+  --text-primary: #17213b;
+  --text-secondary: #52617a;
+  --text-muted: #8190a8;
+  --accent: #2563eb;
+  --accent-soft: rgba(37, 99, 235, 0.08);
+  --accent-edge: rgba(37, 99, 235, 0.18);
+  box-shadow: 1px 0 0 rgba(15, 23, 42, 0.04);
+}
+
+.sidebar-section-label {
+  padding: 0.6rem 0.75rem 0.35rem;
+  color: var(--text-muted);
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.sidebar-nav-dot {
+  width: 0.38rem;
+  height: 0.38rem;
+  margin-left: auto;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #f59e0b;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.12);
 }
 
 button,
