@@ -136,7 +136,9 @@ function EditModal({
   const [form, setForm] = useState<Record<string, string>>(() => {
     const data: Record<string, string> = {}
     for (const field of fields) {
-      data[field.key] = (setting?.auth?.[field.key] || '') || (setting?.config?.[field.key] || '')
+      data[field.key] = field.secret
+        ? ''
+        : (setting?.auth?.[field.key] || '') || (setting?.config?.[field.key] || '')
     }
     return data
   })
@@ -256,6 +258,7 @@ function EditModal({
             <p className="text-sm text-[var(--text-muted)]">{t('providers.noConfig')}</p>
           ) : fields.map(field => {
             const sk = `${provider.value}:${field.key}`
+            const secretPreserved = field.secret && Boolean(setting?.auth_preview?.[field.key])
             return (
               <div key={field.key}>
                 <label className="mb-1.5 block text-sm font-medium text-[var(--text-secondary)]">{field.label}</label>
@@ -290,7 +293,7 @@ function EditModal({
                     <textarea
                       value={form[field.key] || ''}
                       onChange={e => setForm(f => ({ ...f, [field.key]: e.target.value }))}
-                      placeholder={field.placeholder || ''}
+                      placeholder={secretPreserved ? '已保存，留空保持不变' : (field.placeholder || '')}
                       className="control-surface min-h-32 font-mono text-xs"
                       autoComplete="off"
                       data-1p-ignore
@@ -300,7 +303,7 @@ function EditModal({
                     <>
                       <input type={field.secret && !showSecret[sk] ? 'password' : 'text'} value={form[field.key] || ''}
                         onChange={e => setForm(f => ({ ...f, [field.key]: e.target.value }))}
-                        placeholder={field.placeholder || ''} className="control-surface pr-9" autoComplete="new-password"
+                        placeholder={secretPreserved ? '已保存，留空保持不变' : (field.placeholder || '')} className="control-surface pr-9" autoComplete="new-password"
                         data-1p-ignore data-lpignore="true" />
                       {field.secret && (
                         <button onClick={() => setShowSecret(s => ({ ...s, [sk]: !s[sk] }))}

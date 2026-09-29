@@ -11,6 +11,7 @@ from core.auth import (
 )
 from core.vault import MASKED_SECRET
 from application.provider_settings import ProviderSettingsService
+from infrastructure.provider_settings_repository import _merge_auth
 
 
 def _request(*, authorization: str = "", cookie: str = "") -> Request:
@@ -55,7 +56,7 @@ def test_provider_serialization_masks_auth_values():
         is_default = False
 
         def get_auth(self):
-            return {"api_key": "raw-api-key", "empty": ""}
+            return {"api_key": "raw-api-key", "pool_text": "account----token", "empty": ""}
 
         def get_config(self):
             return {"country": "US"}
@@ -74,7 +75,10 @@ def test_provider_serialization_masks_auth_values():
             return ["api_key"]
 
         def get_fields(self):
-            return []
+            return [
+                {"key": "api_key", "secret": True, "category": "auth"},
+                {"key": "pool_text", "category": "auth"},
+            ]
 
     class Definitions:
         def get_by_key(self, provider_type, provider_key):
@@ -84,7 +88,20 @@ def test_provider_serialization_masks_auth_values():
     service.definitions = Definitions()
     result = service._serialize(Item())
 
-    assert result["auth"]["api_key"] == MASKED_SECRET
+    assert "api_key" not in result["auth"]
     assert result["auth_preview"]["api_key"] == MASKED_SECRET
+    assert result["auth"]["pool_text"] == "account----token"
     assert "raw-api-key" not in str(result)
     assert result["auth"]["empty"] == ""
+
+
+def test_provider_auth_merge_clears_non_secret_fields_and_preserves_secret_placeholders():
+    merged = _merge_auth(
+        {"pool_text": "old-account----token", "api_key": "old-api-key"},
+        {"pool_text": "", "api_key": MASKED_SECRET},
+        known_keys={"pool_text", "api_key"},
+        secret_keys={"api_key"},
+    )
+
+    assert merged["pool_text"] == ""
+    assert merged["api_key"] == "old-api-key"

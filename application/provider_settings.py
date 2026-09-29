@@ -51,15 +51,25 @@ class ProviderSettingsService:
 
     def _serialize(self, item) -> dict:
         definition = self.definitions.get_by_key(item.provider_type, item.provider_key)
-        raw_auth = item.get_auth() or {}
-        # Never send credential material to the browser. The mask also lets the
-        # client preserve configured fields while the repository merges updates.
-        auth = {
-            str(key): MASKED_SECRET if str(value or "") else ""
-            for key, value in raw_auth.items()
-        }
         auth_modes = definition.get_auth_modes() if definition else []
         fields = definition.get_fields() if definition else []
+        raw_auth = item.get_auth() or {}
+        field_map = {
+            str(field.get("key") or ""): field
+            for field in fields
+            if str(field.get("key") or "").strip()
+        }
+        auth: dict[str, object] = {}
+        auth_preview: dict[str, str] = {}
+        for key, value in raw_auth.items():
+            normalized_key = str(key)
+            field = field_map.get(normalized_key)
+            # Only fields explicitly marked secret are hidden. Unknown auth
+            # keys stay hidden as a compatibility and security fallback.
+            if field is not None and not bool(field.get("secret")):
+                auth[normalized_key] = value
+            elif str(value or "").strip():
+                auth_preview[normalized_key] = MASKED_SECRET
         return {
             "id": int(item.id or 0),
             "provider_type": item.provider_type,
@@ -77,6 +87,6 @@ class ProviderSettingsService:
             "fields": fields,
             "config": item.get_config(),
             "auth": auth,
-            "auth_preview": dict(auth),
+            "auth_preview": auth_preview,
             "metadata": item.get_metadata(),
         }

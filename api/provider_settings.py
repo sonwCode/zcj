@@ -75,10 +75,26 @@ def test_provider(body: ProviderTestRequest):
     repository = ProviderSettingsRepository(definitions)
     extra = repository.resolve_runtime_settings(body.provider_type, body.provider_key)
     extra.update({str(key): value for key, value in body.config.items()})
+    fields = definition.get_fields()
+    known_keys = {
+        str(field.get("key") or "")
+        for field in fields
+        if str(field.get("key") or "").strip()
+    }
+    secret_keys = {
+        str(field.get("key") or "")
+        for field in fields
+        if str(field.get("key") or "").strip() and bool(field.get("secret"))
+    }
     for key, value in body.auth.items():
+        normalized_key = str(key)
         text = str(value or "")
-        if text.strip() and text != MASKED_SECRET:
-            extra[str(key)] = value
+        is_secret = normalized_key in secret_keys or normalized_key not in known_keys
+        if is_secret:
+            if text.strip() and text != MASKED_SECRET:
+                extra[normalized_key] = value
+        else:
+            extra[normalized_key] = value
 
     if body.provider_type == "mailbox":
         return _test_mailbox(definition.driver_type or body.provider_key, extra, definition)

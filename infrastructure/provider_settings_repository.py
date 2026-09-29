@@ -13,14 +13,25 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _merge_auth(existing: dict, incoming: dict) -> dict:
+def _merge_auth(
+    existing: dict,
+    incoming: dict,
+    *,
+    known_keys: set[str] | None = None,
+    secret_keys: set[str] | None = None,
+) -> dict:
+    known = set(known_keys or set())
+    secrets = set(secret_keys or set())
     merged = dict(existing or {})
     for key, value in (incoming or {}).items():
+        normalized_key = str(key)
         text = str(value or "")
-        # The UI sends these placeholders when it did not edit a secret.
-        if not text.strip() or text == MASKED_SECRET:
+        # Empty values are meaningful for declared non-secret fields. For
+        # secrets and unknown legacy fields they mean "keep the old value".
+        is_secret = normalized_key in secrets or normalized_key not in known
+        if is_secret and (not text.strip() or text == MASKED_SECRET):
             continue
-        merged[str(key)] = value
+        merged[normalized_key] = value
     return merged
 
 
@@ -134,6 +145,17 @@ class ProviderSettingsRepository:
         definition = self.definitions.get_by_key(provider_type, provider_key)
         if not definition:
             raise ValueError(f"未知 provider: {provider_type}/{provider_key}")
+        fields = definition.get_fields()
+        known_keys = {
+            str(field.get("key") or "")
+            for field in fields
+            if str(field.get("key") or "").strip()
+        }
+        secret_keys = {
+            str(field.get("key") or "")
+            for field in fields
+            if str(field.get("key") or "").strip() and bool(field.get("secret"))
+        }
 
         with Session(engine) as session:
             if setting_id:
@@ -167,7 +189,14 @@ class ProviderSettingsRepository:
             item.enabled = bool(enabled)
             item.is_default = bool(is_default)
             item.set_config(config or {})
-            item.set_auth(_merge_auth(item.get_auth(), auth or {}))
+            item.set_auth(
+                _merge_auth(
+                    item.get_auth(),
+                    auth or {},
+                    known_keys=known_keys,
+                    secret_keys=secret_keys,
+                )
+            )
             item.set_metadata(metadata or {})
             item.updated_at = _utcnow()
             session.add(item)
