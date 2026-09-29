@@ -23,7 +23,6 @@ import {
   ClipboardList,
   UserPlus,
   CreditCard,
-  Boxes,
 
   Inbox,
   PanelLeftClose,
@@ -84,8 +83,7 @@ const SETTINGS_NAV_ITEMS: { labelKey: TranslationKey; hash: string }[] = [
 const NAV_ITEMS: NavItem[] = [
   { path: "/", labelKey: "nav.dashboard", icon: LayoutDashboard, exact: true, group: "总览" },
   { path: "/accounts/chatgpt", label: "账号池", icon: Users, group: "账号" },
-  { path: "/register", label: "注册中心", icon: UserPlus, group: "账号" },
-  { path: "/register-other", label: "多平台注册", icon: Boxes, group: "账号" },
+  { path: "/register-center", label: "注册中心", icon: UserPlus, group: "账号" },
   { path: "/tasks", label: "任务中心", icon: ClipboardList, group: "账号" },
   { path: "/history", label: "任务历史", icon: ClipboardList, group: "账号" },
   { path: "/plus-manager", label: "Plus 管理", icon: CreditCard, group: "PLUS" },
