@@ -22,6 +22,8 @@ import Settings from "@/pages/Settings";
 import Proxies from "@/pages/Proxies";
 import AdvancedSettings from "@/components/settings/AdvancedSettings";
 import BitBrowserProfiles from "@/components/settings/BitBrowserProfiles";
+import Integrations from "@/pages/Integrations";
+import ProxyPoolSettings from "@/pages/ProxyPoolSettings";
 
 /* ------------------------------------------------------------------ */
 /*  Tab definitions                                                    */
@@ -500,8 +502,10 @@ export default function SettingsPage({
     captcha: t("settings.title.captcha"),
     sms: t("settings.title.sms"),
     proxies: t("settings.title.proxies"),
+    "proxy-nodes": t("settings.title.proxyNodes"),
     chatgpt: t("settings.title.chatgpt"),
     bitbrowser: t("settings.title.bitbrowser"),
+    integrations: t("settings.title.integrations"),
     advanced: t("settings.title.advanced"),
     about: t("settings.title.about"),
   };
@@ -515,7 +519,9 @@ export default function SettingsPage({
       {tab === "general" && <GeneralTab theme={theme} setTheme={setTheme} />}
       {isConfigTab && <Settings embedded defaultTab={tab} />}
       {tab === "proxies" && <Proxies />}
+      {tab === "proxy-nodes" && <ProxyPoolSettings />}
       {tab === "bitbrowser" && <BitBrowserProfiles />}
+      {tab === "integrations" && <Integrations />}
       {tab === "advanced" && <AdvancedSettings />}
       {tab === "about" && <AboutTab />}
     </div>

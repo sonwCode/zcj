@@ -23,12 +23,9 @@ import {
   ClipboardList,
   UserPlus,
   CreditCard,
-  Network,
-  Cable,
   Boxes,
 
   Inbox,
-  Route as RouteIcon,
   PanelLeftClose,
   PanelLeft,
 } from "lucide-react";
@@ -39,16 +36,14 @@ const Register = lazy(() => import("@/pages/RegisterWorkbench"));
 const RegisterCenter = lazy(() => import("@/pages/RegisterCenter"));
 const OtherRegisterWorkbench = lazy(() => import("@/pages/OtherRegisterWorkbench"));
 const Tasks = lazy(() => import("@/pages/Tasks"));
-const Integrations = lazy(() => import("@/pages/Integrations"));
 const SmsSettings = lazy(() => import("@/pages/SmsSettings"));
-const Proxies = lazy(() => import("@/pages/Proxies"));
 const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
 const TaskHistory = lazy(() => import("@/pages/TaskHistory"));
 const CtfGptPlus = lazy(() => import("@/pages/CtfGptPlus"));
 const GoPayGptPlus = lazy(() => import("@/pages/GoPayGptPlus"));
 const PlusManager = lazy(() => import("@/pages/PlusManager"));
 const MicrosoftMailboxes = lazy(() => import("@/pages/MicrosoftMailboxes"));
-const ProxyPoolSettings = lazy(() => import("@/pages/ProxyPoolSettings"));
+
 
 function RouteFallback() {
   return (
@@ -78,8 +73,10 @@ const SETTINGS_NAV_ITEMS: { labelKey: TranslationKey; hash: string }[] = [
   { labelKey: "nav.settings.captcha", hash: "captcha" },
   { labelKey: "nav.settings.sms", hash: "sms" },
   { labelKey: "nav.settings.proxies", hash: "proxies" },
+  { labelKey: "nav.settings.proxyNodes", hash: "proxy-nodes" },
   { labelKey: "nav.settings.chatgpt", hash: "chatgpt" },
   { labelKey: "nav.settings.bitbrowser", hash: "bitbrowser" },
+  { labelKey: "nav.settings.integrations", hash: "integrations" },
   { labelKey: "nav.settings.advanced", hash: "advanced" },
   { labelKey: "nav.settings.about", hash: "about" },
 ];
@@ -94,10 +91,7 @@ const NAV_ITEMS: NavItem[] = [
   { path: "/plus-manager", label: "Plus 管理", icon: CreditCard, group: "PLUS" },
   { path: "/ctf-gpt-plus", label: "CTF Plus", icon: CreditCard, group: "PLUS" },
   { path: "/gopay-gpt-plus", label: "GoPay Plus", icon: CreditCard, group: "PLUS" },
-  { path: "/proxies", label: "代理池", icon: Network, group: "工具" },
   { path: "/microsoft-mailboxes", label: "微软邮箱", icon: Inbox, group: "工具" },
-  { path: "/integrations", label: "功能适配", icon: Cable, group: "工具" },
-  { path: "/proxy-nodes", label: "代理节点", icon: RouteIcon, group: "工具" },
   { path: "/settings", labelKey: "nav.settings", icon: SettingsIcon, group: "系统" },
 ];
 
@@ -339,11 +333,8 @@ function Shell({
               <Route path="/gopay-gpt-plus" element={<GoPayGptPlus />} />
               <Route path="/plus-manager" element={<PlusManager />} />
               <Route path="/history" element={<TaskHistory />} />
-              <Route path="/proxies" element={<Proxies />} />
               <Route path="/microsoft-mailboxes" element={<MicrosoftMailboxes />} />
-              <Route path="/integrations" element={<Integrations />} />
               <Route path="/sms-settings" element={<SmsSettings />} />
-              <Route path="/proxy-nodes" element={<ProxyPoolSettings />} />
               <Route
                 path="/settings"
                 element={<SettingsPage theme={theme} setTheme={setTheme} />}
