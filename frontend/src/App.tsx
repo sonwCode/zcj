@@ -26,7 +26,7 @@ import {
   Network,
   Cable,
   Boxes,
-  ShieldAlert,
+
   Inbox,
   Route as RouteIcon,
   PanelLeftClose,
@@ -35,7 +35,6 @@ import {
 
 const Dashboard = lazy(() => import("@/pages/Dashboard"));
 const Accounts = lazy(() => import("@/pages/Accounts"));
-const SmsPoolBlacklist = lazy(() => import("@/pages/SmsPoolBlacklist"));
 const Register = lazy(() => import("@/pages/RegisterWorkbench"));
 const RegisterCenter = lazy(() => import("@/pages/RegisterCenter"));
 const OtherRegisterWorkbench = lazy(() => import("@/pages/OtherRegisterWorkbench"));
@@ -96,7 +95,6 @@ const NAV_ITEMS: NavItem[] = [
   { path: "/ctf-gpt-plus", label: "CTF Plus", icon: CreditCard, group: "PLUS" },
   { path: "/gopay-gpt-plus", label: "GoPay Plus", icon: CreditCard, group: "PLUS" },
   { path: "/proxies", label: "代理池", icon: Network, group: "工具" },
-  { path: "/accounts/sms-pool", label: "号码黑名单", icon: ShieldAlert, group: "工具" },
   { path: "/microsoft-mailboxes", label: "微软邮箱", icon: Inbox, group: "工具" },
   { path: "/integrations", label: "功能适配", icon: Cable, group: "工具" },
   { path: "/proxy-nodes", label: "代理节点", icon: RouteIcon, group: "工具" },
@@ -332,7 +330,6 @@ function Shell({
             <Routes>
               <Route path="/" element={<Dashboard />} />
               <Route path="/accounts" element={<Accounts />} />
-              <Route path="/accounts/sms-pool" element={<SmsPoolBlacklist />} />
               <Route path="/accounts/:platform" element={<Accounts />} />
               <Route path="/register" element={<Register />} />
               <Route path="/register-center" element={<RegisterCenter />} />
