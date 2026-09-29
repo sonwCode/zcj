@@ -1,6 +1,15 @@
 """数据库模型 - SQLite via SQLModel"""
 import json
+import os
+import re
 import threading
+from contextlib import contextmanager
+from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows development fallback
+    fcntl = None
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -8,7 +17,15 @@ from sqlalchemy import UniqueConstraint, event, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, SQLModel, Session, select
 
-from .storage import build_engine, database_url, describe, is_sqlite
+from .storage import (
+    build_engine,
+    database_url,
+    describe,
+    is_postgres,
+    is_sqlite,
+    is_sqlite_memory,
+    secure_sqlite_file_permissions,
+)
 from .vault import EncryptedText, blind_index
 
 
@@ -18,6 +35,72 @@ def _utcnow():
 
 DATABASE_URL = database_url()
 engine = build_engine(DATABASE_URL)
+
+
+@contextmanager
+def _migration_lock():
+    """Serialize startup DDL and data migrations across service processes."""
+    if is_postgres(DATABASE_URL):
+        # Hold a transaction-scoped advisory lock on a dedicated connection
+        # while the migration body opens its own connections.
+        with engine.connect() as connection:
+            with connection.begin():
+                connection.exec_driver_sql(
+                    "SELECT pg_advisory_xact_lock(hashtext('zcj_account_manager_migrations'))"
+                )
+                yield
+        return
+    if not is_sqlite(DATABASE_URL) or is_sqlite_memory(DATABASE_URL) or fcntl is None:
+        yield
+        return
+    database = str(getattr(engine.url, "database", "") or "")
+    lock_path = Path(f"{database}.migration.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as handle:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+_TASK_DISPATCH_THREAD_LOCK = threading.RLock()
+
+
+@contextmanager
+def task_dispatch_lock():
+    """Serialize task selection and capacity accounting across workers."""
+    # fcntl locks coordinate processes, while this guard also coordinates
+    # threads in the same process and keeps the SQLite path deterministic.
+    with _TASK_DISPATCH_THREAD_LOCK:
+        if is_postgres(DATABASE_URL):
+            # A session advisory lock covers the separate SQLModel connection
+            # used for the SELECT/conditional UPDATE below.
+            with engine.connect() as connection:
+                connection.exec_driver_sql(
+                    "SELECT pg_advisory_lock(hashtext('zcj_account_manager_task_dispatch'))"
+                )
+                try:
+                    yield
+                finally:
+                    connection.exec_driver_sql(
+                        "SELECT pg_advisory_unlock(hashtext('zcj_account_manager_task_dispatch'))"
+                    )
+            return
+        if not is_sqlite(DATABASE_URL) or is_sqlite_memory(DATABASE_URL) or fcntl is None:
+            yield
+            return
+        database = str(getattr(engine.url, "database", "") or "")
+        lock_path = Path(f"{database}.task_dispatch.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as handle:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def storage_backend() -> dict:
@@ -42,6 +125,7 @@ if is_sqlite(DATABASE_URL):
             cursor.execute("PRAGMA busy_timeout=10000")
         finally:
             cursor.close()
+        secure_sqlite_file_permissions(DATABASE_URL)
 
 _ACCOUNT_SAVE_LOCKS = tuple(threading.RLock() for _ in range(64))
 
@@ -288,6 +372,10 @@ class TaskModel(SQLModel, table=True):
     finished_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
+    # Cross-process worker ownership. A lease prevents an old worker from
+    # writing over a task after another process has recovered it.
+    worker_id: str = Field(default="", index=True)
+    lease_expires_at: Optional[float] = Field(default=None, index=True)
 
     def get_payload(self) -> dict:
         return json.loads(self.payload_json or "{}")
@@ -393,6 +481,212 @@ class ResourceReservationModel(SQLModel, table=True):
 
     def set_metadata(self, data: dict):
         self.metadata_json = json.dumps(data or {}, ensure_ascii=False)
+
+
+class RegisteredEmailHistoryModel(SQLModel, table=True):
+    """已成功注册过的邮箱历史 - 只记录时间戳，不保存任何凭据。
+
+    用于避免把同一个邮箱重复投给注册流程（尤其是允许复用的邮箱池），
+    并给运营界面提供"这个邮箱什么时候用过"的回答。
+    """
+
+    __tablename__ = "registered_email_history"
+    __table_args__ = (
+        UniqueConstraint(
+            "platform",
+            "email",
+            name="uq_registered_email_history_platform_email",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    platform: str = Field(index=True)
+    email: str = Field(index=True)
+    first_registered_at: datetime = Field(default_factory=_utcnow)
+    last_registered_at: datetime = Field(default_factory=_utcnow)
+
+
+class MicrosoftMailboxModel(SQLModel, table=True):
+    """本地微软邮箱池库存。
+
+    密码、恢复密码、刷新令牌和 TOTP 密钥都以密文列保存；明文只在内存中出现，
+    加解密由仓库层通过 core.vault 完成。
+    """
+
+    __tablename__ = "microsoft_mailboxes"
+    __table_args__ = (
+        UniqueConstraint("email_key", name="uq_microsoft_mailboxes_email_key"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(index=True)
+    email_key: str = Field(index=True)
+    password_ciphertext: str = ""
+    login_account: str = ""
+    imap_host: str = ""
+    imap_port: str = ""
+    imap_account_type: str = ""
+    imap_security: str = ""
+    smtp_host: str = ""
+    smtp_port: str = ""
+    smtp_security: str = ""
+    note: str = ""
+    proxy_mode: str = ""
+    proxy: str = ""
+    label: str = ""
+    recovery_email: str = ""
+    recovery_password_ciphertext: str = ""
+    client_id: str = ""
+    refresh_token_ciphertext: str = ""
+    totp_secret_ciphertext: str = ""
+    source_format: str = ""
+    use_count: int = Field(default=0, index=True)
+    max_uses: int = 6
+    status: str = Field(default="available", index=True)
+    allocation_version: int = Field(default=1)
+    last_reserved_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class MicrosoftMailboxLeaseModel(SQLModel, table=True):
+    """微软邮箱别名槽租约。
+
+    (mailbox_id, alias_index) 的唯一约束就是原子性原语：两个 worker 抢同一个
+    别名槽时可以都 INSERT，但只有一个 COMMIT 成功，另一个拿到 IntegrityError。
+    """
+
+    __tablename__ = "microsoft_mailbox_leases"
+    __table_args__ = (
+        UniqueConstraint(
+            "mailbox_id",
+            "alias_index",
+            name="uq_microsoft_mailbox_leases_slot",
+        ),
+        UniqueConstraint("lease_token", name="uq_microsoft_mailbox_leases_token"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    mailbox_id: int = Field(index=True, foreign_key="microsoft_mailboxes.id")
+    alias_index: int = Field(index=True)
+    lease_token: str = Field(index=True)
+    status: str = Field(default="reserved", index=True)
+    expires_at: Optional[datetime] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+def _normalized_history_key(platform: str, email: str) -> tuple[str, str]:
+    return str(platform or "").strip().lower(), str(email or "").strip().lower()
+
+
+def _normalized_utc(value: datetime | None) -> datetime:
+    value = value or _utcnow()
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _history_key_is_usable(key: tuple[str, str]) -> bool:
+    return bool(key[0]) and "@" in key[1] and not any(ch.isspace() for ch in key[1])
+
+
+def record_registered_email(
+    platform: str,
+    email: str,
+    *,
+    registered_at: datetime | None = None,
+) -> bool:
+    """记录一次成功注册所用的邮箱，不保存凭据。"""
+    key = _normalized_history_key(platform, email)
+    if not _history_key_is_usable(key):
+        return False
+    occurred_at = _normalized_utc(registered_at)
+    with Session(engine) as session:
+        existing = session.exec(
+            select(RegisteredEmailHistoryModel)
+            .where(RegisteredEmailHistoryModel.platform == key[0])
+            .where(RegisteredEmailHistoryModel.email == key[1])
+        ).first()
+        if existing:
+            existing.first_registered_at = min(
+                _normalized_utc(existing.first_registered_at),
+                occurred_at,
+            )
+            existing.last_registered_at = max(
+                _normalized_utc(existing.last_registered_at),
+                occurred_at,
+            )
+            session.add(existing)
+        else:
+            session.add(
+                RegisteredEmailHistoryModel(
+                    platform=key[0],
+                    email=key[1],
+                    first_registered_at=occurred_at,
+                    last_registered_at=occurred_at,
+                )
+            )
+        session.commit()
+    return True
+
+
+def _backfill_registered_email_history() -> None:
+    """从已保留账号和历史上成功的注册事件里回填邮箱历史。
+
+    任务事件只在首次部署（表为空）时扫描一次；之后新增的成功注册会直接写入，
+    而保留账号每次都便宜地对账。
+    """
+    success_prefix = "注册成功:"
+    with Session(engine) as session:
+        rows = session.exec(select(RegisteredEmailHistoryModel)).all()
+        by_key = {(row.platform, row.email): row for row in rows}
+        candidates: list[tuple[str, str, datetime]] = [
+            (account.platform, account.email, account.created_at)
+            for account in session.exec(select(AccountModel)).all()
+        ]
+        if not rows:
+            event_rows = session.exec(
+                select(TaskEventModel, TaskModel)
+                .join(TaskModel, TaskModel.id == TaskEventModel.task_id)
+                .where(TaskModel.type == "register")
+                .where(TaskEventModel.message.startswith(success_prefix))
+            ).all()
+            candidates.extend(
+                (
+                    task.platform or "chatgpt",
+                    event.message[len(success_prefix):].strip(),
+                    event.created_at,
+                )
+                for event, task in event_rows
+            )
+
+        for platform, email, registered_at in candidates:
+            key = _normalized_history_key(platform, email)
+            if not _history_key_is_usable(key):
+                continue
+            occurred_at = _normalized_utc(registered_at)
+            existing = by_key.get(key)
+            if existing:
+                existing.first_registered_at = min(
+                    _normalized_utc(existing.first_registered_at),
+                    occurred_at,
+                )
+                existing.last_registered_at = max(
+                    _normalized_utc(existing.last_registered_at),
+                    occurred_at,
+                )
+                session.add(existing)
+                continue
+            model = RegisteredEmailHistoryModel(
+                platform=key[0],
+                email=key[1],
+                first_registered_at=occurred_at,
+                last_registered_at=occurred_at,
+            )
+            session.add(model)
+            by_key[key] = model
+        session.commit()
 
 
 def save_account(account) -> 'AccountModel':
@@ -606,8 +900,14 @@ def _ensure_accounts_unique_index() -> None:
 
 
 def init_db():
+    with _migration_lock():
+        _init_db_locked()
+
+
+def _init_db_locked():
     SQLModel.metadata.create_all(engine)
     from core.account_graph import sync_all_account_graphs
+    from core.config_store import config_store
     from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 
     if is_sqlite(DATABASE_URL):
@@ -615,8 +915,13 @@ def init_db():
     _ensure_accounts_unique_index()
     _ensure_column("provider_definitions", "category", "TEXT DEFAULT ''")
     _ensure_column("proxies", "url_index", "TEXT DEFAULT ''")
+    _ensure_column("tasks", "worker_id", "TEXT DEFAULT ''")
+    _ensure_column("tasks", "lease_expires_at", "REAL")
     SQLModel.metadata.create_all(engine)
+    secure_sqlite_file_permissions(DATABASE_URL)
+    config_store.migrate_plaintext()
     _backfill_proxy_url_index()
+    _backfill_registered_email_history()
 
     with Session(engine) as session:
         ProviderDefinitionsRepository().ensure_seeded()
@@ -627,8 +932,22 @@ def init_db():
         session.commit()
 
 
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_COLUMN_TYPE_RE = re.compile(r"[A-Za-z0-9_ ,'()]+\Z")
+
+
 def _ensure_column(table: str, column: str, col_type: str):
-    """给已有表安全地加一列（SQLite 不支持 IF NOT EXISTS ADD COLUMN）。"""
+    """给已有表安全地加一列（SQLite 不支持 IF NOT EXISTS ADD COLUMN）。
+
+    SQLite 的 ALTER TABLE ... ADD COLUMN 不接受参数绑定，表名/列名/类型只能拼接，
+    因此这里对三者施加白名单校验，杜绝把外部数据拼进 DDL。
+    """
+    if not _IDENTIFIER_RE.match(table):
+        raise ValueError(f"非法表名: {table!r}")
+    if not _IDENTIFIER_RE.match(column):
+        raise ValueError(f"非法列名: {column!r}")
+    if not _COLUMN_TYPE_RE.match(col_type):
+        raise ValueError(f"非法列类型: {col_type!r}")
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
     if table not in tables:

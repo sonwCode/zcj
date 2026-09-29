@@ -75,7 +75,7 @@ ACCOUNT_MANAGER_DATABASE_URL=postgresql+psycopg://user:pass@host:5432/zcj
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `ZCJ_ENFORCE_PREFLIGHT` | 关闭 | 开启后本地依赖检查失败即终止任务 |
+| `ZCJ_ENFORCE_PREFLIGHT` | 开启 | 本地资源/依赖检查失败即终止任务；设为 `0` 仅用于显式测试旁路 |
 | `ZCJ_PREFLIGHT` | 开启 | 容器启动前跑一次 `scripts/cloud_preflight.py`（不阻塞启动） |
 
 任务级覆盖：`extra["enforce_preflight"]`。

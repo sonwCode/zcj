@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from application.provider_settings import ProviderSettingsService
+from core.vault import MASKED_SECRET
+from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
+from infrastructure.provider_settings_repository import ProviderSettingsRepository
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/provider-settings", tags=["provider-settings"])
 service = ProviderSettingsService()
 
@@ -60,30 +66,31 @@ class ProviderTestRequest(BaseModel):
 
 @router.post("/test")
 def test_provider(body: ProviderTestRequest):
-    """测试 provider 配置是否正确 — 尝试创建/获取一个邮箱地址。"""
-    from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
-
+    """测试 provider 配置；掩码/空认证字段回退到已保存密钥。"""
     definitions = ProviderDefinitionsRepository()
     definition = definitions.get_by_key(body.provider_type, body.provider_key)
     if not definition:
         return {"ok": False, "error": f"未找到 provider 定义: {body.provider_key}"}
 
-    # Merge config + auth into a flat dict (same as runtime)
-    extra = {**body.config, **body.auth}
+    repository = ProviderSettingsRepository(definitions)
+    extra = repository.resolve_runtime_settings(body.provider_type, body.provider_key)
+    extra.update({str(key): value for key, value in body.config.items()})
+    for key, value in body.auth.items():
+        text = str(value or "")
+        if text.strip() and text != MASKED_SECRET:
+            extra[str(key)] = value
 
     if body.provider_type == "mailbox":
         return _test_mailbox(definition.driver_type or body.provider_key, extra, definition)
-    elif body.provider_type == "captcha":
+    if body.provider_type == "captcha":
         return {"ok": True, "message": "验证码服务暂不支持在线测试，请在注册任务中验证"}
-    elif body.provider_type == "sms":
+    if body.provider_type == "sms":
         return {"ok": True, "message": "接码服务暂不支持在线测试，请在注册任务中验证"}
-    else:
-        return {"ok": False, "error": f"不支持测试的 provider 类型: {body.provider_type}"}
+    return {"ok": False, "error": f"不支持测试的 provider 类型: {body.provider_type}"}
 
 
 def _test_mailbox(driver_type: str, extra: dict, definition) -> dict:
     """尝试用给定配置创建一个邮箱，验证配置是否正确。"""
-    import traceback
     from core.base_mailbox import MAILBOX_FACTORY_REGISTRY
 
     factory = MAILBOX_FACTORY_REGISTRY.get(driver_type)
@@ -99,21 +106,11 @@ def _test_mailbox(driver_type: str, extra: dict, definition) -> dict:
 
         if hasattr(mailbox, "peek_email"):
             email = mailbox.peek_email()
-            return {
-                "ok": True,
-                "message": f"测试成功！可用邮箱: {email}",
-                "email": email,
-            }
+            return {"ok": True, "message": f"测试成功！可用邮箱: {email}", "email": email}
 
         account = mailbox.get_email()
-        return {
-            "ok": True,
-            "message": f"测试成功！生成邮箱: {account.email}",
-            "email": account.email,
-        }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": f"测试失败: {str(exc)}",
-            "detail": traceback.format_exc()[-500:],
-        }
+        return {"ok": True, "message": f"测试成功！生成邮箱: {account.email}", "email": account.email}
+    except Exception:
+        # Exception text and traceback may contain credentials or signed URLs.
+        logger.exception("provider test failed: type=%s driver=%s", definition.provider_type, driver_type)
+        return {"ok": False, "error": "测试失败，请检查配置或服务日志"}

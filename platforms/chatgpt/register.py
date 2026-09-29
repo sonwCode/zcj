@@ -229,6 +229,8 @@ def _classify_server_error(server_code: str, default: str) -> str:
         return "email_already_exists"
     if code == "account_deactivated":
         return "email_account_deactivated"
+    if code == "registration_disallowed":
+        return "registration_disallowed"
     return default
 
 
@@ -2517,21 +2519,52 @@ class RegistrationEngine:
 
 
 
-            # 提取 continue_url（ChatGPT Web 流程直接返回 OAuth callback URL）
-
+            # HTTP 200 仍可能携带 registration_disallowed 等业务错误。
             try:
-
                 resp_data = response.json()
+            except Exception as exc:
+                self._step_error_code = "account_creation_invalid_response"
+                self._step_error_message = f"create_account 响应不是有效 JSON: {exc}"
+                self._log(self._step_error_message, "warning")
+                return False
 
-                self._create_account_continue_url = resp_data.get("continue_url", "")
+            if not isinstance(resp_data, dict):
+                self._step_error_code = "account_creation_invalid_response"
+                self._step_error_message = "create_account 响应不是对象"
+                self._log(self._step_error_message, "warning")
+                return False
 
-                if self._create_account_continue_url:
+            error_value = resp_data.get("error")
+            server_code = resp_data.get("error_code") or resp_data.get("errorCode")
+            server_message = resp_data.get("message") or resp_data.get("detail")
+            if isinstance(error_value, dict):
+                server_code = server_code or error_value.get("code") or error_value.get("type")
+                server_message = (
+                    error_value.get("message")
+                    or error_value.get("detail")
+                    or server_message
+                )
+            elif error_value:
+                server_message = str(error_value)
 
-                    self._log("create_account 已返回 continue_url")
+            if resp_data.get("ok") is False or resp_data.get("success") is False or error_value or server_code:
+                self._step_error_code = _classify_server_error(
+                    str(server_code or ""),
+                    "account_creation_rejected",
+                )
+                self._step_error_message = str(
+                    server_message or "create_account 被服务端拒绝"
+                )
+                self._log(
+                    f"账户创建被服务端拒绝: code={self._step_error_code}",
+                    "warning",
+                )
+                return False
 
-            except Exception:
-
-                pass
+            # 提取 continue_url（ChatGPT Web 流程直接返回 OAuth callback URL）
+            self._create_account_continue_url = str(resp_data.get("continue_url") or "")
+            if self._create_account_continue_url:
+                self._log("create_account 已返回 continue_url")
 
 
 

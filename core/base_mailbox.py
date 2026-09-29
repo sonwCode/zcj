@@ -54,6 +54,22 @@ class BaseMailbox(ABC):
         """等待并返回验证链接。默认由具体 provider 自行实现。"""
         raise NotImplementedError(f"{self.__class__.__name__} 暂不支持 wait_for_link()")
 
+    def test_connection(self) -> None:
+        """启动前自检。默认无副作用；池类 provider 应覆写以剔除不可用条目。"""
+        return None
+
+    def commit_email(self, account: MailboxAccount) -> bool:
+        """注册整条流程成功后，兑现该邮箱的租赁（计入使用次数）。"""
+        return False
+
+    def release_email(self, account: MailboxAccount) -> bool:
+        """注册失败时归还该邮箱，让它还能被下一个任务使用。"""
+        return False
+
+    def mark_registration_failure(self, account: MailboxAccount, reason: str = "") -> bool:
+        """仅在 provider 确认的终态失败时永久退役该身份。"""
+        return False
+
 
 class FallbackMailbox(BaseMailbox):
     """按顺序尝试多个 provider，创建邮箱成功后固定使用同一 provider 收件。"""
@@ -122,6 +138,47 @@ class FallbackMailbox(BaseMailbox):
             timeout=timeout,
             before_ids=before_ids,
         )
+
+    def test_connection(self) -> None:
+        """并发 worker 启动前剔除不可用的 provider。"""
+        available: list[tuple[str, 'BaseMailbox']] = []
+        errors: list[str] = []
+        for key, mailbox in self.providers:
+            tester = getattr(mailbox, "test_connection", None)
+            if not callable(tester):
+                available.append((key, mailbox))
+                continue
+            try:
+                tester()
+            except Exception as exc:
+                errors.append(f"{key}: {str(exc).strip() or exc.__class__.__name__}")
+            else:
+                available.append((key, mailbox))
+        self.providers = available
+        if not available:
+            raise RuntimeError("所有邮箱 provider 连接失败: " + " | ".join(errors))
+
+    def commit_email(self, account: MailboxAccount) -> bool:
+        mailbox = self._resolve_mailbox(account)
+        try:
+            return bool(mailbox.commit_email(account))
+        finally:
+            self._accounts.pop(str(account.email or "").strip(), None)
+
+    def release_email(self, account: MailboxAccount) -> bool:
+        mailbox = self._resolve_mailbox(account)
+        try:
+            return bool(mailbox.release_email(account))
+        finally:
+            self._accounts.pop(str(account.email or "").strip(), None)
+
+    def mark_registration_failure(self, account: MailboxAccount, reason: str = "") -> bool:
+        mailbox = self._resolve_mailbox(account)
+        marker = getattr(mailbox, "mark_registration_failure", None)
+        handled = bool(marker(account, reason)) if callable(marker) else False
+        if handled:
+            self._accounts.pop(str(account.email or "").strip(), None)
+        return handled
 
     def recover_transient_failures(self) -> int:
         recovered = 0
@@ -319,6 +376,34 @@ def _create_generic_http(extra: dict, proxy: str | None, *, pipeline_config: dic
     )
 
 
+def _create_api_mailbox(extra: dict, proxy: str | None) -> 'BaseMailbox':
+    from core.api_mailbox import ApiMailboxPool
+
+    return ApiMailboxPool(
+        pool_text=extra.get("api_mailbox_pool_text", ""),
+        state_file=extra.get("api_mailbox_state_file", ""),
+        allow_reuse=str(extra.get("api_mailbox_allow_reuse", "")).strip().lower()
+        in {"1", "true", "yes", "on"},
+        poll_interval=extra.get("api_mailbox_poll_interval", 3),
+        request_timeout=extra.get("api_mailbox_request_timeout", 15),
+        proxy=proxy,
+    )
+
+
+def _create_domain_imap_catchall(extra: dict, proxy: str | None) -> 'BaseMailbox':
+    del proxy  # IMAP 是直连，imaplib 不支持走代理
+    from core.domain_imap_mailbox import DomainImapCatchallMailbox
+
+    return DomainImapCatchallMailbox.from_config(extra)
+
+
+def _create_domain_inbucket(extra: dict, proxy: str | None) -> 'BaseMailbox':
+    del proxy
+    from core.inbucket_domain_mailbox import InbucketDomainMailbox
+
+    return InbucketDomainMailbox.from_config(extra)
+
+
 MAILBOX_FACTORY_REGISTRY = {
     "generic_http_mailbox": _create_generic_http,
     "tempmail_lol_api": _create_tempmail,
@@ -333,6 +418,9 @@ MAILBOX_FACTORY_REGISTRY = {
     "outlook_email_api": _create_outlook_email,
     "local_ms_pool": _create_local_ms_pool,
     "laoudo_api": _create_laoudo,
+    "api_mailbox": _create_api_mailbox,
+    "domain_imap_catchall": _create_domain_imap_catchall,
+    "domain_inbucket": _create_domain_inbucket,
     # backward-compat fallback
     "generic_http": _create_generic_http,
     "tempmail_lol": _create_tempmail,

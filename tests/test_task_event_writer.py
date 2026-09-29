@@ -77,9 +77,9 @@ def test_order_is_preserved():
     assert messages == ["m%d" % index for index in range(10)]
 
 
-def test_repeated_flush_failures_requeue_then_drop():
-    """A dead database must not grow the buffer until the process is OOM-killed."""
-    writer = TaskEventWriter(interval=10, max_buffer=10_000)
+def test_repeated_flush_failures_spool_without_unbounded_buffer(tmp_path):
+    """A dead database persists events locally instead of dropping them."""
+    writer = TaskEventWriter(interval=10, max_buffer=10_000, spool_path=tmp_path / "events.jsonl")
     writer.enqueue("t1", "m")
 
     # Mirror flush(): it takes the rows out of the buffer before attempting the
@@ -94,12 +94,14 @@ def test_repeated_flush_failures_requeue_then_drop():
     assert writer.pending() == 1, "rows are retried for a few attempts"
 
     attempt_failed_flush()
-    assert writer.pending() == 0, "after that they are dropped, not accumulated"
-    assert writer.stats()["dropped"] == 1
+    assert writer.pending() == 0, "spooled rows leave the in-memory buffer"
+    assert writer.stats()["dropped"] == 0
+    assert writer.stats()["spooled"] == 1
+    assert (tmp_path / "events.jsonl").exists()
 
 
-def test_stop_flushes_what_is_left():
-    writer = TaskEventWriter(interval=10, max_buffer=10_000)
+def test_stop_flushes_what_is_left(tmp_path):
+    writer = TaskEventWriter(interval=10, max_buffer=10_000, spool_path=tmp_path / "events.jsonl")
     writer.enqueue("t1", "m")
     writer.stop()
     assert _count() == 1

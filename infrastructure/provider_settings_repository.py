@@ -5,11 +5,23 @@ from datetime import datetime, timezone
 from sqlmodel import Session, select
 
 from core.db import ProviderSettingModel, engine
+from core.vault import MASKED_SECRET
 from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _merge_auth(existing: dict, incoming: dict) -> dict:
+    merged = dict(existing or {})
+    for key, value in (incoming or {}).items():
+        text = str(value or "")
+        # The UI sends these placeholders when it did not edit a secret.
+        if not text.strip() or text == MASKED_SECRET:
+            continue
+        merged[str(key)] = value
+    return merged
 
 
 class ProviderSettingsRepository:
@@ -103,7 +115,6 @@ class ProviderSettingsRepository:
                 fallback.updated_at = _utcnow()
                 session.add(fallback)
                 session.commit()
-                self._sync_legacy_config(provider_type, fallback)
             return True
 
     def save(
@@ -156,7 +167,7 @@ class ProviderSettingsRepository:
             item.enabled = bool(enabled)
             item.is_default = bool(is_default)
             item.set_config(config or {})
-            item.set_auth(auth or {})
+            item.set_auth(_merge_auth(item.get_auth(), auth or {}))
             item.set_metadata(metadata or {})
             item.updated_at = _utcnow()
             session.add(item)

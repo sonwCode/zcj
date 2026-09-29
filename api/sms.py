@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from core.base_sms import HERO_SMS_DEFAULT_COUNTRY, HERO_SMS_DEFAULT_SERVICE, HeroSmsProvider, SmsBowerProvider
+from core.vault import MASKED_SECRET
 from infrastructure.provider_settings_repository import ProviderSettingsRepository
 
 router = APIRouter(prefix="/sms", tags=["sms"])
@@ -47,7 +48,10 @@ def _public_sms_error(exc: Exception, secret: str = "") -> str:
 def _provider_from_payload(payload: HeroSmsQueryRequest | None = None) -> HeroSmsProvider:
     payload = payload or HeroSmsQueryRequest()
     saved = _saved_herosms_config()
-    api_key = str(payload.api_key or saved.get("herosms_api_key") or "").strip()
+    requested_key = str(payload.api_key or "").strip()
+    if requested_key == MASKED_SECRET:
+        requested_key = ""
+    api_key = requested_key or str(saved.get("herosms_api_key") or "").strip()
     return HeroSmsProvider(
         api_key=api_key,
         default_service=str(payload.service or saved.get("sms_service") or HERO_SMS_DEFAULT_SERVICE),

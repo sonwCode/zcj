@@ -71,7 +71,9 @@ class SmsActivation:
 class BaseSmsProvider(ABC):
     """Base class for SMS verification code providers."""
 
-    auto_report_success_on_code = True
+    # OTP receipt is not proof that the target accepted the code. The
+    # protocol worker reports success only after the validation transition.
+    auto_report_success_on_code = False
 
     @abstractmethod
     def get_number(self, *, service: str, country: str = "") -> SmsActivation:
@@ -100,9 +102,9 @@ class BaseSmsProvider(ABC):
         """Optional hook used to interrupt provider polling when a task is cancelled."""
         self._cancel_check = callback if callable(callback) else (lambda: False)
 
-    def mark_code_failed(self, activation_id: str, reason: str = "") -> None:
-        """Optional hook used when the target service rejects a received code."""
-        return None
+    def mark_code_failed(self, activation_id: str, reason: str = "") -> bool:
+        """Handle a rejected code and report whether a fresh code can be polled."""
+        return False
 
     def mark_send_failed(self, activation_id: str, reason: str = "") -> None:
         """Optional hook used when the target service rejects the rented phone."""
@@ -161,6 +163,9 @@ class SmsActivateProvider(BaseSmsProvider):
         self.api_key = api_key
         self.default_country = default_country or "ru"
         self._proxy = {"http": proxy, "https": proxy} if proxy else None
+        # Prevent a persistent STATUS_OK response from replaying a rejected code.
+        self._last_codes: dict[str, str] = {}
+        self._rejected_codes: dict[str, set[str]] = {}
 
     def _request(self, action: str, **params) -> str:
         params["api_key"] = self.api_key
@@ -204,17 +209,33 @@ class SmsActivateProvider(BaseSmsProvider):
 
     def get_code(self, activation_id: str, *, timeout: int = 120) -> str:
         deadline = time.monotonic() + max(int(timeout or 0), 0)
+        rejected = self._rejected_codes.setdefault(str(activation_id), set())
+        retry_requested = False
         while time.monotonic() < deadline:
             if callable(getattr(self, "_cancel_check", None)) and self._cancel_check():
                 return ""
             result = self._request("getStatus", id=activation_id)
             if result.startswith("STATUS_OK:"):
-                return result.split(":")[1].strip()
+                code = result.split(":", 1)[1].strip()
+                if code and code not in rejected:
+                    self._last_codes[str(activation_id)] = code
+                    return code
+                # A provider may keep returning the previous STATUS_OK value
+                # after setStatus(3); keep polling until a different code arrives.
+                time.sleep(3)
+                continue
             if result == "STATUS_WAIT_CODE":
                 time.sleep(3)
                 continue
-            if result == "STATUS_WAIT_RETRY":
-                self._request("setStatus", id=activation_id, status="6")
+            if result.startswith("STATUS_WAIT_RETRY"):
+                previous_code = result.split(":", 1)[1].strip() if ":" in result else ""
+                if previous_code:
+                    rejected.add(previous_code)
+                if not retry_requested:
+                    retry_result = self._request("setStatus", id=activation_id, status="3")
+                    if not retry_result.startswith("ACCESS"):
+                        return ""
+                    retry_requested = True
                 time.sleep(3)
                 continue
             if result == "STATUS_CANCEL":
@@ -224,13 +245,35 @@ class SmsActivateProvider(BaseSmsProvider):
         self.cancel(activation_id)
         return ""
 
+    def mark_code_failed(self, activation_id: str, reason: str = "") -> bool:
+        activation_key = str(activation_id)
+        previous_code = self._last_codes.get(activation_key, "")
+        if previous_code:
+            self._rejected_codes.setdefault(activation_key, set()).add(previous_code)
+        try:
+            # SMS-Activate status 3 requests another SMS for this activation.
+            result = self._request("setStatus", id=activation_id, status="3")
+        except Exception:
+            return False
+        return result.startswith("ACCESS")
+
     def cancel(self, activation_id: str) -> bool:
-        result = self._request("setStatus", id=activation_id, status="8")
-        return "ACCESS" in result
+        try:
+            result = self._request("setStatus", id=activation_id, status="8")
+            return result.startswith("ACCESS")
+        finally:
+            activation_key = str(activation_id)
+            self._last_codes.pop(activation_key, None)
+            self._rejected_codes.pop(activation_key, None)
 
     def report_success(self, activation_id: str) -> bool:
-        result = self._request("setStatus", id=activation_id, status="6")
-        return "ACCESS" in result
+        try:
+            result = self._request("setStatus", id=activation_id, status="6")
+            return result.startswith("ACCESS")
+        finally:
+            activation_key = str(activation_id)
+            self._last_codes.pop(activation_key, None)
+            self._rejected_codes.pop(activation_key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1008,8 +1051,8 @@ class HeroSmsProvider(BaseSmsProvider):
 
     def request_resend_sms(self, activation_id: str) -> bool:
         try:
-            self.set_status(activation_id, 3)
-            return True
+            result = self.set_status(activation_id, 3)
+            return result.startswith("ACCESS")
         except Exception:
             return False
 
@@ -1167,18 +1210,19 @@ class HeroSmsProvider(BaseSmsProvider):
         if failed:
             cache["last_failed_reason"] = "invalid otp"
 
-    def mark_code_failed(self, activation_id: str, reason: str = "") -> None:
+    def mark_code_failed(self, activation_id: str, reason: str = "") -> bool:
         with _HERO_SMS_CACHE_LOCK:
             cache = _HERO_SMS_CACHE
             if cache and str(cache.get("activation_id")) == str(activation_id):
                 self._record_last_attempt(cache, failed=True)
                 self._save_cache(cache)
+        target_ok = True
         if self.openai_resend_callback:
             try:
-                self.openai_resend_callback()
+                target_ok = self.openai_resend_callback() is not False
             except Exception:
-                pass
-        self.request_resend_sms(activation_id)
+                target_ok = False
+        return bool(target_ok and self.request_resend_sms(activation_id))
 
     def mark_send_succeeded(self, activation_id: str) -> None:
         try:
@@ -2097,7 +2141,7 @@ class PhoneCallbackController:
             code = provider.get_code(self.activation.activation_id, timeout=code_timeout)
             if code:
                 self.log("已收到短信验证码")
-                if getattr(provider, "auto_report_success_on_code", True):
+                if getattr(provider, "auto_report_success_on_code", False):
                     self.report_success()
                 else:
                     self.awaiting_external_success = True
@@ -2113,13 +2157,19 @@ class PhoneCallbackController:
             original_provider = self._provider()
             original_provider.set_resend_callback(callback)
 
-    def mark_code_failed(self, reason: str = "") -> None:
-        if self.activation and self.provider:
-            hook = getattr(self.provider, "mark_code_failed", None)
-            if callable(hook):
-                hook(self.activation.activation_id, reason=reason)
-            self.phase = "need_code"
-            self.awaiting_external_success = False
+    def mark_code_failed(self, reason: str = "") -> bool:
+        if not (self.activation and self.provider):
+            return False
+        hook = getattr(self.provider, "mark_code_failed", None)
+        if not callable(hook):
+            return False
+        try:
+            can_retry = hook(self.activation.activation_id, reason=reason) is True
+        except Exception:
+            can_retry = False
+        self.awaiting_external_success = False
+        self.phase = "need_code" if can_retry else "failed"
+        return can_retry
 
     def mark_send_failed(self, reason: str = "") -> None:
         """Release current number and decide whether to stay on same price tier.
@@ -2241,9 +2291,20 @@ class PhoneCallbackController:
             if callable(hook):
                 hook(self.activation.activation_id)
 
-    def report_success(self) -> None:
+    def report_success(self) -> bool:
         if self.activation and self.provider and not self.completed:
-            self.provider.report_success(self.activation.activation_id)
+            try:
+                provider_result = self.provider.report_success(self.activation.activation_id)
+            except Exception as exc:
+                self.log(f"短信 activation 完成上报失败: {str(exc)[:160]}", "warning")
+                provider_result = False
+            if provider_result is False:
+                self.awaiting_external_success = False
+                self.phase = "failed"
+                if self._verify_lock_acquired:
+                    _HERO_SMS_VERIFY_LOCK.release()
+                    self._verify_lock_acquired = False
+                return False
             self.completed = True
             self.phase = "done"
             self.awaiting_external_success = False
@@ -2254,6 +2315,7 @@ class PhoneCallbackController:
         if self._verify_lock_acquired:
             _HERO_SMS_VERIFY_LOCK.release()
             self._verify_lock_acquired = False
+        return True
 
     def cleanup(self) -> None:
         activation = self.activation

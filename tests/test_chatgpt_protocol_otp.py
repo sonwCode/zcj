@@ -176,6 +176,37 @@ def test_send_verification_code_visits_email_verification_page_before_send():
     assert engine._email_otp_page_loaded is True
 
 
+def test_create_user_account_rejects_http_200_registration_disallowed():
+    engine = _bare_engine()
+    engine._device_id = ""
+
+    class CreateAccountResponse:
+        status_code = 200
+        text = '{"error":{"code":"registration_disallowed","message":"Sorry, we cannot create your account with the given information."}}'
+
+        def json(self):
+            return {
+                "error": {
+                    "code": "registration_disallowed",
+                    "message": "Sorry, we cannot create your account with the given information.",
+                }
+            }
+
+    class CreateAccountSession:
+        def get(self, url, **kwargs):
+            return SimpleNamespace(status_code=200, text="{}")
+
+        def post(self, url, **kwargs):
+            return CreateAccountResponse()
+
+    engine.session = CreateAccountSession()
+
+    assert engine._create_user_account() is False
+    assert engine._step_error_code == "registration_disallowed"
+    assert "given information" in engine._step_error_message
+    assert engine._create_account_continue_url is None
+
+
 def test_passwordless_email_challenge_prefers_resend_and_confirms_delivery():
     engine = _bare_engine()
     engine._oauth_email_verification = True

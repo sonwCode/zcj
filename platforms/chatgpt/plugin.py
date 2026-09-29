@@ -1004,7 +1004,10 @@ class ChatGPTPlatform(BasePlatform):
             _export_session_cookies,
         )
 
-        require_rt = True
+        # Web registration plus phone binding is useful without Codex RT.
+        # Explicit credential-upgrade flows still pass require_codex_refresh_token=True.
+        require_rt = False
+        sms_otp_max_attempts = 2
         try:
             extra = dict(getattr(self.config, "extra", None) or getattr(account, "extra", None) or {})
             # Prefer task-level flags from plugin config if present.
@@ -1014,8 +1017,13 @@ class ChatGPTPlatform(BasePlatform):
             raw = extra.get("require_codex_refresh_token")
             if raw is not None and str(raw).strip() != "":
                 require_rt = str(raw).strip().lower() not in {"0", "false", "no", "off"}
+            sms_otp_max_attempts = min(
+                max(int(extra.get("sms_otp_max_attempts") or 2), 1),
+                5,
+            )
         except Exception:
-            require_rt = True
+            require_rt = False
+            sms_otp_max_attempts = 2
         worker = ChatGPTProtocolEmailThenPhoneWorker(
             email_service=mailbox_worker.email_service,
             phone_callback=phone_callback,
@@ -1023,6 +1031,7 @@ class ChatGPTPlatform(BasePlatform):
             log_fn=self.log,
             cancel_check=self.is_cancel_requested,
             max_phone_attempts=min(max(int(max_phone_attempts or 3), 1), 20),
+            max_otp_attempts=sms_otp_max_attempts,
             require_codex_refresh_token=require_rt,
             existing_account_id=str(getattr(account, "user_id", "") or ""),
             existing_device_id=str(
@@ -1119,6 +1128,7 @@ class ChatGPTPlatform(BasePlatform):
                 log_fn=ctx.log,
                 cancel_check=ctx.platform.is_cancel_requested,
                 max_phone_attempts=min(max(int((ctx.extra or {}).get("sms_phone_max_attempts") or 8), 1), 20),
+                max_otp_attempts=min(max(int((ctx.extra or {}).get("sms_otp_max_attempts") or 2), 1), 5),
                 proxy_country=str((ctx.extra or {}).get("proxy_route_country") or ""),
                 mailbox_factory=mailbox_factory,
                 bind_email_after_registration=bind_email,

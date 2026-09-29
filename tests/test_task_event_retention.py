@@ -1,9 +1,8 @@
 """Retention for ``task_events``.
 
-The event log gets one row per log line and nothing ever deleted from it, so on a
-server that registers continuously the SQLite file grows without bound. These tests
-pin the two trimming rules and the safety property that events belonging to a task
-that is still running are never removed.
+The event log gets one row per log line. Retention trims completed-task events by
+age and row count, while events belonging to a running task remain available. These
+tests pin both trimming rules and the safety property for active tasks.
 """
 from __future__ import annotations
 
@@ -117,6 +116,7 @@ def test_env_defaults_and_overrides(monkeypatch):
     monkeypatch.delenv("ZCJ_TASK_EVENT_MAX_ROWS", raising=False)
     assert retention.retention_days() == retention.DEFAULT_RETENTION_DAYS
     assert retention.retention_max_rows() == retention.DEFAULT_MAX_ROWS
+    assert retention.retention_enabled() is True
 
     monkeypatch.setenv("ZCJ_TASK_EVENT_RETENTION_DAYS", "3")
     monkeypatch.setenv("ZCJ_TASK_EVENT_MAX_ROWS", "0")

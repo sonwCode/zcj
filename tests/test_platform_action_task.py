@@ -13,6 +13,12 @@ from domain.actions import ActionExecutionCommand
 from infrastructure import platform_runtime as runtime_module
 
 
+@pytest.fixture(autouse=True)
+def _disable_external_resource_preflight_for_synthetic_registration(monkeypatch):
+    """These tests inject fake platforms and do not own mailbox/SMS credentials."""
+    monkeypatch.setenv("ZCJ_ENFORCE_PREFLIGHT", "false")
+
+
 class _FakeLogger:
     def __init__(self):
         self.events = []

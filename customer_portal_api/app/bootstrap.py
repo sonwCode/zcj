@@ -105,9 +105,12 @@ def _seed_admin(session: Session) -> None:
     if admin:
         # Already provisioned: surface the fact if it still uses the shipped default.
         if verify_password("admin123456", admin.password_hash):
-            print("[portal][WARN] 管理员账号仍在使用出厂默认口令 admin123456，请立即修改！")
+            print("[portal][WARN] 管理员账号仍在使用出厂默认口令，请立即修改")
         return
     password, generated = resolve_seed_admin_password()
+    if not password:
+        print("[portal][ERROR] 未配置 PORTAL_ADMIN_PASSWORD，跳过管理员初始化")
+        return
     session.add(
         PortalUser(
             username=settings.seed_admin_username,
@@ -121,10 +124,7 @@ def _seed_admin(session: Session) -> None:
         )
     )
     if generated:
-        print("[portal][WARN] 未配置 PORTAL_ADMIN_PASSWORD，已生成一次性管理员口令：")
-        print("[portal][WARN]     用户名: " + settings.seed_admin_username)
-        print("[portal][WARN]     口令  : " + password)
-        print("[portal][WARN] 该口令只显示这一次，请立即登录并修改。")
+        print("[portal][ERROR] 管理员口令未配置，跳过管理员初始化")
     else:
         print("[portal] 已按 PORTAL_ADMIN_PASSWORD 创建管理员账号 " + settings.seed_admin_username)
 

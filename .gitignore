@@ -13,6 +13,10 @@ _debug_*.py
 # 数据库
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
+*.migration.lock
+*.task_dispatch.lock
 *.sqlit
 *.db.*.bak
 *.db.pre_*

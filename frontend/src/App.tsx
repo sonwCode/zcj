@@ -1,4 +1,4 @@
-﻿import {
+import {
   BrowserRouter,
   NavLink,
   Route,
@@ -6,7 +6,7 @@
   useLocation,
 } from "react-router-dom";
 import { lazy, Suspense, useEffect, useState } from "react";
-import { getAuthToken, setAuthToken, API, cn } from "@/lib/utils";
+import { API, cn } from "@/lib/utils";
 import { I18nProvider, useI18n } from "@/lib/i18n-context";
 import type { TranslationKey } from "@/lib/i18n";
 import UpdateBanner from "@/components/UpdateBanner";
@@ -25,6 +25,8 @@ import {
   CreditCard,
   Network,
   ShieldAlert,
+  Inbox,
+  Route as RouteIcon,
   PanelLeftClose,
   PanelLeft,
 } from "lucide-react";
@@ -39,6 +41,8 @@ const TaskHistory = lazy(() => import("@/pages/TaskHistory"));
 const CtfGptPlus = lazy(() => import("@/pages/CtfGptPlus"));
 const GoPayGptPlus = lazy(() => import("@/pages/GoPayGptPlus"));
 const PlusManager = lazy(() => import("@/pages/PlusManager"));
+const MicrosoftMailboxes = lazy(() => import("@/pages/MicrosoftMailboxes"));
+const ProxyPoolSettings = lazy(() => import("@/pages/ProxyPoolSettings"));
 
 function RouteFallback() {
   return (
@@ -84,6 +88,8 @@ const NAV_ITEMS: NavItem[] = [
   { path: "/gopay-gpt-plus", label: "GoPay Plus", icon: CreditCard, group: "Plus" },
   { path: "/proxies", label: "代理池", icon: Network, group: "工具" },
   { path: "/accounts/sms-pool", label: "号码黑名单", icon: ShieldAlert, group: "工具" },
+  { path: "/microsoft-mailboxes", label: "微软邮箱", icon: Inbox, group: "工具" },
+  { path: "/proxy-nodes", label: "代理节点", icon: RouteIcon, group: "工具" },
   { path: "/settings", labelKey: "nav.settings", icon: SettingsIcon, group: "系统" },
 ];
 
@@ -315,6 +321,8 @@ function Shell({
               <Route path="/plus-manager" element={<PlusManager />} />
               <Route path="/history" element={<TaskHistory />} />
               <Route path="/proxies" element={<Proxies />} />
+              <Route path="/microsoft-mailboxes" element={<MicrosoftMailboxes />} />
+              <Route path="/proxy-nodes" element={<ProxyPoolSettings />} />
               <Route
                 path="/settings"
                 element={<SettingsPage theme={theme} setTheme={setTheme} />}
@@ -345,13 +353,13 @@ function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
     try {
       const res = await fetch(API + "/auth/login", {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password: pw }),
       });
       const data = await res.json();
       if (data.ok) {
-        setAuthToken(data.token || "");
-        onLogin(data.token || "");
+        onLogin("");
       } else {
         setError(data.error || t("login.passwordError"));
       }
@@ -438,8 +446,7 @@ function AppContent() {
     fetch(API + "/auth/check")
       .then((r) => r.json())
       .then((data) => {
-        if (!data.required) setAuthState("open");
-        else if (getAuthToken()) setAuthState("authed");
+        if (data.authenticated) setAuthState("authed");
         else setAuthState("locked");
       })
       .catch(() => setAuthState("open"));

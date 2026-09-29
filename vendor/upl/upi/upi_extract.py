@@ -422,10 +422,14 @@ def coerce_upi_fingerprint_triplet(
 
 def log_upi_fingerprint_triplet(fingerprints: dict[str, UpiFingerprintProfile]) -> None:
     parts = []
+    # 引号先取出到变量：f-string 的表达式部分在 3.11 及以前不允许出现反斜杠
+    # （PEP 701 到 3.12 才放开），服务器跑的是 3.10。
+    quote = '"'
     for stage in ("checkout", "promotion", "provider"):
         profile = fingerprints[stage]
+        platform_label = profile.sec_ch_ua_platform.strip(quote)
         parts.append(
-            f"{stage}={profile.sec_ch_ua_platform.strip('\"')}/"
+            f"{stage}={platform_label}/"
             f"{profile.locale}/{profile.timezone}/imp={profile.impersonate}/"
             f"did={profile.device_id[:8]}"
         )

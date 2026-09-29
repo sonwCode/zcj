@@ -32,15 +32,24 @@ process is killed outright - and those are logs.
 from __future__ import annotations
 
 import atexit
+import json
 import os
+from pathlib import Path
 import threading
 
 DEFAULT_INTERVAL_SECONDS = 0.5
 # Bound memory if the database is slow or unavailable.
 DEFAULT_MAX_BUFFER = 500
-# After this many consecutive failed flushes, stop re-queueing and drop instead of
-# growing the buffer forever.
+# Flush retries stay bounded, but rows are retained in a durable local spool
+# before they are dropped so a transient database outage cannot erase events.
 MAX_FLUSH_FAILURES = 3
+
+
+def _default_spool_path() -> Path:
+    configured = str(os.environ.get("ZCJ_TASK_EVENT_SPOOL", "") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path(__file__).resolve().parent.parent / "data" / "task_events.spool.jsonl"
 
 
 def buffering_enabled() -> bool:
@@ -82,16 +91,64 @@ class TaskEventWriter:
     threads, and the flusher runs on its own thread.
     """
 
-    def __init__(self, *, interval=None, max_buffer=None) -> None:
+    def __init__(self, *, interval=None, max_buffer=None, spool_path=None) -> None:
         self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()
         self._buffer = []
         self._thread = None
         self._stop = threading.Event()
         self._interval = interval if interval is not None else _interval_seconds()
         self._max_buffer = max_buffer if max_buffer is not None else _max_buffer()
+        self._spool_path = Path(spool_path) if spool_path else _default_spool_path()
         self._flushed = 0
+        self._spooled = 0
         self._dropped = 0
         self._failures = 0
+
+    def _read_spool_rows(self) -> list[dict]:
+        """Read durable rows without moving them into memory permanently."""
+        try:
+            handle = self._spool_path.open("r", encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        rows = []
+        with handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(row, dict) and row.get("task_id") is not None:
+                    rows.append(row)
+        return rows
+
+    def _clear_spool(self) -> None:
+        try:
+            self._spool_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _persist_spool(self, rows) -> None:
+        existing = self._read_spool_rows()
+        all_rows = existing + list(rows)
+        if not all_rows:
+            return
+        self._spool_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self._spool_path.with_name(self._spool_path.name + ".tmp")
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                for row in all_rows:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, self._spool_path)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # -- write path ---------------------------------------------------------
 
@@ -110,42 +167,64 @@ class TaskEventWriter:
             self.flush()
 
     def flush(self) -> int:
-        """Write everything buffered in a single transaction. Returns rows written."""
-        with self._lock:
-            if not self._buffer:
+        """Commit memory and durable rows in order, with one writer at a time."""
+        with self._flush_lock:
+            with self._lock:
+                rows = self._buffer
+                self._buffer = []
+            try:
+                spool_rows = self._read_spool_rows()
+            except OSError as exc:
+                if rows:
+                    self._requeue_or_drop(rows, exc)
+                else:
+                    print("[TaskEventWriter] 事件 spool 读取失败: %s" % str(exc)[:200], flush=True)
                 return 0
-            rows = self._buffer
-            self._buffer = []
-        try:
-            from sqlmodel import Session
+            all_rows = spool_rows + rows
+            if not all_rows:
+                return 0
+            try:
+                from sqlmodel import Session
 
-            from core.db import TaskEventModel, engine
+                from core.db import TaskEventModel, engine
 
-            with Session(engine) as session:
-                session.add_all([TaskEventModel(**row) for row in rows])
-                session.commit()
-        except Exception as exc:
-            self._requeue_or_drop(rows, exc)
-            return 0
-        with self._lock:
-            self._flushed += len(rows)
-            self._failures = 0
-        return len(rows)
+                with Session(engine) as session:
+                    session.add_all([TaskEventModel(**row) for row in all_rows])
+                    session.commit()
+            except Exception as exc:
+                # Rows already present on disk stay there; only new memory rows
+                # need an in-memory retry or a new durable append.
+                if rows:
+                    self._requeue_or_drop(rows, exc)
+                else:
+                    print("[TaskEventWriter] 事件 spool 批量写入失败: %s" % str(exc)[:200], flush=True)
+                return 0
+            with self._lock:
+                self._flushed += len(all_rows)
+                self._failures = 0
+            self._clear_spool()
+            return len(all_rows)
 
     def _requeue_or_drop(self, rows, exc) -> None:
-        """Put rows back for a retry, but never grow the buffer without bound.
-
-        A database that stays unavailable must not turn into an out-of-memory kill;
-        after a few attempts the rows are dropped and counted instead.
-        """
+        """Retry briefly, then persist rows locally instead of discarding them."""
+        persist = False
         with self._lock:
             self._failures += 1
             if self._failures <= MAX_FLUSH_FAILURES:
-                # rows were written first, so they go back at the front to keep order
+                # rows were removed before the transaction; put them back in order.
                 self._buffer = rows + self._buffer
             else:
-                self._dropped += len(rows)
                 self._failures = 0
+                persist = True
+        if persist:
+            try:
+                self._persist_spool(rows)
+                with self._lock:
+                    self._spooled += len(rows)
+            except Exception as spool_exc:
+                with self._lock:
+                    self._dropped += len(rows)
+                print("[TaskEventWriter] 事件 spool 写入失败: %s" % str(spool_exc)[:200], flush=True)
         print("[TaskEventWriter] 事件批量写入失败: %s" % str(exc)[:200], flush=True)
 
     # -- lifecycle ----------------------------------------------------------
@@ -194,6 +273,8 @@ class TaskEventWriter:
                 "pending": len(self._buffer),
                 "flushed": self._flushed,
                 "dropped": self._dropped,
+                "spooled": self._spooled,
+                "spool_path": str(self._spool_path),
                 "enabled": buffering_enabled(),
                 "interval_seconds": self._interval,
                 "max_buffer": self._max_buffer,

@@ -13,6 +13,9 @@ _tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _tmp.close()
 _TEST_DB_PATH = _tmp.name
 os.environ["ACCOUNT_MANAGER_DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
+# Legacy API tests exercise authenticated routes through the shared client.
+# Keep production fail-closed behavior and log in explicitly inside the fixture.
+os.environ["APP_PASSWORD"] = "test-app-password"
 
 import pytest
 from sqlmodel import SQLModel, create_engine
@@ -45,6 +48,9 @@ def client():
     from main import app
 
     with TestClient(app, raise_server_exceptions=False) as c:
+        login = c.post("/api/auth/login", json={"password": "test-app-password"})
+        assert login.status_code == 200, login.text
+        assert login.json().get("ok") is True
         yield c
 
 

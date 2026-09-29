@@ -38,6 +38,27 @@ def _registered_routes() -> list[tuple[str, str, str]]:
     return routes
 
 
+def _registered_portal_routes() -> list[tuple[str, str, str]]:
+    """Return routes from the separately mounted customer portal app."""
+    from customer_portal_api.main import app as portal_app
+
+    routes: list[tuple[str, str, str]] = []
+    for included in getattr(portal_app, "routes", []):
+        router = getattr(included, "original_router", None)
+        context = getattr(included, "include_context", None)
+        if router is None or context is None:
+            continue
+        prefix = str(getattr(context, "prefix", "") or "")
+        for route in getattr(router, "routes", []):
+            path = getattr(route, "path", None)
+            methods = getattr(route, "methods", None)
+            if not path or not methods:
+                continue
+            for method in methods:
+                routes.append((method, prefix + path, "customer_portal_api"))
+    return routes
+
+
 def test_the_scan_finds_the_api_surface():
     """A broken import would make the duplicate check pass vacuously."""
     routes = _registered_routes()
@@ -60,6 +81,22 @@ def test_the_polling_and_stream_endpoints_still_exist():
     paths = {path for _method, path, _module in _registered_routes()}
     assert "/api/tasks/{task_id}/events" in paths
     assert "/api/tasks/{task_id}/events/stream" in paths
+
+
+def test_customer_portal_route_surface_is_scanned():
+    routes = _registered_portal_routes()
+    assert len(routes) > 25, "expected the customer portal route surface"
+
+
+def test_customer_portal_has_no_duplicate_path_and_method():
+    seen: dict[tuple[str, str], str] = {}
+    clashes = []
+    for method, path, module in _registered_portal_routes():
+        key = (method, path)
+        if key in seen and seen[key] != module:
+            clashes.append(f"{method} {path} -> {seen[key]} and {module}")
+        seen.setdefault(key, module)
+    assert not clashes, "duplicate portal routes:\n  " + "\n  ".join(clashes)
 
 
 def test_no_duplicate_openapi_operation_ids():

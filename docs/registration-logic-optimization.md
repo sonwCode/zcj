@@ -3426,9 +3426,9 @@ verify_payment_callback（app/security.py:119）的三种走向**互斥且完备
 
 - **入口守卫与预检的一致性**：`check_auth` / `check_single_process` / `check_vnc` 的三条规则，逐分支对照过交付脚本，
   并由两个 agreement 测试（§50、§51）从**交付文本**里切片执行来钉住。
-- **失败语义**：`main()` 有 FAIL 就返回 1（`return 1 if report.failures else 0`），
-  但入口用 `python3 scripts/cloud_preflight.py --quiet || true` 调用，所以预检失败**不阻断启动**——
-  这是有意的（第 111 行注释写明硬拦截在上面的 guard 里），要阻断得显式开 `ZCJ_ENFORCE_PREFLIGHT`。
+- **失败语义**：容器启动预检仍由入口脚本决定是否阻断服务；注册任务自身的资源预检默认
+  fail-closed，缺少邮箱/SMS/运行时能力时不会先消耗代理或号码。仅测试或明确的任务级旁路
+  `extra["enforce_preflight"]=false`（或 `ZCJ_ENFORCE_PREFLIGHT=0`）会继续。
 - **已知的非缺陷**：`VNC_PASSWORD` 只有在判空时才 strip，实际落盘用的是原值（因此 `" pw "` 的密码就是带空格的原值），
   这与 `APP_PASSWORD`（应用侧会 strip）不一致，但两侧判断一致，不算缺陷。
 
@@ -5039,7 +5039,7 @@ if current["status"] in TERMINAL_TASK_STATUSES:
 | --- | --- | --- |
 | `ZCJ_MANUAL_OTP` / `extra.manual_otp_fallback` | 关 | 自动取码失败后转入人工验证码通道 |
 | `ZCJ_RESUME_REGISTRATION` / `extra.resume_registration` | 关 | 重试时优先续跑已建号但后续阶段失败的账号 |
-| `ZCJ_ENFORCE_PREFLIGHT` | 关 | 前置检查失败时中止（现在包含哨兵自检） |
+| `ZCJ_ENFORCE_PREFLIGHT` | 开 | 前置检查失败时中止；`0` 仅用于显式测试旁路（现在包含哨兵自检） |
 
 身份画像与 OTP 打分**无需开关**：前者只是把原本自相矛盾的常量换成一致的取值，
 后者在显式传入 `code_pattern` 时仍走原来的正则路径。

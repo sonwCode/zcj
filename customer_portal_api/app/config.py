@@ -113,7 +113,8 @@ def resolve_seed_admin_password() -> tuple[str, bool]:
     configured = os.getenv("PORTAL_ADMIN_PASSWORD", "").strip()
     if configured and configured not in _INSECURE_ADMIN_PASSWORDS:
         return configured, False
-    return secrets.token_urlsafe(18), True
+    # Never create an administrator whose credential must be printed to logs.
+    return "", False
 
 
 class Settings:

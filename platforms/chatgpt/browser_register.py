@@ -294,6 +294,81 @@ PASSWORDLESS_LOGIN_SELECTORS = [
     'button:has-text("認証コード")',
 ]
 
+# 线上版本在密码注册落点之外还支持年龄/生日/姓名三种补充资料表单，
+# 这里把对应选择器和生成器一并带上，缺失字段由生成器补齐。
+PASSWORD_REGISTRATION_FALLBACK_SELECTORS = [
+    'a[href="/create-account/password"]',
+    'a[href*="/create-account/password"]',
+]
+
+NAME_INPUT_SELECTORS = [
+    'input[name="name"]',
+    'input[name="full_name"]',
+    'input[autocomplete="name"]',
+    'input[id*="name" i]',
+    'input[placeholder*="name" i]',
+]
+
+AGE_INPUT_SELECTORS = [
+    'input[name="age"]',
+    'input[type="number"][name*="age" i]',
+    'input[placeholder*="age" i]',
+    'input[id*="age" i]',
+]
+
+BIRTHDAY_INPUT_SELECTORS = [
+    'input[name="birthday"]',
+    'input[type="date"]',
+    'input[name="birthdate"]',
+    'input[name="birth_date"]',
+    'input[autocomplete="bday"]',
+    'input[id*="birth" i]',
+    'input[placeholder*="birth" i]',
+]
+
+_FIRST_NAMES = [
+    "James", "Oliver", "William", "Lucas", "Henry", "Theodore", "Jack", "Levi",
+    "Mateo", "Daniel", "Ethan", "Michael", "Samuel", "Alexander", "Owen",
+    "Amelia", "Olivia", "Emma", "Charlotte", "Sophia", "Mia", "Isabella",
+    "Ava", "Evelyn", "Luna", "Harper", "Camila", "Sofia", "Ella", "Mila",
+]
+_LAST_NAMES = [
+    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
+    "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez",
+    "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin",
+]
+
+# 注册后的会话建立判定：登录成功落在 chatgpt.com 首页且带 session cookie
+_SESSION_COOKIE_NAME = "__Secure-next-auth.session-token"
+
+
+def _extract_account_id(access_token: str) -> str:
+    return str(
+        _decode_jwt_payload_no_verify(access_token)
+        .get("https://api.openai.com/profile", {})
+        .get("id")
+        or ""
+    )
+
+
+def _generate_name() -> str:
+    return f"{random.choice(_FIRST_NAMES)} {random.choice(_LAST_NAMES)}"
+
+
+def _generate_age() -> int:
+    """18-35 岁之间，保证成年且不显眼。"""
+    return random.randint(18, 35)
+
+
+def _generate_birthdate(age: int | None = None) -> str:
+    """按当前日期 - 年龄 生成生日（YYYY-MM-DD），与年龄保持一致。"""
+    from datetime import date
+    today = date.today()
+    age_value = int(age) if age is not None else _generate_age()
+    year = today.year - age_value
+    return f"{year:04d}-{today.month:02d}-{today.day:02d}"
+
+
 # add-phone 页面国际拨号码 -> 国家名映射（用于 UI 下拉选择）
 PHONE_COUNTRY_CODE_MAP = {
     "1": "United States", "7": "Russia", "20": "Egypt", "27": "South Africa",

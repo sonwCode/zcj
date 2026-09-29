@@ -72,10 +72,10 @@ def test_default_jwt_secret_is_never_used() -> None:
     assert settings.jwt_secret != "change-me-in-production"
 
 
-def test_default_admin_password_is_not_reused() -> None:
+def test_missing_admin_password_fails_closed() -> None:
     password, generated = resolve_seed_admin_password()
-    assert generated is True
-    assert password != "admin123456"
+    assert password == ""
+    assert generated is False
 
 
 def test_login_with_shipped_default_password_is_rejected(client) -> None:
@@ -91,12 +91,13 @@ def test_jwt_forged_with_old_default_secret_is_rejected(client) -> None:
     assert response.status_code == 401
 
 
-def test_jwt_signed_with_real_secret_is_accepted(client) -> None:
+def test_jwt_signature_alone_is_not_an_admin_session(client) -> None:
     response = client.get(
         "/api/auth/me",
         headers={"Authorization": "Bearer " + _forge_jwt(settings.jwt_secret)},
     )
-    assert response.status_code == 200
+    # A valid signature still needs a provisioned, active portal user.
+    assert response.status_code == 401
 
 
 def test_channel_without_secret_rejects_every_callback(client) -> None:
@@ -130,3 +131,18 @@ def test_cors_is_not_wildcard_by_default(client) -> None:
     assert settings.cors_origins == []
     response = client.get("/docs", headers={"Origin": "https://evil.example"})
     assert "access-control-allow-origin" not in response.headers
+
+
+@pytest.mark.parametrize(
+    "method,path,payload",
+    [
+        ("GET", "/api/app/platforms", None),
+        ("GET", "/api/admin/users", None),
+        ("GET", "/api/config", None),
+        ("POST", "/api/app/tasks/register", {"platform": "chatgpt"}),
+        ("POST", "/api/admin/users", {"username": "new", "password": "secret"}),
+    ],
+)
+def test_protected_portal_surfaces_require_access_token(client, method, path, payload) -> None:
+    response = client.request(method, path, json=payload)
+    assert response.status_code == 401

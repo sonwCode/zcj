@@ -11,6 +11,42 @@ _registry: Dict[str, Type[BasePlatform]] = {}
 
 _CAPABILITY_KEYS = ("supported_executors", "supported_identity_modes", "supported_oauth_providers", "capabilities")
 
+# 线上工作台把"注册能力"作为一个独立入口暴露；这份清单决定了哪些平台会出现在
+# 该入口里，以及它们各自走什么验证方式。chatgpt_free 不是目录，它由
+# platforms/chatgpt/free_plugin.py 注册，所以不参与下面的目录扫描。
+LEGACY_REGISTRATION_PLATFORMS = (
+    "chatgpt_free",
+    "anything",
+    "blink",
+    "cerebras",
+    "cursor",
+    "grok",
+    "kiro",
+    "openblocklabs",
+    "oreateai",
+    "tavily",
+    "trae",
+    "windsurf",
+)
+
+LEGACY_REGISTRATION_METADATA = {
+    "chatgpt_free": {
+        "description": "ChatGPT Free 邮箱注册 + 手机接码，并完成 Codex AT/RT。",
+        "verification": "邮箱验证码 + 手机短信验证码 + Codex OAuth",
+    },
+    "anything": {"description": "邮箱魔法链接注册，纯协议执行。", "verification": "魔法链接"},
+    "blink": {"description": "邮箱魔法链接注册，并初始化工作区。", "verification": "魔法链接"},
+    "cerebras": {"description": "邮箱验证码注册，成功后生成并保存 API Key。", "verification": "邮箱验证码"},
+    "cursor": {"description": "邮箱验证码注册，支持协议和浏览器执行。", "verification": "邮箱验证码 + 人机验证"},
+    "grok": {"description": "支持邮箱注册或 Google OAuth 可视浏览器注册。", "verification": "邮箱验证码 / Google OAuth"},
+    "kiro": {"description": "邮箱验证码注册，支持协议和浏览器执行。", "verification": "邮箱验证码"},
+    "openblocklabs": {"description": "支持邮箱注册或 Google OAuth 可视浏览器注册。", "verification": "邮箱验证码 / Google OAuth"},
+    "oreateai": {"description": "邮箱验证码注册，支持协议和浏览器执行。", "verification": "邮箱验证码"},
+    "tavily": {"description": "支持邮箱注册及多种 OAuth；OAuth 需要可复用 Chrome 会话。", "verification": "邮箱验证码 / OAuth"},
+    "trae": {"description": "支持邮箱注册或 Google OAuth 可视浏览器注册。", "verification": "邮箱验证码 / Google OAuth"},
+    "windsurf": {"description": "邮箱验证码注册，支持协议和浏览器执行。", "verification": "邮箱验证码 + 人机验证"},
+}
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -25,6 +61,11 @@ def register(cls: Type[BasePlatform]):
 def load_all():
     """自动扫描并加载 platforms/ 下所有插件"""
     import platforms
+    # chatgpt_free 的平台类挂在 free_plugin 里而不是 plugin 里，扫描不到。
+    try:
+        importlib.import_module("platforms.chatgpt.free_plugin")
+    except ModuleNotFoundError:
+        pass
     for finder, name, _ in pkgutil.iter_modules(platforms.__path__, platforms.__name__ + "."):
         try:
             importlib.import_module(f"{name}.plugin")
@@ -121,3 +162,14 @@ def list_platforms() -> list:
                 **caps,
             })
         return result
+
+
+def list_legacy_registration_platforms() -> list:
+    """注册工作台入口的平台清单：只列白名单内的，并附上验证方式说明。"""
+    allowed = set(LEGACY_REGISTRATION_PLATFORMS)
+    result = []
+    for item in list_platforms():
+        if item["name"] not in allowed:
+            continue
+        result.append({**item, **LEGACY_REGISTRATION_METADATA.get(item["name"], {})})
+    return result

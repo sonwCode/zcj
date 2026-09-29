@@ -569,6 +569,23 @@ class BasePlatform(ABC):
                 snapshot["provider_resource"] = mailbox_extra["provider_resource"]
         return snapshot
 
+    def _finalize_registration_identity(self, *, success: bool) -> bool:
+        identity = getattr(self, "_last_identity", None)
+        mailbox_account = getattr(identity, "mailbox_account", None)
+        mailbox = getattr(self, "mailbox", None)
+        if mailbox_account is None or mailbox is None:
+            return False
+        method = getattr(mailbox, "commit_email" if success else "release_email", None)
+        return bool(method(mailbox_account)) if callable(method) else False
+
+    def commit_registration_identity(self) -> bool:
+        """整条账号流程成功后，兑现该邮箱的额度。"""
+        return self._finalize_registration_identity(success=True)
+
+    def release_registration_identity(self) -> bool:
+        """校验、2FA、落库或取消任一步失败时，归还该邮箱。"""
+        return self._finalize_registration_identity(success=False)
+
     def _attach_identity_metadata(self, account: Account, identity=None) -> Account:
         actual_identity = identity or getattr(self, "_last_identity", None)
         if not actual_identity:

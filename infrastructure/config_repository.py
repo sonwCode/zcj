@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from core.config_store import config_store
+from core.vault import MASKED_SECRET
 from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 
 
 class ConfigRepository:
+    SECRET_KEYS = {
+        "cpa_api_key", "team_manager_key", "any2api_password",
+        "sub2api_admin_password",
+    }
+
     BASE_KEYS = {
         "default_executor",
         "default_identity_provider", "default_oauth_provider", "oauth_email_hint",
@@ -32,17 +38,27 @@ class ConfigRepository:
                         keys.add(field_key)
         return keys
 
-    def get_flat(self) -> dict[str, str]:
+    def get_flat(self, *, masked: bool = True) -> dict[str, str]:
         data = config_store.get_all()
         allowed = self.get_allowed_keys()
-        return {
-            key: str(value or "")
-            for key, value in data.items()
-            if key in allowed
-        }
+        result: dict[str, str] = {}
+        for key, value in data.items():
+            if key not in allowed:
+                continue
+            text = str(value or "")
+            result[key] = MASKED_SECRET if masked and key in self.SECRET_KEYS and text else text
+        return result
 
     def update_flat(self, data: dict[str, str]) -> list[str]:
         allowed = self.get_allowed_keys()
-        safe = {key: value for key, value in data.items() if key in allowed}
+        safe: dict[str, str] = {}
+        for key, value in data.items():
+            if key not in allowed:
+                continue
+            text = str(value or "")
+            # Empty/masked secret fields mean "leave the stored secret alone".
+            if key in self.SECRET_KEYS and (not text.strip() or text == MASKED_SECRET):
+                continue
+            safe[key] = text
         config_store.set_many(safe)
         return list(safe.keys())

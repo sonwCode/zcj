@@ -295,7 +295,7 @@ _REGIONS: dict[str, tuple] = {
     "AE": ("en-AE", "en-AE,en;q=0.9,ar;q=0.8", "Asia/Dubai", "Gulf Standard Time"),
     "TR": ("tr-TR", "tr-TR,tr;q=0.9,en;q=0.8", "Europe/Istanbul", "Turkey Standard Time"),
     "RU": ("ru-RU", "ru-RU,ru;q=0.9,en;q=0.8", "Europe/Moscow", "Moscow Standard Time"),
-    "UA": ("uk-UA", "uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.7", "Europe/Kiev", "Eastern European Standard Time"),
+    "UA": ("uk-UA", "uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.7", "Europe/Kyiv", "Eastern European Standard Time"),
     "VN": ("vi-VN", "vi-VN,vi;q=0.9,en;q=0.8", "Asia/Ho_Chi_Minh", "Indochina Time"),
     "TH": ("th-TH", "th-TH,th;q=0.9,en;q=0.8", "Asia/Bangkok", "Indochina Time"),
     "ID": ("id-ID", "id-ID,id;q=0.9,en;q=0.8", "Asia/Jakarta", "Western Indonesia Time"),

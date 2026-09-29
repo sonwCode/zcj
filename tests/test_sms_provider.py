@@ -1164,6 +1164,8 @@ class TestCreatePhoneCallbacks:
 
         assert callback() == "+15557654321"
         assert callback() == "123456"
+        assert ("report_success", "act_2") not in events
+        callback.report_success()
         cleanup()
         assert ("report_success", "act_2") in events
         assert ("cancel", "act_2") not in events
@@ -1282,6 +1284,8 @@ class TestCreatePhoneCallbacks:
 
         assert callback() == "+66123456789"
         assert callback() == "654321"
+        assert ("report_success", "act_retry") not in events
+        callback.report_success()
         cleanup()
         assert ("report_success", "act_retry") in events
 
@@ -1596,3 +1600,40 @@ class TestSmsActivation:
     def test_with_country(self):
         a = SmsActivation(activation_id="1", phone_number="+1555", country="us")
         assert a.country == "us"
+
+
+class TestSmsActivateOtpLifecycle:
+    def test_rejected_code_requests_fresh_code_and_cleanup_releases_activation(self, monkeypatch):
+        statuses = iter(["STATUS_OK:111111", "STATUS_OK:111111", "STATUS_OK:222222"])
+        calls = []
+        provider = SmsActivateProvider("test123", default_country="us")
+
+        def fake_request(action, **params):
+            calls.append((action, params))
+            if action == "getNumber":
+                return "ACCESS_NUMBER:act-1:15550000001"
+            if action == "getStatus":
+                return next(statuses)
+            if action == "setStatus" and str(params.get("status")) == "3":
+                return "ACCESS_RETRY_GET"
+            if action == "setStatus" and str(params.get("status")) == "8":
+                return "ACCESS_CANCEL"
+            raise AssertionError((action, params))
+
+        monkeypatch.setattr(provider, "_request", fake_request)
+        monkeypatch.setattr(sms_module.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(sms_module, "create_sms_provider", lambda *_args, **_kwargs: provider)
+
+        callback, cleanup = create_phone_callbacks(
+            "smsactivate", {}, service="chatgpt", country="us"
+        )
+        try:
+            assert callback() == "15550000001"
+            assert callback() == "111111"
+            assert callback.mark_code_failed("invalid otp") is True
+            assert callback() == "222222"
+        finally:
+            cleanup()
+
+        assert ("setStatus", {"id": "act-1", "status": "3"}) in calls
+        assert ("setStatus", {"id": "act-1", "status": "8"}) in calls

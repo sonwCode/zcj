@@ -3,8 +3,8 @@
 ``task_events`` gets one row per log line, and ``TaskLogger.log()`` commits each one
 immediately. A single ChatGPT registration emits on the order of a hundred events -
 ``browser_register.py`` alone has 200+ ``log()`` call sites - so a server that
-registers continuously grows this table without bound. Nothing ever deleted from it:
-``TaskLogsRepository`` only reads.
+registers continuously grows this table without bound. Historically,
+``TaskLogsRepository`` only read it and nothing deleted old events.
 
 Two things make that a deployment problem rather than a cosmetic one:
 
@@ -21,8 +21,9 @@ exclusive lock.
 ``task_logs`` - the per-account success/failure record - is deliberately NOT purged.
 That is history, not a log.
 
-Everything is off unless configured: ``ZCJ_TASK_EVENT_RETENTION_DAYS`` (default 14) and
-``ZCJ_TASK_EVENT_MAX_ROWS`` (default 200000) can each be set to 0 to disable that half.
+Retention is enabled by default: ``ZCJ_TASK_EVENT_RETENTION_DAYS`` defaults to 14 days and
+``ZCJ_TASK_EVENT_MAX_ROWS`` defaults to 200000 rows. Set either variable to 0 to disable
+that half of the policy.
 """
 from __future__ import annotations
 

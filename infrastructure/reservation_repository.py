@@ -188,6 +188,40 @@ class ReservationRepository:
             session.commit()
             return int(getattr(result, "rowcount", 0) or 0) == 1
 
+    def release_owner(self, *, owner: str, status: str = STATUS_RELEASED) -> int:
+        """Release every active reservation owned by one task lease."""
+        token = str(owner or "").strip()
+        if not token:
+            return 0
+        now = _utcnow()
+        with Session(engine) as session:
+            result = session.exec(
+                update(ResourceReservationModel)
+                .where(ResourceReservationModel.owner == token)
+                .where(ResourceReservationModel.status == STATUS_RESERVED)
+                .values(status=status, expires_at=now, updated_at=now)
+            )
+            session.commit()
+            return int(getattr(result, "rowcount", 0) or 0)
+
+    def renew_owner(self, *, owner: str, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> int:
+        """Extend all active reservations for one task lease atomically."""
+        token = str(owner or "").strip()
+        if not token:
+            return 0
+        now = _utcnow()
+        expires = now + timedelta(seconds=max(int(ttl_seconds or 0), 1))
+        with Session(engine) as session:
+            result = session.exec(
+                update(ResourceReservationModel)
+                .where(ResourceReservationModel.owner == token)
+                .where(ResourceReservationModel.status == STATUS_RESERVED)
+                .where(ResourceReservationModel.expires_at > now)
+                .values(expires_at=expires, updated_at=now)
+            )
+            session.commit()
+            return int(getattr(result, "rowcount", 0) or 0)
+
     def get(self, *, pool: str, resource_key: str) -> ReservationRecord | None:
         key = _normalize_key(resource_key)
         if not pool or not key:

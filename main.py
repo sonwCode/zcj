@@ -90,6 +90,10 @@ from api.stats import router as stats_router
 from api.system import router as system_router
 from api.task_commands import router as task_commands_router
 from api.task_logs import router as task_logs_router
+from api.legacy_registration import router as legacy_registration_router
+from api.management import router as management_router
+from api.microsoft_mailboxes import router as microsoft_mailboxes_router
+from api.proxy_nodes import router as proxy_nodes_router
 from api.tasks import router as tasks_router
 from core.db import init_db
 from core.registry import load_all
@@ -106,37 +110,52 @@ async def lifespan(app: FastAPI):
     print("[OK] 数据库初始化完成")
     from core.registry import list_platforms
     print(f"[OK] 已加载平台: {[p['name'] for p in list_platforms()]}")
-    from core.scheduler import scheduler
-    scheduler.start()
-    from services.task_runtime import task_runtime
-    task_runtime.start()
     from core.task_event_writer import task_event_writer
-    task_event_writer.start()
+    from core.scheduler import scheduler
+    from services.task_runtime import task_runtime
     from services.solver_manager import start_async
-    start_async()
     from core.lifecycle import lifecycle_manager
-    lifecycle_manager.start()
-    yield
-    from core.lifecycle import lifecycle_manager as _lifecycle_manager
-    _lifecycle_manager.stop()
-    from core.scheduler import scheduler as _scheduler
-    _scheduler.stop()
-    from services.task_runtime import task_runtime as _task_runtime
-    _task_runtime.stop()
-    # 关停时把缓冲区里剩下的事件落盘，别丢最后一批日志。
-    from core.task_event_writer import task_event_writer as _event_writer
-    _event_writer.stop()
-    from services.solver_manager import stop
-    stop()
+
+    # Start the writer before any producer so early task events have a live
+    # flusher. Background producers are stopped in the reverse dependency order.
+    try:
+        task_event_writer.start()
+        scheduler.start()
+        task_runtime.start()
+        start_async()
+        lifecycle_manager.start()
+        yield
+    finally:
+        # Stop producers before closing the event writer or database resources.
+        components = (
+            ("lifecycle", lifecycle_manager.stop),
+            ("scheduler", scheduler.stop),
+            ("task runtime", task_runtime.stop),
+            ("event writer", task_event_writer.stop),
+        )
+        for name, shutdown in components:
+            try:
+                shutdown()
+            except Exception as exc:
+                print(f"[Shutdown] {name} 关闭失败: {exc}", flush=True)
+        try:
+            from services.solver_manager import stop as stop_solver
+            stop_solver()
+        except Exception as exc:
+            print(f"[Shutdown] solver 关闭失败: {exc}", flush=True)
+        try:
+            from core.db import engine
+            engine.dispose()
+        except Exception as exc:
+            print(f"[Shutdown] 数据库连接池关闭失败: {exc}", flush=True)
 
 
 app = FastAPI(title="Account Manager", version="2.0.0", lifespan=lifespan)
 
 if not os.environ.get("APP_PASSWORD", "").strip():
     print(
-        "[WARN] 未设置 APP_PASSWORD：所有 /api 接口当前无需鉴权，"
-        "本实例持有的账号口令、平台 Token 与代理凭据均可被任意访问。"
-        "公网或共享网络部署请务必设置 APP_PASSWORD。"
+        "[WARN] 未设置 APP_PASSWORD：受保护的 /api 接口将拒绝请求；"
+        "登录会话不会被创建。请在部署前配置 APP_PASSWORD。"
     )
 
 app.add_middleware(AuthMiddleware)
@@ -172,6 +191,10 @@ app.include_router(tasks_router, prefix="/api")
 app.include_router(task_commands_router, prefix="/api")
 app.include_router(task_logs_router, prefix="/api")
 app.include_router(system_router, prefix="/api")
+app.include_router(legacy_registration_router, prefix="/api")
+app.include_router(management_router, prefix="/api")
+app.include_router(microsoft_mailboxes_router, prefix="/api")
+app.include_router(proxy_nodes_router, prefix="/api")
 
 
 _static_dir = os.path.join(os.path.dirname(__file__), "static")

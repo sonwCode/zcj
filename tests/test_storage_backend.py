@@ -12,6 +12,7 @@ the only way to observe the path the module actually produces on a real startup.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 
@@ -25,6 +26,8 @@ from core.storage import (
     dialect_of,
     is_postgres,
     is_sqlite,
+    is_sqlite_memory,
+    secure_sqlite_file_permissions,
 )
 
 
@@ -95,6 +98,36 @@ def test_a_blank_setting_is_treated_as_unset():
 )
 def test_the_dialect_is_classified(url, expected):
     assert dialect_of(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["sqlite://", "sqlite:///:memory:", "sqlite+pysqlite:///:memory:", "sqlite:///x.db"],
+)
+def test_sqlite_memory_detection(url):
+    assert is_sqlite_memory(url) is ("memory" in url or url == "sqlite://")
+
+
+def test_sqlite_database_sidecars_are_restricted(tmp_path):
+    database = tmp_path / "accounts.db"
+    for path in (database, tmp_path / "accounts.db-wal", tmp_path / "accounts.db-shm"):
+        path.write_bytes(b"fixture")
+        os.chmod(path, 0o644)
+
+    secure_sqlite_file_permissions(f"sqlite:///{database}")
+
+    for path in (database, tmp_path / "accounts.db-wal", tmp_path / "accounts.db-shm"):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_memory_sqlite_does_not_touch_filesystem_permissions(tmp_path):
+    fixture = tmp_path / "memory.db"
+    fixture.write_bytes(b"fixture")
+    os.chmod(fixture, 0o644)
+
+    secure_sqlite_file_permissions("sqlite:///:memory:")
+
+    assert stat.S_IMODE(fixture.stat().st_mode) == 0o644
 
 
 def test_an_empty_url_falls_back_to_the_default():

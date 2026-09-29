@@ -1587,6 +1587,172 @@ def test_email_then_phone_keeps_verified_account_when_codex_callback_has_no_toke
     assert any(level == "warning" and "保留当前 Free 账号" in message for message, level in logs)
 
 
+def test_phone_otp_retries_same_activation_before_success():
+    class Callback:
+        def __init__(self):
+            self.values = iter(["111111", "222222"])
+            self.failures = []
+            self.resend_callback = None
+            self.activation = object()
+
+        def __call__(self):
+            return next(self.values)
+
+        def set_resend_callback(self, callback):
+            self.resend_callback = callback
+
+        def mark_code_failed(self, reason=""):
+            self.failures.append(reason)
+            assert self.resend_callback is not None
+            self.resend_callback()
+
+    callback = Callback()
+    resend_activations = []
+    worker = ChatGPTProtocolPhoneWorker(
+        phone_callback=callback,
+        max_otp_attempts=2,
+        log_fn=lambda message: None,
+    )
+    callback.set_resend_callback(
+        lambda: resend_activations.append(callback.activation) or True
+    )
+    engine = SimpleNamespace(_step_error_code="", _step_error_message="")
+    validated_codes = []
+
+    def validate(_engine, code):
+        validated_codes.append(code)
+        if len(validated_codes) == 1:
+            _engine._step_error_code = "phone_otp_validation_failed"
+            _engine._step_error_message = "invalid code"
+            return False
+        return True
+
+    worker._validate_phone_otp = validate
+
+    result = worker._read_and_validate_phone_otp(engine)
+
+    assert result == (True, "", "")
+    assert validated_codes == ["111111", "222222"]
+    assert callback.failures == ["invalid code"]
+    assert resend_activations == [callback.activation]
+
+
+def test_phone_otp_exhaustion_releases_activation_after_retry_budget(monkeypatch):
+    class FakeEngine:
+        def __init__(self, **kwargs):
+            self._authorize_final_url = "https://auth.openai.com/create-account/password"
+            self._password_next_page_type = ""
+            self._device_id = "did-1"
+            self._step_error_code = ""
+            self._step_error_message = ""
+
+        def _init_session(self):
+            return True
+
+        def _start_oauth(self):
+            return True
+
+        def _get_device_id(self):
+            return self._device_id
+
+        def _register_password(self):
+            return True, "Registered123!"
+
+    class Callback:
+        def __init__(self):
+            self.values = iter(["+15550001111", "111111", "222222"])
+            self.failures = []
+            self.send_failures = []
+            self.resend_callback = None
+            self.successes = 0
+
+        def __call__(self):
+            return next(self.values)
+
+        def set_resend_callback(self, callback):
+            self.resend_callback = callback
+
+        def mark_send_succeeded(self):
+            self.successes += 1
+
+        def mark_code_failed(self, reason=""):
+            self.failures.append(reason)
+            assert self.resend_callback is not None
+            self.resend_callback()
+
+        def mark_send_failed(self, reason=""):
+            self.send_failures.append(reason)
+
+    callback = Callback()
+    worker = ChatGPTProtocolPhoneWorker(
+        phone_callback=callback,
+        max_phone_attempts=1,
+        max_otp_attempts=2,
+        log_fn=lambda message: None,
+    )
+    resend_calls = []
+    worker._send_phone_otp = lambda *args, **kwargs: resend_calls.append(True) or True
+    monkeypatch.setattr(protocol_phone_module, "RegistrationEngine", FakeEngine)
+    monkeypatch.setattr(
+        protocol_phone_module,
+        "pin_711proxy_session",
+        lambda proxy, **kwargs: proxy,
+    )
+
+    def invalid_code(engine, code):
+        engine._step_error_code = "phone_otp_validation_failed"
+        engine._step_error_message = "invalid code"
+        return False
+
+    worker._validate_phone_otp = invalid_code
+
+    result = worker.run(password="Secret123!")
+
+    assert result.success is False
+    assert result.error_code == "phone_otp_validation_failed"
+    assert callback.successes == 1
+    assert callback.failures == ["invalid code"]
+    assert callback.send_failures == ["invalid code"]
+    assert resend_calls == [True]
+
+
+def test_phone_otp_validation_rejects_http_200_business_error():
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"error": {"code": "invalid_otp", "message": "Incorrect code"}}
+
+    class Session:
+        def post(self, *args, **kwargs):
+            return Response()
+
+    engine = SimpleNamespace(
+        session=Session(),
+        _device_id="did-1",
+        _step_error_code="stale",
+        _step_error_message="stale",
+    )
+    worker = ChatGPTProtocolPhoneWorker(
+        phone_callback=lambda: "",
+        log_fn=lambda message: None,
+    )
+
+    assert worker._validate_phone_otp(engine, "123456") is False
+    assert engine._step_error_code == "invalid_otp"
+    assert engine._step_error_message == "Incorrect code"
+
+
+def test_email_phone_worker_defaults_to_web_success_without_codex_rt():
+    worker = ChatGPTProtocolEmailThenPhoneWorker(
+        email_service=SimpleNamespace(),
+        phone_callback=lambda: "",
+        log_fn=lambda message: None,
+    )
+
+    assert worker.require_codex_refresh_token is False
+
+
 def test_email_then_phone_does_not_rent_when_remote_is_already_verified(monkeypatch):
     class Callback:
         completed = False

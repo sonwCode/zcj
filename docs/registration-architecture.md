@@ -125,8 +125,9 @@ HTTP 状态码优先（407/403→代理，429→限流，5xx→上游），否�
 - 浏览器栈（`playwright`/`patchright`/`camoufox`，仅浏览器任务要求）；
 - 浏览器指纹档（如 `chrome146`）。
 
-默认只记录日志；`ZCJ_ENFORCE_PREFLIGHT=1` 或 `extra["enforce_preflight"]=true` 时
-检查失败会直接终止任务并给出可读原因。
+默认 fail-closed：检查失败会直接终止任务并给出可读原因。
+仅在测试或明确的任务级旁路 `extra["enforce_preflight"]=false`，或设置
+`ZCJ_ENFORCE_PREFLIGHT=0` 时继续；资源检查本身抛异常时仍按默认策略终止任务。
 
 ## 9. Agent Identity
 

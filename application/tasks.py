@@ -12,7 +12,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from sqlalchemy import update
+from sqlalchemy import or_, update
 from sqlmodel import Session, select, func
 
 from core.account_graph import (
@@ -22,7 +22,15 @@ from core.account_graph import (
 )
 from core.base_platform import AccountStatus, RegisterConfig
 from core.datetime_utils import format_local_clock, serialize_datetime
-from core.db import AccountModel, TaskEventModel, TaskLog, TaskModel, engine, save_account
+from core.db import (
+    AccountModel,
+    TaskEventModel,
+    TaskLog,
+    TaskModel,
+    engine,
+    save_account,
+    task_dispatch_lock,
+)
 from core.platform_accounts import build_platform_account
 from core.proxy_strategy import describe_decision, resolve_proxy
 from core.proxy_utils import mask_proxy_url
@@ -80,6 +88,38 @@ TASK_STATUS_INTERRUPTED = "interrupted"
 TASK_STATUS_CANCEL_REQUESTED = "cancel_requested"
 TASK_STATUS_CANCELLED = "cancelled"
 
+# 单次注册脉冲里最多同时在飞的注册任务数：既作为默认波次并发，也作为配置上限。
+MAX_REGISTER_CONCURRENCY = 200
+# 任务详情回传的账号摘要条数上限，避免一次序列化整张账号表。
+MAX_TASK_ACCOUNT_SUMMARIES = 200
+# "没有可用邮箱"和"邮箱池已耗尽"是两个不同的运维事件，用独立标记透传到前端。
+_NO_EMAIL_MARKER = "__no_email__"
+_POOL_EXHAUSTED_MARKER = "__pool_exhausted__"
+# 共享浏览器进程崩溃属于基础设施故障，不能把失败归因到账号或代理上。
+# 这两组标记把这类失败从"账号问题"里摘出来，决定是重试还是直接判任务失败。
+_BROWSER_INFRA_FAILURE_MARKERS = (
+    "共享浏览器进程已退出",
+    "共享浏览器进程在注册过程中退出",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "browser disconnected",
+    "target closed",
+)
+_BROWSER_FATAL_FAILURE_MARKERS = (
+    "共享浏览器事件循环超过",
+    "共享浏览器池无可用进程",
+)
+
+
+def _is_browser_infrastructure_failure(value: Any) -> bool:
+    message = str(value or "").strip().lower()
+    return any(marker.lower() in message for marker in _BROWSER_INFRA_FAILURE_MARKERS)
+
+
+def _is_browser_runtime_fatal_failure(value: Any) -> bool:
+    message = str(value or "").strip().lower()
+    return any(marker.lower() in message for marker in _BROWSER_FATAL_FAILURE_MARKERS)
+
 TERMINAL_TASK_STATUSES = {
     TASK_STATUS_SUCCEEDED,
     TASK_STATUS_FAILED,
@@ -91,6 +131,8 @@ ACTIVE_TASK_STATUSES = {
     TASK_STATUS_RUNNING,
     TASK_STATUS_CANCEL_REQUESTED,
 }
+TASK_LEASE_SECONDS = max(float(os.environ.get("ZCJ_TASK_LEASE_SECONDS", "300") or 300), 30.0)
+TASK_LEASE_RENEW_SECONDS = max(min(TASK_LEASE_SECONDS / 3.0, 30.0), 5.0)
 
 _task_locks: dict[str, threading.Lock] = {}
 _task_locks_guard = threading.Lock()
@@ -345,18 +387,80 @@ def _task_lock(task_id: str) -> threading.Lock:
         return lock
 
 
-def _mutate_task(task_id: str, fn: Callable[[TaskModel], None]) -> Optional[TaskModel]:
+def _mutate_task(
+    task_id: str,
+    fn: Callable[[TaskModel], None],
+    *,
+    owner_id: str = "",
+) -> Optional[TaskModel]:
+    owner = str(owner_id or "")
     with _task_lock(task_id):
         with Session(engine) as session:
             task = session.get(TaskModel, task_id)
             if not task:
                 return None
+            if owner:
+                if str(task.worker_id or "") != owner:
+                    return None
+                if task.lease_expires_at is not None and float(task.lease_expires_at) < time.time():
+                    return None
             fn(task)
             task.updated_at = _utcnow()
-            session.add(task)
+            if owner:
+                task.lease_expires_at = time.time() + TASK_LEASE_SECONDS
+            if task.status in TERMINAL_TASK_STATUSES:
+                task.worker_id = ""
+                task.lease_expires_at = None
+            if owner:
+                values = {
+                    column.key: getattr(task, column.key)
+                    for column in TaskModel.__table__.columns
+                    if column.key != "id"
+                }
+                result = session.exec(
+                    update(TaskModel)
+                    .where(
+                        TaskModel.id == task_id,
+                        TaskModel.worker_id == owner,
+                        or_(TaskModel.lease_expires_at.is_(None), TaskModel.lease_expires_at >= time.time()),
+                    )
+                    .values(**values)
+                )
+                if int(getattr(result, "rowcount", 0) or 0) != 1:
+                    session.rollback()
+                    return None
+            else:
+                session.add(task)
             session.commit()
             session.refresh(task)
             return task
+
+
+def renew_task_lease(task_id: str, owner_id: str, *, lease_seconds: float = TASK_LEASE_SECONDS) -> bool:
+    owner = str(owner_id or "")
+    if not owner:
+        return False
+    now = time.time()
+    with _task_lock(task_id):
+        with Session(engine) as session:
+            result = session.exec(
+                update(TaskModel)
+                .where(
+                    TaskModel.id == task_id,
+                    TaskModel.worker_id == owner,
+                    TaskModel.status.in_(ACTIVE_TASK_STATUSES),
+                    or_(TaskModel.lease_expires_at.is_(None), TaskModel.lease_expires_at >= now),
+                )
+                .values(
+                    lease_expires_at=now + max(float(lease_seconds), 30.0),
+                    updated_at=_utcnow(),
+                )
+            )
+            if int(getattr(result, "rowcount", 0) or 0) != 1:
+                session.rollback()
+                return False
+            session.commit()
+            return True
 
 
 def _save_task_log(platform: str, email: str, status: str, error: str = "", detail: dict | None = None) -> None:
@@ -390,6 +494,34 @@ def _task_account_keys(task_type: str, payload: dict[str, Any]) -> list[str]:
             ids = [int(payload.get("account_id") or 0)]
         return [f"account:{account_id}" for account_id in ids]
     return []
+
+
+def _persisted_dispatch_state(session: Session) -> tuple[dict[str, int], dict[str, int], set[str]]:
+    """Read active task occupancy from the database for multi-process dispatch."""
+    platform_counts: dict[str, int] = {}
+    lane_counts: dict[str, int] = {}
+    busy_account_keys: set[str] = set()
+    active_tasks = session.exec(
+        select(TaskModel).where(TaskModel.status.in_(ACTIVE_TASK_STATUSES))
+    ).all()
+    for task in active_tasks:
+        lane = task_lane(task.type)
+        lane_counts[lane] = lane_counts.get(lane, 0) + 1
+        payload = task.get_payload()
+        platform = task.platform or str(payload.get("platform", "") or "")
+        if platform:
+            key = f"{lane}:{platform}"
+            platform_counts[key] = platform_counts.get(key, 0) + 1
+        busy_account_keys.update(_task_account_keys(task.type, payload))
+    return platform_counts, lane_counts, busy_account_keys
+
+
+def _merge_max_counts(*sources: dict[str, int]) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for source in sources:
+        for key, value in source.items():
+            merged[key] = max(merged.get(key, 0), int(value or 0))
+    return merged
 
 
 def task_lane(task_type: str) -> str:
@@ -667,14 +799,23 @@ def mark_incomplete_tasks_interrupted() -> None:
     with Session(engine) as session:
         # Pending tasks have not started and must survive a service restart. Only
         # tasks that a worker may have been executing need crash recovery.
+        now = time.time()
         tasks = session.exec(
-            select(TaskModel).where(TaskModel.status.in_(ACTIVE_TASK_STATUSES))
+            select(TaskModel).where(
+                TaskModel.status.in_(ACTIVE_TASK_STATUSES),
+                or_(
+                    TaskModel.lease_expires_at.is_(None),
+                    TaskModel.lease_expires_at < now,
+                ),
+            )
         ).all()
         for task in tasks:
             task.status = TASK_STATUS_INTERRUPTED
             task.error = task.error or "任务在服务重启后被中断"
             task.finished_at = _utcnow()
             task.updated_at = _utcnow()
+            task.worker_id = ""
+            task.lease_expires_at = None
             session.add(task)
             interrupted_ids.append(task.id)
         session.commit()
@@ -709,6 +850,38 @@ def _request_cancel_mutation(task: TaskModel) -> None:
     task.error = task.error or "任务已取消"
 
 
+def recover_expired_task_leases() -> list[str]:
+    """Interrupt tasks whose owning worker lease expired in another process."""
+    expired_ids: list[str] = []
+    now = time.time()
+    with Session(engine) as session:
+        tasks = session.exec(
+            select(TaskModel).where(
+                TaskModel.status.in_(ACTIVE_TASK_STATUSES),
+                TaskModel.lease_expires_at.is_not(None),
+                TaskModel.lease_expires_at < now,
+            )
+        ).all()
+        for task in tasks:
+            task.status = TASK_STATUS_INTERRUPTED
+            task.error = task.error or "任务 worker 租约过期后被中断"
+            task.finished_at = _utcnow()
+            task.updated_at = _utcnow()
+            task.worker_id = ""
+            task.lease_expires_at = None
+            session.add(task)
+            expired_ids.append(task.id)
+        session.commit()
+    for task_id in expired_ids:
+        append_task_event(
+            task_id,
+            "任务 worker 租约过期后被标记为中断",
+            event_type="state",
+            level="warning",
+        )
+    return expired_ids
+
+
 def claim_next_runnable_task(
     *,
     running_platform_counts: dict[str, int] | None = None,
@@ -720,77 +893,90 @@ def claim_next_runnable_task(
     # Kept as compatibility aliases for callers from the two-lane revision.
     running_check_tasks: int | None = None,
     max_parallel_check_tasks: int | None = None,
+    worker_id: str | None = None,
+    lease_seconds: float = TASK_LEASE_SECONDS,
 ) -> Optional[dict[str, Any]]:
     running_platform_counts = dict(running_platform_counts or {})
-    busy_account_keys = set(busy_account_keys or set())
-    running_lane_counts = dict(running_lane_counts or {})
-    lane_capacities = dict(lane_capacities or {})
-    if running_check_tasks is not None:
-        running_lane_counts[TASK_LANE_ACCOUNT_CHECK] = int(running_check_tasks)
-    if max_parallel_check_tasks is not None:
-        lane_capacities[TASK_LANE_ACCOUNT_CHECK] = max(int(max_parallel_check_tasks), 1)
-    platform_limited_lanes = set(platform_limited_lanes or {TASK_LANE_MAIN, TASK_LANE_REGISTER})
-    with Session(engine) as session:
-        tasks = session.exec(
-            select(TaskModel)
-            .where(TaskModel.status == TASK_STATUS_PENDING)
-            .order_by(TaskModel.created_at)
-        ).all()
-        for task in tasks:
-            payload = task.get_payload()
-            platform = task.platform or str(payload.get("platform", "") or "")
-            lane = task_lane(task.type)
-            lane_capacity = lane_capacities.get(lane)
-            if lane_capacity is not None and running_lane_counts.get(lane, 0) >= max(int(lane_capacity), 1):
-                continue
-            account_keys = _task_account_keys(task.type, payload)
-            # Platform limits are lane-local.  A check/action/payment task is
-            # therefore independent from registration, while two registration
-            # tasks for the same platform retain the original guard.
-            platform_key = f"{lane}:{platform}" if platform else ""
-            platform_count = running_platform_counts.get(platform_key, 0)
-            # Accept the old unqualified key for direct callers/tests that
-            # still pass the pre-lane accounting dictionary.
-            if lane == TASK_LANE_MAIN and platform_count == 0:
-                platform_count = running_platform_counts.get(platform, 0)
-            if lane in platform_limited_lanes and platform and platform_count >= max_parallel_per_platform:
-                continue
-            if account_keys and busy_account_keys.intersection(account_keys):
-                continue
-            # Selection above is only a scheduling decision. The conditional
-            # UPDATE is the ownership boundary: another process may have claimed
-            # this row after the SELECT, so only one caller can change pending ->
-            # claimed. A loser continues scanning for another eligible task.
-            claimed_at = _utcnow()
-            claim_result = session.exec(
-                update(TaskModel)
-                .where(
-                    TaskModel.id == task.id,
-                    TaskModel.status == TASK_STATUS_PENDING,
+    worker_id = str(worker_id or f"legacy-{uuid.uuid4().hex}")
+    lease_until = time.time() + max(float(lease_seconds), 30.0)
+    with task_dispatch_lock():
+        recover_expired_task_leases()
+        busy_account_keys = set(busy_account_keys or set())
+        running_lane_counts = dict(running_lane_counts or {})
+        lane_capacities = dict(lane_capacities or {})
+        if running_check_tasks is not None:
+            running_lane_counts[TASK_LANE_ACCOUNT_CHECK] = int(running_check_tasks)
+        if max_parallel_check_tasks is not None:
+            lane_capacities[TASK_LANE_ACCOUNT_CHECK] = max(int(max_parallel_check_tasks), 1)
+        platform_limited_lanes = set(platform_limited_lanes or {TASK_LANE_MAIN, TASK_LANE_REGISTER})
+        with Session(engine) as session:
+            persisted_platform, persisted_lanes, persisted_accounts = _persisted_dispatch_state(session)
+            running_platform_counts = _merge_max_counts(running_platform_counts, persisted_platform)
+            running_lane_counts = _merge_max_counts(running_lane_counts, persisted_lanes)
+            busy_account_keys.update(persisted_accounts)
+            tasks = session.exec(
+                select(TaskModel)
+                .where(TaskModel.status == TASK_STATUS_PENDING)
+                .order_by(TaskModel.created_at)
+            ).all()
+            for task in tasks:
+                payload = task.get_payload()
+                platform = task.platform or str(payload.get("platform", "") or "")
+                lane = task_lane(task.type)
+                lane_capacity = lane_capacities.get(lane)
+                if lane_capacity is not None and running_lane_counts.get(lane, 0) >= max(int(lane_capacity), 1):
+                    continue
+                account_keys = _task_account_keys(task.type, payload)
+                # Platform limits are lane-local.  A check/action/payment task is
+                # therefore independent from registration, while two registration
+                # tasks for the same platform retain the original guard.
+                platform_key = f"{lane}:{platform}" if platform else ""
+                platform_count = running_platform_counts.get(platform_key, 0)
+                # Accept the old unqualified key for direct callers/tests that
+                # still pass the pre-lane accounting dictionary.
+                if lane == TASK_LANE_MAIN and platform_count == 0:
+                    platform_count = running_platform_counts.get(platform, 0)
+                if lane in platform_limited_lanes and platform and platform_count >= max_parallel_per_platform:
+                    continue
+                if account_keys and busy_account_keys.intersection(account_keys):
+                    continue
+                # Selection above is only a scheduling decision. The conditional
+                # UPDATE is the ownership boundary: another process may have claimed
+                # this row after the SELECT, so only one caller can change pending ->
+                # claimed. A loser continues scanning for another eligible task.
+                claimed_at = _utcnow()
+                claim_result = session.exec(
+                    update(TaskModel)
+                    .where(
+                        TaskModel.id == task.id,
+                        TaskModel.status == TASK_STATUS_PENDING,
+                    )
+                    .values(
+                        status=TASK_STATUS_CLAIMED,
+                        started_at=task.started_at or claimed_at,
+                        updated_at=claimed_at,
+                        worker_id=worker_id,
+                        lease_expires_at=lease_until,
+                    )
                 )
-                .values(
-                    status=TASK_STATUS_CLAIMED,
-                    started_at=task.started_at or claimed_at,
-                    updated_at=claimed_at,
-                )
-            )
-            if int(getattr(claim_result, "rowcount", 0) or 0) != 1:
-                continue
-            session.commit()
-            return {
-                "id": task.id,
-                "type": task.type,
-                "lane": lane,
-                "platform": platform,
-                "account_keys": account_keys,
-            }
+                if int(getattr(claim_result, "rowcount", 0) or 0) != 1:
+                    continue
+                session.commit()
+                return {
+                    "id": task.id,
+                    "type": task.type,
+                    "lane": lane,
+                    "platform": platform,
+                    "account_keys": account_keys,
+                }
     return None
 
 
 class TaskLogger:
-    def __init__(self, task_id: str, *, task_type: str = ""):
+    def __init__(self, task_id: str, *, task_type: str = "", owner_id: str = ""):
         self.task_id = task_id
         self.task_type = str(task_type or "")
+        self.owner_id = str(owner_id or "")
         # 并发任务里每个 worker 通过 ``set_subtask`` 把自己的 subtask_id
         # 绑到 thread-local，之后 ``log()`` 自动把 ``subtask_id`` 注入
         # 事件 detail，前端按这个分组折叠展示。
@@ -861,20 +1047,33 @@ class TaskLogger:
             prefix += f"[{sid}]"
         print(f"{prefix} {message}")
 
-    def mark_running(self) -> None:
+    def _mutate(self, fn: Callable[[TaskModel], None]) -> Optional[TaskModel]:
+        return _mutate_task(self.task_id, fn, owner_id=self.owner_id)
+
+    def mark_running(self) -> bool:
         def _update(task: TaskModel) -> None:
             if task.status in TERMINAL_TASK_STATUSES:
                 return
             task.status = TASK_STATUS_RUNNING
             task.started_at = task.started_at or _utcnow()
 
-        _mutate_task(self.task_id, _update)
+        changed = self._mutate(_update)
+        if not changed:
+            return False
         self.log("任务已开始执行", event_type="state")
+        return True
 
     def is_cancel_requested(self) -> bool:
         with Session(engine) as session:
             task = session.get(TaskModel, self.task_id)
-            return bool(task and task.status in {TASK_STATUS_CANCEL_REQUESTED, TASK_STATUS_CANCELLED})
+            if not task:
+                return True
+            if self.owner_id and (
+                str(task.worker_id or "") != self.owner_id
+                or (task.lease_expires_at is not None and float(task.lease_expires_at) < time.time())
+            ):
+                return True
+            return task.status in {TASK_STATUS_CANCEL_REQUESTED, TASK_STATUS_CANCELLED}
 
     def set_progress(self, current: int, total: Optional[int] = None) -> None:
         current = max(int(current), 0)
@@ -884,13 +1083,13 @@ class TaskLogger:
             if total is not None:
                 task.progress_total = max(int(total), 0)
 
-        _mutate_task(self.task_id, _update)
+        self._mutate(_update)
 
     def record_success(self) -> None:
         def _update(task: TaskModel) -> None:
             task.success_count += 1
 
-        _mutate_task(self.task_id, _update)
+        self._mutate(_update)
 
     def record_error(self, error: str) -> None:
         def _update(task: TaskModel) -> None:
@@ -901,7 +1100,7 @@ class TaskLogger:
             result["errors"] = errors
             task.set_result(result)
 
-        _mutate_task(self.task_id, _update)
+        self._mutate(_update)
 
     def record_sub2_sync(
         self,
@@ -943,7 +1142,7 @@ class TaskLogger:
             result["sub2_sync"] = summary
             task.set_result(result)
 
-        _mutate_task(self.task_id, _update)
+        self._mutate(_update)
 
     def add_cashier_url(self, url: str) -> None:
         def _update(task: TaskModel) -> None:
@@ -953,7 +1152,7 @@ class TaskLogger:
             result["cashier_urls"] = urls
             task.set_result(result)
 
-        _mutate_task(self.task_id, _update)
+        self._mutate(_update)
 
     def set_result_data(self, data: Any) -> None:
         def _update(task: TaskModel) -> None:
@@ -961,18 +1160,23 @@ class TaskLogger:
             result["data"] = data
             task.set_result(result)
 
-        _mutate_task(self.task_id, _update)
+        self._mutate(_update)
 
     def finish(self, status: str, *, error: str = "") -> None:
+        changed = False
+
         def _update(task: TaskModel) -> None:
-            if task.status == TASK_STATUS_CANCELLED and status != TASK_STATUS_CANCELLED:
+            nonlocal changed
+            if task.status in TERMINAL_TASK_STATUSES:
                 return
             task.status = status
             task.finished_at = _utcnow()
             if error:
                 task.error = error
+            changed = True
 
-        _mutate_task(self.task_id, _update)
+        if not self._mutate(_update) or not changed:
+            return
         event_level = "error" if status == TASK_STATUS_FAILED else ("warning" if status in {TASK_STATUS_INTERRUPTED, TASK_STATUS_CANCELLED} else "info")
         self.log(
             f"任务结束: {status}",
@@ -1407,16 +1611,23 @@ def _run_single_account_check(account_id: int, logger: TaskLogger | None = None)
     return validity_result, result
 
 
-def execute_task(task_id: str) -> None:
+def execute_task(task_id: str, *, owner_id: str = "") -> None:
+    owner = str(owner_id or "")
     with Session(engine) as session:
         task = session.get(TaskModel, task_id)
         if not task:
             return
+        if owner and (
+            str(task.worker_id or "") != owner
+            or (task.lease_expires_at is not None and float(task.lease_expires_at) < time.time())
+        ):
+            return
         task_type = task.type
         payload = task.get_payload()
 
-    logger = TaskLogger(task_id, task_type=task_type)
-    logger.mark_running()
+    logger = TaskLogger(task_id, task_type=task_type, owner_id=owner)
+    if not logger.mark_running():
+        return
 
     if logger.is_cancel_requested():
         logger.finish(TASK_STATUS_CANCELLED, error="任务在启动后立即被取消")
@@ -1455,7 +1666,7 @@ def execute_task(task_id: str) -> None:
             task.error = error
             changed = True
 
-        _mutate_task(task_id, _fail_active_task)
+        _mutate_task(task_id, _fail_active_task, owner_id=owner)
         if changed:
             logger.log(
                 error,
@@ -1650,7 +1861,7 @@ def _complete_required_chatgpt_phone_verification(
             account_extra["phone_number"] = phone_number
         account.extra = account_extra
 
-        require_rt = _bool_config(extra.get("require_codex_refresh_token"), True)
+        require_rt = _bool_config(extra.get("require_codex_refresh_token"), False)
         has_rt = bool(str(account_extra.get("refresh_token") or "").strip())
         has_at = bool(str(account_extra.get("access_token") or getattr(account, "token", "") or "").strip())
         if require_rt and (not has_rt or not has_at):
@@ -2780,8 +2991,23 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         return
 
     logger.set_progress(0, progress_total)
+    enforce_preflight = _bool_config(
+        extra.get("enforce_preflight"),
+        _bool_config(os.getenv("ZCJ_ENFORCE_PREFLIGHT"), True),
+    )
     preflight_report = None
     try:
+        from core.base_identity import normalize_identity_provider
+
+        identity_provider_for_preflight = normalize_identity_provider(extra.get("identity_provider"))
+        mailbox_required = platform_name == "chatgpt" and identity_provider_for_preflight == "mailbox"
+        mailbox_provider_for_preflight = str(extra.get("mail_provider") or "").strip()
+        if mailbox_required and not mailbox_provider_for_preflight:
+            from infrastructure.provider_settings_repository import ProviderSettingsRepository
+
+            mailbox_provider_for_preflight = ProviderSettingsRepository().get_default_provider_key("mailbox")
+            if mailbox_provider_for_preflight:
+                extra["mail_provider"] = mailbox_provider_for_preflight
         preflight_report = run_preflight(
             require_browser=str(payload.get("executor_type") or "").strip().lower()
             in {"headless", "headed"},
@@ -2789,6 +3015,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 extra.get("browser_profile") or extra.get("camoufox_profile") or ""
             ),
             sentinel=platform_name == "chatgpt",
+            mailbox_provider=mailbox_provider_for_preflight,
+            mailbox_email=str(email or "") if mailbox_required else "",
+            mailbox_config=extra,
+            require_mailbox=mailbox_required,
+            sms_provider=sms_provider_key,
+            sms_config=sms_settings,
+            require_sms=sms_registration_flow,
         )
         for check in preflight_report.checks:
             if not check.ok:
@@ -2801,10 +3034,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 "前置检查通过: "
                 + ", ".join(check.name for check in preflight_report.checks if check.ok)
             )
-        enforce_preflight = _bool_config(
-            extra.get("enforce_preflight"),
-            _bool_config(os.getenv("ZCJ_ENFORCE_PREFLIGHT"), False),
-        )
+        # Required mailbox/SMS resources are procured before the worker starts;
+        # fail closed by default so a missing credential cannot burn a proxy or phone.
         if enforce_preflight and not preflight_report.ok:
             error = "注册前置检查未通过: " + ", ".join(
                 check.name for check in preflight_report.failures
@@ -2813,7 +3044,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             logger.finish(TASK_STATUS_FAILED, error=error)
             return
     except Exception as preflight_exc:
-        logger.log(f"前置检查执行异常（忽略）: {preflight_exc}", level="warning")
+        if enforce_preflight:
+            error = f"注册前置检查执行失败: {preflight_exc}"
+            logger.log(error, level="error")
+            logger.finish(TASK_STATUS_FAILED, error=error)
+            return
+        logger.log(f"前置检查执行异常（显式旁路）: {preflight_exc}", level="warning")
     if herosms_enabled:
         if hero_reuse_to_max:
             logger.log(
@@ -3230,8 +3466,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 _registration_pipeline_update(account, "phone_verified", "not_required")
             require_codex_rt = _bool_config(
                 extra.get("require_codex_refresh_token"),
-                _bool_config(extra.get("sub2api_auto_sync"), False)
-                or _bool_config(extra.get("require_phone_verification"), False),
+                _bool_config(extra.get("sub2api_auto_sync"), False),
             )
             _registration_pipeline_update(account, "credentials_ready", "in_progress")
             try:

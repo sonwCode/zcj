@@ -9,11 +9,11 @@ export const API = import.meta.env.VITE_API_BASE || '/api'
 export const API_BASE = API
 
 export function getAuthToken(): string {
-  return localStorage.getItem('_auth_token') || ''
+  // Authentication is carried by the server-managed HttpOnly cookie.
+  return ''
 }
-export function setAuthToken(token: string) {
-  if (token) localStorage.setItem('_auth_token', token)
-  else localStorage.removeItem('_auth_token')
+export function setAuthToken(_token: string) {
+  // Kept as a compatibility shim for callers migrated from bearer tokens.
 }
 
 export async function copyTextToClipboard(text: string): Promise<boolean> {
@@ -49,13 +49,13 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
 }
 
 function authHeaders(): Record<string, string> {
-  const token = getAuthToken()
-  return token ? { Authorization: `Bearer ${token}` } : {}
+  return {}
 }
 
 export async function apiFetch(path: string, opts?: RequestInit) {
   const res = await fetch(API + path, {
     ...opts,
+    credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...authHeaders(), ...(opts?.headers || {}) },
   })
   if (res.status === 401 && !path.startsWith('/auth/')) {
@@ -70,6 +70,7 @@ export async function apiFetch(path: string, opts?: RequestInit) {
 export async function apiDownload(path: string, opts?: RequestInit) {
   const res = await fetch(API + path, {
     ...opts,
+    credentials: 'include',
     headers: {
       ...(opts?.body ? { 'Content-Type': 'application/json' } : {}),
       ...authHeaders(),

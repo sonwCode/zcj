@@ -117,16 +117,15 @@ ssh -L 6080:127.0.0.1:6080 user@server
 
 ## 9. 磁盘增长（长期运行的主要风险）
 
-`task_events` 表**每写一行日志就插一条记录**，而 `TaskLogger.log()` 每条都单独
-`commit()`。`browser_register.py` 一个文件里就有 200+ 处 `log()` 调用，
-一次注册轻轻松松上百条事件。而 `TaskLogsRepository` 只有读方法——
-**从来没有任何东西删除过这张表**。
+`task_events` 表每条逻辑日志保存一行。`TaskLogger.log()` 通过
+`TaskEventWriter` 合批落盘；`browser_register.py` 一个文件里有 200+ 处 `log()`
+调用，一次注册轻轻松松上百条事件。
 
-服务器连续跑下去，两件事会同时发生：
+如果没有保留策略，服务器连续运行会造成两件事：
 
-1. SQLite 主文件无限增长；
-2. WAL 模式下 `-wal` 文件跟着涨，而且因为没开 `auto_vacuum`，
-   删了行也不会把空间还给文件系统。
+1. SQLite 主文件持续增长；
+2. WAL 模式下 `-wal` 文件跟着增长，而且因为没开 `auto_vacuum`，
+   删除行不会自动把空间还给文件系统。
 
 现在由 `core/retention.py` 在既有维护周期里清理：
 

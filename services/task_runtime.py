@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import threading
 import time
+import uuid
 
 from application.tasks import (
     TASK_LANE_ACCOUNT_ACTION,
@@ -15,7 +17,10 @@ from application.tasks import (
     claim_next_runnable_task,
     execute_task,
     mark_incomplete_tasks_interrupted,
+    request_cancel,
+    renew_task_lease,
     task_lane,
+    TASK_LEASE_RENEW_SECONDS,
 )
 
 
@@ -62,25 +67,62 @@ class TaskRuntime:
         self._dispatcher: threading.Thread | None = None
         self._workers: dict[str, TaskWorkerState] = {}
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._stop_timeout = 30.0
+        self.worker_id = f"runtime-{os.getpid()}-{uuid.uuid4().hex}"
 
     def start(self) -> None:
         with self._lock:
             if self._running:
                 return
             self._running = True
+            self._stop_event.clear()
+            self._wake_event.clear()
             mark_incomplete_tasks_interrupted()
             self._dispatcher = threading.Thread(target=self._loop, daemon=True, name="task-runtime")
             self._dispatcher.start()
             print("[TaskRuntime] 已启动")
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float | None = None) -> None:
         with self._lock:
             self._running = False
-        print("[TaskRuntime] 停止中")
+            worker_ids = list(self._workers)
+        self._stop_event.set()
+        self._wake_event.set()
+        for task_id in worker_ids:
+            try:
+                request_cancel(task_id)
+            except Exception:
+                pass
+        dispatcher = self._dispatcher
+        wait_timeout = self._stop_timeout if timeout is None else max(float(timeout), 0.0)
+        if dispatcher is not None and dispatcher.is_alive():
+            dispatcher.join(timeout=wait_timeout)
+        deadline = time.monotonic() + wait_timeout
+        while True:
+            with self._lock:
+                workers = [state.thread for state in self._workers.values()]
+            alive = [worker for worker in workers if worker.is_alive()]
+            if not alive or time.monotonic() >= deadline:
+                break
+            remaining = max(deadline - time.monotonic(), 0.0)
+            for worker in alive:
+                worker.join(timeout=min(0.2, remaining))
+        self._reap_workers()
+        print("[TaskRuntime] 已停止")
 
     def wake_up(self) -> None:
-        # Polling loop wakes quickly already; this method exists as an explicit runtime hook.
-        return
+        self._wake_event.set()
+
+    def get_status(self) -> dict:
+        with self._lock:
+            workers = list(self._workers.values())
+            return {
+                "running": bool(self._running),
+                "dispatcher_alive": bool(self._dispatcher and self._dispatcher.is_alive()),
+                "worker_count": sum(1 for state in workers if state.thread.is_alive()),
+            }
 
     def _loop(self) -> None:
         while self._running:
@@ -109,6 +151,7 @@ class TaskRuntime:
                     running_lane_counts=running_lane_counts,
                     lane_capacities=self.lane_capacities,
                     platform_limited_lanes=self.platform_limited_lanes,
+                    worker_id=self.worker_id,
                 )
                 if not task_info:
                     break
@@ -125,7 +168,7 @@ class TaskRuntime:
                 task_id = task_info["id"]
                 worker = threading.Thread(
                     target=self._run_task,
-                    args=(task_id,),
+                    args=(task_id, self.worker_id),
                     daemon=True,
                     name=f"task-worker-{task_id}",
                 )
@@ -142,15 +185,35 @@ class TaskRuntime:
                         running_platform_counts[key] = running_platform_counts.get(key, 0) + 1
                     busy_account_keys.update(set(task_info.get("account_keys") or []))
                 worker.start()
-            time.sleep(self.poll_interval)
+            self._wake_event.wait(self.poll_interval)
+            self._wake_event.clear()
         self._reap_workers()
 
-    def _run_task(self, task_id: str) -> None:
+    def _run_task(self, task_id: str, owner_id: str) -> None:
+        heartbeat_stop = threading.Event()
+        heartbeat = threading.Thread(
+            target=self._renew_lease,
+            args=(task_id, owner_id, heartbeat_stop),
+            daemon=True,
+            name=f"task-lease-{task_id}",
+        )
+        heartbeat.start()
         try:
-            execute_task(task_id)
+            execute_task(task_id, owner_id=owner_id)
         finally:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=1.0)
             with self._lock:
                 self._workers.pop(task_id, None)
+
+    @staticmethod
+    def _renew_lease(task_id: str, owner_id: str, stop_event: threading.Event) -> None:
+        while not stop_event.wait(TASK_LEASE_RENEW_SECONDS):
+            try:
+                if not renew_task_lease(task_id, owner_id):
+                    return
+            except Exception:
+                return
 
     def _reap_workers(self) -> None:
         with self._lock:

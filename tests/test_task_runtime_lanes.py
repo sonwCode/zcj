@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import application.tasks as tasks_module
@@ -11,6 +12,7 @@ from application.tasks import (
     TASK_TYPE_CODEX_OAUTH,
     TASK_TYPE_GOPAY_PAY_CHATGPT,
     TASK_TYPE_PHONE_BIND,
+    TASK_TYPE_PLATFORM_ACTION,
     TASK_STATUS_FAILED,
     TASK_STATUS_INTERRUPTED,
     TASK_STATUS_PENDING,
@@ -19,6 +21,8 @@ from application.tasks import (
     claim_next_runnable_task,
     create_task,
     execute_task,
+    recover_expired_task_leases,
+    renew_task_lease,
     mark_incomplete_tasks_interrupted,
     task_lane,
 )
@@ -120,32 +124,8 @@ def test_concurrent_claimers_can_only_claim_one_pending_row(monkeypatch):
         platform="chatgpt",
         payload={"platform": "chatgpt", "count": 1},
     )
-    barrier = threading.Barrier(2)
-    real_session = tasks_module.Session
-
-    class CoordinatedSession:
-        def __init__(self, *args, **kwargs):
-            self._session = real_session(*args, **kwargs)
-            self._first_exec = True
-
-        def __enter__(self):
-            self._session.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self._session.__exit__(*args)
-
-        def exec(self, statement, *args, **kwargs):
-            result = self._session.exec(statement, *args, **kwargs)
-            if self._first_exec:
-                self._first_exec = False
-                barrier.wait(timeout=5)
-            return result
-
-        def __getattr__(self, name):
-            return getattr(self._session, name)
-
-    monkeypatch.setattr(tasks_module, "Session", CoordinatedSession)
+    # The database dispatch lock serializes occupancy calculation and claim
+    # across both threads and processes; let two real callers race through it.
 
     def claim():
         return claim_next_runnable_task(
@@ -164,6 +144,87 @@ def test_concurrent_claimers_can_only_claim_one_pending_row(monkeypatch):
         assert claimed is not None
         assert claimed.status == "claimed"
 
+
+
+def test_persisted_platform_occupancy_blocks_second_registration_claim():
+    first = create_task(
+        task_type=TASK_TYPE_REGISTER,
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "count": 1},
+    )
+    second = create_task(
+        task_type=TASK_TYPE_REGISTER,
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "count": 1},
+    )
+
+    claimed = claim_next_runnable_task(worker_id="worker-a")
+    assert claimed is not None
+    assert claimed["id"] == first["id"]
+
+    blocked = claim_next_runnable_task(worker_id="worker-b")
+    assert blocked is None
+
+    with Session(engine) as session:
+        pending = session.get(TaskModel, second["id"])
+        assert pending is not None
+        assert pending.status == TASK_STATUS_PENDING
+
+
+def test_persisted_account_occupancy_blocks_same_account_across_workers():
+    first = create_task(
+        task_type=TASK_TYPE_PLATFORM_ACTION,
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "account_id": 42, "action_id": "check"},
+    )
+    second = create_task(
+        task_type=TASK_TYPE_PLATFORM_ACTION,
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "account_id": 42, "action_id": "check"},
+    )
+
+    claimed = claim_next_runnable_task(worker_id="worker-a")
+    assert claimed is not None
+    assert claimed["id"] == first["id"]
+
+    blocked = claim_next_runnable_task(worker_id="worker-b")
+    assert blocked is None
+
+    with Session(engine) as session:
+        pending = session.get(TaskModel, second["id"])
+        assert pending is not None
+        assert pending.status == TASK_STATUS_PENDING
+
+
+def test_persisted_lane_occupancy_blocks_second_check_task():
+    first = create_task(
+        task_type=TASK_TYPE_ACCOUNT_CHECK,
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "account_id": 101},
+    )
+    second = create_task(
+        task_type=TASK_TYPE_ACCOUNT_CHECK,
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "account_id": 102},
+    )
+
+    claimed = claim_next_runnable_task(
+        worker_id="worker-a",
+        lane_capacities={"account_check": 1},
+    )
+    assert claimed is not None
+    assert claimed["id"] == first["id"]
+
+    blocked = claim_next_runnable_task(
+        worker_id="worker-b",
+        lane_capacities={"account_check": 1},
+    )
+    assert blocked is None
+
+    with Session(engine) as session:
+        pending = session.get(TaskModel, second["id"])
+        assert pending is not None
+        assert pending.status == TASK_STATUS_PENDING
 
 
 def test_unexpected_handler_exception_finishes_active_task(monkeypatch):
@@ -185,3 +246,50 @@ def test_unexpected_handler_exception_finishes_active_task(monkeypatch):
         assert model.status == TASK_STATUS_FAILED
         assert model.error == "任务执行异常: synthetic handler crash"
         assert model.finished_at is not None
+
+
+def test_claim_records_owner_and_only_owner_can_renew():
+    task = create_task(
+        task_type=TASK_TYPE_REGISTER,
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "count": 1},
+    )
+
+    claim = claim_next_runnable_task(worker_id="worker-a", lease_seconds=60)
+    assert claim is not None
+    assert claim["id"] == task["id"]
+
+    with Session(engine) as session:
+        model = session.get(TaskModel, task["id"])
+        assert model is not None
+        assert model.worker_id == "worker-a"
+        assert model.lease_expires_at is not None
+        assert model.lease_expires_at > time.time()
+
+    assert renew_task_lease(task["id"], "worker-b") is False
+    assert renew_task_lease(task["id"], "worker-a") is True
+
+
+def test_expired_worker_lease_is_recovered_without_touching_pending():
+    task = create_task(
+        task_type=TASK_TYPE_REGISTER,
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "count": 1},
+    )
+    claim = claim_next_runnable_task(worker_id="worker-a", lease_seconds=60)
+    assert claim is not None
+
+    with Session(engine) as session:
+        model = session.get(TaskModel, task["id"])
+        assert model is not None
+        model.lease_expires_at = time.time() - 1
+        session.add(model)
+        session.commit()
+
+    assert task["id"] in recover_expired_task_leases()
+    with Session(engine) as session:
+        model = session.get(TaskModel, task["id"])
+        assert model is not None
+        assert model.status == TASK_STATUS_INTERRUPTED
+        assert model.worker_id == ""
+        assert model.lease_expires_at is None

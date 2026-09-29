@@ -8780,14 +8780,33 @@ def extract_paypal_authorize_link_protocol(
     }
 
 
+_UNSAFE_SHELL_URL_CHARS = frozenset('"&|^<>%\r\n\x00')
+
+
+def _is_safe_shell_url(url: str) -> bool:
+    """URL 进入命令行前的白名单校验。
+
+    Windows 走 start 必须经 cmd.exe 解析，而 checkout URL 由外部返回，
+    其中的 & / | / ^ 会被 cmd 当作命令分隔符执行额外命令。
+    这里只放行明确的 http(s) URL 且不含任何 cmd 元字符的值。
+    """
+    value = str(url or "").strip()
+    if not value or any(ch in value for ch in _UNSAFE_SHELL_URL_CHARS):
+        return False
+    return value.split("://", 1)[0].lower() in ("http", "https")
+
+
 def _open_url_system_browser(url: str) -> bool:
     """回退方案：调用系统浏览器以无痕模式打开"""
     platform = sys.platform
+    if platform == "win32" and not _is_safe_shell_url(url):
+        logger.warning("系统浏览器无痕打开已跳过：URL 未通过安全校验")
+        return False
     try:
         if platform == "win32":
             for browser, flag in [("chrome", "--incognito"), ("msedge", "--inprivate")]:
                 try:
-                    subprocess.Popen(f'start {browser} {flag} "{url}"', shell=True)
+                    subprocess.Popen(["cmd", "/c", "start", "", browser, flag, url])
                     return True
                 except Exception:
                     continue

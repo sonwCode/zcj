@@ -1055,6 +1055,7 @@ class LifecycleManager:
         self.cpa_sync_interval = cpa_sync_interval_hours * 3600
         self.warning_hours = warning_hours
         self._running = False
+        self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_check = 0.0
         self._last_refresh = 0.0
@@ -1064,6 +1065,7 @@ class LifecycleManager:
         if self._running:
             return
         self._running = True
+        self._stop_event.clear()
         # Scheduler owns the fast validity loop.  Defer this legacy 6-hour
         # sweep so startup cannot launch two simultaneous checks through the
         # same account proxy.
@@ -1072,12 +1074,17 @@ class LifecycleManager:
         self._thread.start()
         print("[LifecycleManager] 已启动")
 
-    def stop(self):
+    def stop(self, *, timeout: float = 30.0):
         self._running = False
+        self._stop_event.set()
+        thread = self._thread
+        if thread and thread.is_alive():
+            thread.join(timeout=max(float(timeout), 0.0))
 
     def _loop(self):
-        # Wait a bit before first run to let the app fully initialize
-        time.sleep(30)
+        # Wait a bit before first run to let the app fully initialize.
+        if self._stop_event.wait(30):
+            return
         while self._running:
             now = time.time()
             try:
@@ -1109,7 +1116,8 @@ class LifecycleManager:
             for _ in range(60):
                 if not self._running:
                     break
-                time.sleep(1)
+                if self._stop_event.wait(1):
+                    break
 
 
 lifecycle_manager = LifecycleManager()

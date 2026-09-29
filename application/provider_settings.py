@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from core.vault import MASKED_SECRET
 from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 from infrastructure.provider_settings_repository import ProviderSettingsRepository
 
@@ -26,10 +27,7 @@ class ProviderSettingsService:
             auth=dict(payload.get("auth") or {}),
             metadata=dict(payload.get("metadata") or {}),
         )
-        return {
-            "ok": True,
-            "item": self._serialize(item),
-        }
+        return {"ok": True, "item": self._serialize(item)}
 
     def delete_setting(self, setting_id: int) -> dict:
         return {"ok": self.repository.delete(setting_id)}
@@ -53,7 +51,13 @@ class ProviderSettingsService:
 
     def _serialize(self, item) -> dict:
         definition = self.definitions.get_by_key(item.provider_type, item.provider_key)
-        auth = item.get_auth()
+        raw_auth = item.get_auth() or {}
+        # Never send credential material to the browser. The mask also lets the
+        # client preserve configured fields while the repository merges updates.
+        auth = {
+            str(key): MASKED_SECRET if str(value or "") else ""
+            for key, value in raw_auth.items()
+        }
         auth_modes = definition.get_auth_modes() if definition else []
         fields = definition.get_fields() if definition else []
         return {
@@ -73,15 +77,6 @@ class ProviderSettingsService:
             "fields": fields,
             "config": item.get_config(),
             "auth": auth,
-            "auth_preview": {key: self._preview_secret(value) for key, value in auth.items()},
+            "auth_preview": dict(auth),
             "metadata": item.get_metadata(),
         }
-
-    @staticmethod
-    def _preview_secret(value: str) -> str:
-        text = str(value or "")
-        if not text:
-            return ""
-        if len(text) <= 10:
-            return text
-        return f"{text[:6]}...{text[-4:]}"

@@ -810,3 +810,26 @@ def solve_turnstile_dx(dx_b64: str, p_token: str, user_agent: str = "", sdk_url:
     """
     vm = SentinelVM(user_agent=user_agent, sdk_url=sdk_url)
     return vm.solve(dx_b64, p_token)
+
+
+# 线上版本的 Sentinel 走持久化 Node 运行时（见 platforms/chatgpt/sentinel_node.py，
+# 配套资产在同名 sentinel_vm/ 目录）。本模块保留纯 Python 实现作为默认路径，
+# 这里用惰性再导出把线上 API 暴露出去：移植过来的协议注册链路在装了 node 的机器上
+# 仍然可用，缺 node 时也不会影响纯 Python 路径的导入。
+_LEGACY_EXPORTS = frozenset({
+    "SentinelSDK",
+    "SentinelSDKManager",
+    "SentinelVMError",
+    "SentinelVMPool",
+    "close_sentinel_vm_pool",
+    "get_sentinel_sdk",
+    "get_sentinel_vm_pool",
+})
+
+
+def __getattr__(name: str):
+    if name in _LEGACY_EXPORTS:
+        from platforms.chatgpt import sentinel_node
+
+        return getattr(sentinel_node, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

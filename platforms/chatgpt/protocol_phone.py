@@ -271,6 +271,7 @@ class ChatGPTProtocolPhoneWorker:
         log_fn: Callable[[str], None] = print,
         cancel_check=None,
         max_phone_attempts: int = 3,
+        max_otp_attempts: int = 2,
         proxy_country: str = "",
         proxy_session_id: str = "",
         mailbox_factory: Callable[[str | None], object] | None = None,
@@ -284,6 +285,7 @@ class ChatGPTProtocolPhoneWorker:
         if hasattr(self.phone_callback, "set_cancel_check"):
             self.phone_callback.set_cancel_check(self.cancel_check)
         self.max_phone_attempts = max(int(max_phone_attempts or 3), 1)
+        self.max_otp_attempts = min(max(int(max_otp_attempts or 2), 1), 5)
         self.proxy_country = str(proxy_country or "").strip().upper()
         self.proxy_session_id = (
             "".join(char for char in str(proxy_session_id or "") if char.isalnum())[:11]
@@ -321,6 +323,8 @@ class ChatGPTProtocolPhoneWorker:
             callback.completed = False
 
     def _validate_phone_otp(self, engine: RegistrationEngine, code: str) -> bool:
+        engine._step_error_code = ""
+        engine._step_error_message = ""
         headers = {
             "referer": f"{OPENAI_AUTH}/phone-verification",
             "origin": OPENAI_AUTH,
@@ -345,7 +349,27 @@ class ChatGPTProtocolPhoneWorker:
             engine._step_error_code = server_code or "phone_otp_validation_failed"
             engine._step_error_message = server_message or f"HTTP {response.status_code}"
             return False
-        data = response.json() or {}
+        try:
+            data = response.json() or {}
+        except Exception as exc:
+            engine._step_error_code = "phone_otp_validation_failed"
+            engine._step_error_message = f"手机号验证码校验响应不是有效 JSON: {exc}"
+            return False
+        if not isinstance(data, dict):
+            engine._step_error_code = "phone_otp_validation_failed"
+            engine._step_error_message = "手机号验证码校验响应不是对象"
+            return False
+        error_value = data.get("error")
+        error_code = data.get("error_code") or data.get("errorCode")
+        if isinstance(error_value, dict):
+            error_code = error_code or error_value.get("code") or error_value.get("type")
+            error_message = error_value.get("message") or error_value.get("detail")
+        else:
+            error_message = error_value
+        if data.get("ok") is False or data.get("success") is False or error_value or error_code:
+            engine._step_error_code = str(error_code or "phone_otp_validation_failed")
+            engine._step_error_message = str(error_message or data.get("message") or "手机号验证码被服务端拒绝")
+            return False
         page = data.get("page") if isinstance(data.get("page"), dict) else {}
         payload = page.get("payload") if isinstance(page.get("payload"), dict) else {}
         engine._otp_response_data = dict(data)
@@ -362,6 +386,60 @@ class ChatGPTProtocolPhoneWorker:
             f"continue={'yes' if engine._otp_continue_url else 'no'}"
         )
         return True
+
+    def _read_and_validate_phone_otp(
+        self,
+        engine: RegistrationEngine,
+    ) -> tuple[bool, str, str]:
+        """Validate a code and resend on a retryable rejection in one activation."""
+        can_retry = callable(getattr(self.phone_callback, "mark_code_failed", None))
+        for code_attempt in range(1, self.max_otp_attempts + 1):
+            if self.cancel_check():
+                raise RuntimeError("任务已取消")
+            code = str(self.phone_callback() or "").strip()
+            if not code:
+                return False, "phone_otp_timeout", "等待短信验证码超时"
+            if self._validate_phone_otp(engine, code):
+                return True, "", ""
+
+            error_code = str(getattr(engine, "_step_error_code", "") or "")
+            error_message = str(
+                getattr(engine, "_step_error_message", "")
+                or "短信验证码校验失败"
+            )
+            hard_rejection = (
+                _is_account_deactivated(error_code, error_message)
+                or _is_phone_risk_rejection(error_code, error_message)
+                or _is_phone_account_rate_limited(error_code, error_message)
+                or _is_phone_otp_number_rejection(error_code, error_message)
+            )
+            retryable = (
+                can_retry
+                and code_attempt < self.max_otp_attempts
+                and not hard_rejection
+            )
+            if retryable:
+                try:
+                    resend_result = self.phone_callback.mark_code_failed(error_message)
+                except Exception as exc:
+                    self._log(f"短信验证码重发请求失败: {str(exc)[:160]}", "warning")
+                    resend_result = False
+                # New controllers return True only after the provider accepted
+                # a fresh-code request. None preserves legacy callback behavior.
+                if resend_result is False:
+                    return (
+                        False,
+                        error_code or "phone_otp_retry_unavailable",
+                        "短信服务未确认可获取新的验证码",
+                    )
+                self._log(
+                    f"短信验证码被拒，保留当前 activation 请求重发 "
+                    f"({code_attempt + 1}/{self.max_otp_attempts})"
+                )
+                continue
+            return False, error_code or "phone_otp_validation_failed", error_message
+
+        return False, "phone_otp_validation_failed", "短信验证码校验失败"
 
     def _send_phone_otp(
         self,
@@ -714,19 +792,20 @@ class ChatGPTProtocolPhoneWorker:
             )
         if hasattr(self.phone_callback, "mark_send_succeeded"):
             self.phone_callback.mark_send_succeeded()
-        code = str(self.phone_callback() or "").strip()
-        if not code:
-            return RegistrationResult(success=False, error_code="phone_otp_timeout", error_message="等待短信验证码超时")
-        if not self._validate_phone_otp(engine, code):
-            if hasattr(self.phone_callback, "mark_code_failed"):
-                self.phone_callback.mark_code_failed(engine._step_error_message)
+        otp_ok, error_code, error_message = self._read_and_validate_phone_otp(engine)
+        if not otp_ok:
             return RegistrationResult(
                 success=False,
-                error_code=engine._step_error_code or "phone_otp_validation_failed",
-                error_message=engine._step_error_message or "短信验证码校验失败",
+                error_code=error_code,
+                error_message=error_message,
             )
         if hasattr(self.phone_callback, "report_success"):
-            self.phone_callback.report_success()
+            if self.phone_callback.report_success() is False:
+                return RegistrationResult(
+                    success=False,
+                    error_code="phone_activation_finalize_failed",
+                    error_message="短信号码完成上报失败，已释放当前 activation",
+                )
         if not engine._create_user_account():
             return RegistrationResult(
                 success=False,
@@ -927,7 +1006,8 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
         log_fn: Callable[[str], None] = print,
         cancel_check=None,
         max_phone_attempts: int = 3,
-        require_codex_refresh_token: bool = True,
+        max_otp_attempts: int = 2,
+        require_codex_refresh_token: bool = False,
         existing_account_id: str = "",
         existing_device_id: str = "",
         existing_auth_cookies=None,
@@ -939,6 +1019,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
             log_fn=log_fn,
             cancel_check=cancel_check,
             max_phone_attempts=max_phone_attempts,
+            max_otp_attempts=max_otp_attempts,
             bind_email_after_registration=False,
             proxy_country=proxy_country,
         )
@@ -1420,6 +1501,153 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
             final_url = urljoin(final_url, resolved_url)
         return final_url, resolved_type, resolved_payload
 
+    def _submit_existing_account_password(
+        self,
+        engine: RegistrationEngine,
+        *,
+        email: str,
+        password: str,
+        password_url: str,
+    ) -> tuple[str, str, dict]:
+        """Complete the password step for the account selected by OAuth.
+
+        The unified-session chooser can require the selected account to confirm
+        its password before returning to the original Codex authorization
+        transaction.  This is an authenticated continuation, not a new
+        account registration, but it uses the same ``user/register`` endpoint
+        and ``login_password`` Sentinel flow as the normal login path.
+        """
+        password_url = urljoin(
+            OPENAI_AUTH,
+            str(password_url or "/log-in/password").strip(),
+        )
+        if not str(password or ""):
+            engine._step_error_code = "password_missing"
+            engine._step_error_message = "当前邮箱账号缺少登录密码"
+            raise RuntimeError(engine._step_error_message)
+        engine._password_continue_url = password_url
+
+        try:
+            page_response = engine.session.get(
+                password_url,
+                headers={
+                    "referer": f"{OPENAI_AUTH}/choose-an-account",
+                    "accept": (
+                        "text/html,application/xhtml+xml,application/xml;"
+                        "q=0.9,*/*;q=0.8"
+                    ),
+                },
+                timeout=20,
+            )
+        except Exception as exc:
+            engine._step_error_code = "proxy_network_error"
+            engine._step_error_message = str(exc)[:500]
+            raise RuntimeError("邮箱账号密码页加载失败") from exc
+
+        page_status = int(getattr(page_response, "status_code", 0) or 0)
+        self._log(f"手机号验证账号密码页加载状态: {page_status}")
+        if page_status >= 400:
+            code, message = _response_error(page_response)
+            engine._step_error_code = code or "password_page_load_failed"
+            engine._step_error_message = message or f"HTTP {page_status}"
+            raise RuntimeError(
+                "邮箱账号密码页加载失败: "
+                f"{message or code or f'HTTP {page_status}'}"
+            )
+
+        sentinel = None
+        if engine._device_id:
+            sentinel = engine._check_sentinel(
+                engine._device_id,
+                flow="login_password",
+            )
+            engine._password_sentinel = sentinel
+            engine._sentinel_token = sentinel.c if sentinel else None
+
+        headers = {
+            "origin": OPENAI_AUTH,
+            "referer": password_url,
+            "accept": "application/json",
+            "content-type": "application/json",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
+            **_generate_datadog_trace_headers(),
+        }
+        if engine._device_id:
+            headers["oai-device-id"] = engine._device_id
+        if sentinel and engine._device_id:
+            headers["openai-sentinel-token"] = json.dumps(
+                {
+                    "p": sentinel.p,
+                    "t": sentinel.t,
+                    "c": sentinel.c,
+                    "id": engine._device_id,
+                    "flow": sentinel.flow,
+                },
+                separators=(",", ":"),
+            )
+
+        try:
+            response = engine.session.post(
+                OPENAI_API_ENDPOINTS["register"],
+                headers=headers,
+                data=json.dumps({"password": password, "username": email}),
+                timeout=20,
+            )
+        except Exception as exc:
+            engine._step_error_code = "proxy_network_error"
+            engine._step_error_message = str(exc)[:500]
+            raise RuntimeError("邮箱账号密码验证请求失败") from exc
+
+        self._log(f"手机号验证账号密码提交状态: {response.status_code}")
+        if response.status_code != 200:
+            code, message = _response_error(response)
+            engine._step_error_code = code or "password_verification_failed"
+            engine._step_error_message = message or f"HTTP {response.status_code}"
+            raise RuntimeError(
+                "邮箱账号密码验证失败: "
+                f"{message or code or f'HTTP {response.status_code}'}"
+            )
+
+        page_type, continue_url, page_payload = self._page_state(response)
+        server_code, server_message = _response_error(response)
+        if not page_type and not continue_url and (server_code or server_message):
+            engine._step_error_code = server_code or "password_verification_failed"
+            engine._step_error_message = server_message or "密码验证未返回后续页面"
+            raise RuntimeError(
+                "邮箱账号密码验证失败: "
+                f"{server_message or server_code or '未返回后续页面'}"
+            )
+
+        response_data = {}
+        try:
+            parsed = response.json()
+            if isinstance(parsed, dict):
+                response_data = parsed
+        except Exception:
+            pass
+        engine._otp_response_data = response_data
+        engine._password_next_page_type = page_type
+        engine._password_next_payload = dict(page_payload)
+        resolved_url = (
+            urljoin(
+                str(getattr(response, "url", "") or password_url),
+                continue_url,
+            )
+            if continue_url
+            else ""
+        )
+        engine._password_continue_url = resolved_url or password_url
+        engine._otp_page_type = page_type
+        engine._otp_continue_url = resolved_url
+        self._log(
+            "手机号验证账号密码后页面: "
+            f"{page_type or 'unknown'} "
+            f"continue={'yes' if resolved_url else 'no'}"
+        )
+        return page_type, resolved_url, dict(page_payload)
+
     def _open_phone_challenge(self, *, email: str, password: str) -> tuple[RegistrationEngine, str, dict]:
         self._auth_generation += 1
         engine = RegistrationEngine(
@@ -1487,42 +1715,65 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
 
         if "/add-phone" in final_url:
             return engine, final_url, {}
-        if "/log-in" not in final_url or "/log-in/password" in final_url:
+        if "/log-in/password" in final_url:
+            page_type, continue_url, page_payload = self._submit_existing_account_password(
+                engine,
+                email=email,
+                password=password,
+                password_url=final_url,
+            )
+        elif "/log-in" not in final_url:
             if "code=" in final_url or "consent" in final_url:
                 return engine, "", {"already_verified": True}
             raise RuntimeError(f"手机号验证授权落点异常: {final_url[:160]}")
+        else:
+            headers = {
+                "origin": OPENAI_AUTH,
+                "referer": final_url,
+                "accept": "application/json",
+                "content-type": "application/json",
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
+                **_generate_datadog_trace_headers(),
+                **self._sentinel_header(engine, "authorize_continue"),
+            }
+            headers["oai-device-id"] = engine._device_id
+            response = engine.session.post(
+                OPENAI_API_ENDPOINTS["signup"],
+                headers=headers,
+                data=json.dumps(
+                    {
+                        "username": {"value": email, "kind": "email"},
+                        "screen_hint": "login",
+                    }
+                ),
+                timeout=20,
+            )
+            self._log(f"手机号验证提交邮箱状态: {response.status_code}")
+            if response.status_code != 200:
+                code, message = _response_error(response)
+                raise RuntimeError(message or code or f"提交邮箱失败: HTTP {response.status_code}")
 
-        headers = {
-            "origin": OPENAI_AUTH,
-            "referer": final_url,
-            "accept": "application/json",
-            "content-type": "application/json",
-            "sec-fetch-site": "same-origin",
-            **_generate_datadog_trace_headers(),
-            **self._sentinel_header(engine, "authorize_continue"),
-        }
-        headers["oai-device-id"] = engine._device_id
-        response = engine.session.post(
-            OPENAI_API_ENDPOINTS["signup"],
-            headers=headers,
-            data=json.dumps(
-                {
-                    "username": {"value": email, "kind": "email"},
-                    "screen_hint": "login",
-                }
-            ),
-            timeout=20,
-        )
-        self._log(f"手机号验证提交邮箱状态: {response.status_code}")
-        if response.status_code != 200:
-            code, message = _response_error(response)
-            raise RuntimeError(message or code or f"提交邮箱失败: HTTP {response.status_code}")
+            page_type, continue_url, page_payload = self._page_state(response)
+            self._log(f"手机号验证提交邮箱后页面: {page_type or 'unknown'}")
+            if page_type in {"login_password", "create_account_password"}:
+                page_type, continue_url, page_payload = self._submit_existing_account_password(
+                    engine,
+                    email=email,
+                    password=password,
+                    password_url=continue_url or f"{OPENAI_AUTH}/log-in/password",
+                )
 
-        page_type, continue_url, page_payload = self._page_state(response)
-        self._log(f"手机号验证提交邮箱后页面: {page_type or 'unknown'}")
+        if page_type == "add_phone" or "/add-phone" in continue_url:
+            return engine, urljoin(OPENAI_AUTH, continue_url or "/add-phone"), page_payload
+        if "code=" in continue_url:
+            return engine, "", {"already_verified": True, **page_payload}
+        if page_type in {"consent", "sign_in_with_chatgpt_codex_consent"} or "consent" in continue_url:
+            return engine, "", {"already_verified": True, **page_payload}
+        if page_type in {"phone_otp_verification", "phone_verification"} or "phone-verification" in continue_url:
+            return engine, urljoin(OPENAI_AUTH, continue_url or "/phone-verification"), page_payload
         if page_type not in {"email_otp_verification", "email_otp_send"}:
-            if page_type == "add_phone" or "/add-phone" in continue_url:
-                return engine, urljoin(OPENAI_AUTH, continue_url or "/add-phone"), page_payload
             raise RuntimeError(f"邮箱账号未进入邮箱 OTP 登录: {page_type or continue_url or 'unknown'}")
 
         begin_wait = getattr(self.email_service, "begin_new_otp_wait", None)
@@ -1856,26 +2107,10 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                     )
                 if hasattr(self.phone_callback, "mark_send_succeeded"):
                     self.phone_callback.mark_send_succeeded()
-                sms_code = str(self.phone_callback() or "").strip()
-                if not sms_code:
-                    last_error = "等待短信验证码超时"
-                    self._reset_number(last_error)
-                    if attempt < self.max_phone_attempts:
-                        engine, add_phone_url, page_payload = self._rebuild_phone_challenge(
-                            email=email,
-                            password=password,
-                            reason="phone_otp_timeout",
-                            previous_engine=engine,
-                        )
-                        if page_payload.get("already_verified"):
-                            return self._handle_already_verified_phone_account(engine)
-                        continue
-                    break
-                if not self._validate_phone_otp(engine, sms_code):
-                    error_code = str(getattr(engine, "_step_error_code", "") or "")
-                    last_error = engine._step_error_message or "短信验证码校验失败"
-                    if hasattr(self.phone_callback, "mark_code_failed"):
-                        self.phone_callback.mark_code_failed(last_error)
+                otp_ok, error_code, last_error = self._read_and_validate_phone_otp(engine)
+                if not otp_ok:
+                    error_code = str(error_code or "phone_otp_validation_failed")
+                    last_error = str(last_error or "短信验证码校验失败")
                     self._reset_number(last_error)
                     if _is_account_deactivated(error_code, last_error):
                         self._log(
@@ -1904,7 +2139,7 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                         engine, add_phone_url, page_payload = self._rebuild_phone_challenge(
                             email=email,
                             password=password,
-                            reason=error_code or "phone_otp_validation_failed",
+                            reason=error_code,
                             previous_engine=engine,
                         )
                         if page_payload.get("already_verified"):
@@ -1913,7 +2148,10 @@ class ChatGPTProtocolEmailThenPhoneWorker(ChatGPTProtocolPhoneWorker):
                     break
 
                 if hasattr(self.phone_callback, "report_success"):
-                    self.phone_callback.report_success()
+                    if self.phone_callback.report_success() is False:
+                        raise RuntimeError(
+                            "PHONE_ACTIVATION_FINALIZE_FAILED: 短信号码完成上报失败"
+                        )
                 codex_tokens = self._complete_codex_oauth(engine)
                 require_rt = bool(getattr(self, "require_codex_refresh_token", True))
                 if require_rt:

@@ -6,9 +6,11 @@ HTTP 客户端封装
 
 import time
 import json
+import re
 from typing import Optional, Dict, Any, Union, Tuple
 from dataclasses import dataclass
 import logging
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from curl_cffi import requests as cffi_requests
 from curl_cffi.requests import Session, Response
@@ -18,6 +20,43 @@ from curl_cffi.requests import Session, Response
 
 
 logger = logging.getLogger(__name__)
+
+_SENSITIVE_QUERY_KEYS = {
+    "api_key", "apikey", "access_token", "refresh_token", "token",
+    "authorization", "auth", "password", "passwd", "secret",
+    "key", "signature", "sig",
+}
+_SENSITIVE_TEXT_RE = re.compile(
+    r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|authorization|signature)\s*[=:]\s*)([^\s&,;]+)"
+)
+
+
+def _safe_url(url: str) -> str:
+    """Return a URL suitable for logs without credentials or secret query values."""
+    raw = str(url or "")
+    try:
+        parsed = urlsplit(raw)
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        pairs = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            if key.strip().lower().replace("-", "_") in _SENSITIVE_QUERY_KEYS:
+                value = "***"
+            pairs.append((key, value))
+        return urlunsplit((parsed.scheme, host, parsed.path, urlencode(pairs), ""))
+    except Exception:
+        return "<redacted-url>"
+
+
+def _safe_text(value: object) -> str:
+    text = str(value or "")
+    text = re.sub(
+        r"https?://[^\s\]}>)+]+",
+        lambda match: _safe_url(match.group(0)),
+        text,
+    )
+    return _SENSITIVE_TEXT_RE.sub(r"\1***", text)[:500]
 
 
 @dataclass
@@ -126,7 +165,7 @@ class HTTPClient:
                 # 检查响应状态码
                 if response.status_code >= 400:
                     logger.warning(
-                        f"HTTP {response.status_code} for {method} {url}"
+                        f"HTTP {response.status_code} for {method} {_safe_url(url)}"
                         f" (attempt {attempt + 1}/{self.config.max_retries})"
                     )
 
@@ -140,7 +179,7 @@ class HTTPClient:
             except (cffi_requests.RequestsError, ConnectionError, TimeoutError) as e:
                 last_exception = e
                 logger.warning(
-                    f"请求失败: {method} {url} (attempt {attempt + 1}/{self.config.max_retries}): {e}"
+                    f"请求失败: {method} {_safe_url(url)} (attempt {attempt + 1}/{self.config.max_retries}): {_safe_text(e)}"
                 )
 
                 if attempt < self.config.max_retries - 1:
@@ -149,7 +188,7 @@ class HTTPClient:
                     break
 
         raise HTTPClientError(
-            f"请求失败，最大重试次数已达: {method} {url} - {last_exception}"
+            f"请求失败，最大重试次数已达: {method} {_safe_url(url)} - {_safe_text(last_exception)}"
         )
 
     def get(self, url: str, **kwargs) -> Response:
@@ -202,7 +241,7 @@ class HTTPClient:
                         f.write(chunk)
 
         except Exception as e:
-            raise HTTPClientError(f"下载文件失败: {url} - {e}")
+            raise HTTPClientError(f"下载文件失败: {_safe_url(url)} - {_safe_text(e)}") from e
 
     def check_proxy(self, test_url: str = "https://httpbin.org/ip") -> bool:
         """

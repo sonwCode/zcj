@@ -264,7 +264,6 @@ DEFAULT_SETTINGS = [
     # (key, value, description, category)
     ("system.name", APP_NAME, "系统名称", "general"),
     ("system.version", APP_VERSION, "系统版本", "general"),
-    ("logs.retention_days", "30", "日志保留天数", "general"),
     ("openai.client_id", OAUTH_CLIENT_ID, "OpenAI OAuth Client ID", "openai"),
     ("openai.auth_url", OAUTH_AUTH_URL, "OpenAI 认证地址", "openai"),
     ("openai.token_url", OAUTH_TOKEN_URL, "OpenAI Token 地址", "openai"),

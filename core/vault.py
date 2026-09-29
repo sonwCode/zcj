@@ -40,6 +40,8 @@ from sqlalchemy import Text
 from sqlalchemy.types import TypeDecorator
 
 ENC_PREFIX = "enc:v1:"
+# Stable wire marker for secret fields returned to an operator UI.
+MASKED_SECRET = "********"
 KEY_ENV = "ZCJ_VAULT_KEY"
 KEY_FILE_ENV = "ZCJ_VAULT_KEY_FILE"
 DISABLE_ENV = "ZCJ_VAULT_DISABLED"

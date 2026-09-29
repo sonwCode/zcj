@@ -99,9 +99,14 @@ class Scheduler:
             flush=True,
         )
 
-    def stop(self):
+    def stop(self, *, timeout: float = 30.0):
         self._running = False
         self._stop_event.set()
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=max(deadline - time.monotonic(), 0.0))
+        if self._full_cycle_thread and self._full_cycle_thread.is_alive():
+            self._full_cycle_thread.join(timeout=max(deadline - time.monotonic(), 0.0))
 
     def _loop(self):
         next_full_run = time.monotonic() + 60

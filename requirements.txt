@@ -11,6 +11,8 @@ jwcrypto>=1.5.0
 cbor2>=5.4.0
 camoufox[geoip]>=0.4.0
 aiofiles>=23.0.0
+# 微软邮箱池的 CSV 导入接口用 FastAPI 的 File()/UploadFile；缺它会在导入路由时直接报错。
+python-multipart>=0.0.9
 patchright>=1.0.0
 quart>=0.19.0
 rich>=13.0.0

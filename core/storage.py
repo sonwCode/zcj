@@ -3,18 +3,11 @@
 The account manager was written against SQLite.  This module isolates the
 dialect-specific decisions so the same SQLModel tables can also run on
 PostgreSQL for multi-node deployments, without changing every caller.
-
-The default stays SQLite: no configuration change and no new dependency.  Point
-ACCOUNT_MANAGER_DATABASE_URL at a PostgreSQL URL to switch, for example
-    postgresql+psycopg://user:pass@host:5432/zcj
-
-What is genuinely dialect specific is migration and pragma handling.  The
-legacy-schema rewrite in core.db uses SQLite PRAGMA statements and is therefore
-only run when the engine really is SQLite; everything else uses portable DDL.
 """
 from __future__ import annotations
 
 import os
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,8 +60,39 @@ def is_sqlite(url: str | None = None) -> bool:
     return dialect_of(url) == "sqlite"
 
 
+def is_sqlite_memory(url: str | None = None) -> bool:
+    value = str(url or database_url()).strip()
+    if not is_sqlite(value):
+        return False
+    parsed = urllib.parse.urlparse(value)
+    return parsed.path in {"", "/", "/:memory:"} or urllib.parse.parse_qs(parsed.query).get("mode") == ["memory"]
+
+
 def is_postgres(url: str | None = None) -> bool:
     return dialect_of(url) == "postgresql"
+
+
+def _sqlite_path(url: str) -> Path:
+    parsed = urllib.parse.urlparse(url)
+    database = parsed.path
+    if database.startswith("/") and url.startswith("sqlite:////"):
+        return Path(database)
+    return Path(database.lstrip("/"))
+
+
+def secure_sqlite_file_permissions(url: str | None = None) -> None:
+    """Restrict the database and SQLite sidecars to the service account."""
+    value = str(url or database_url())
+    if not is_sqlite(value) or is_sqlite_memory(value):
+        return
+    path = _sqlite_path(value)
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            if candidate.exists():
+                os.chmod(candidate, 0o600)
+        except OSError:
+            # Permission hardening is retried on the next connection/startup.
+            continue
 
 
 def describe(url: str | None = None) -> StorageBackend:
@@ -106,14 +130,10 @@ def describe(url: str | None = None) -> StorageBackend:
 
 
 def build_engine(url: str | None = None) -> Engine:
-    """Create an engine with backend-appropriate pooling.
-
-    SQLite keeps the historical single-engine behaviour.  Server databases get
-    pre-ping and a bounded pool so a recycled connection does not surface as a
-    registration failure.
-    """
+    """Create an engine with backend-appropriate pooling."""
     value = str(url or database_url())
     if is_sqlite(value):
+        secure_sqlite_file_permissions(value)
         return create_engine(value)
     return create_engine(
         value,
