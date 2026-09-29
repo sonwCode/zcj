@@ -32,7 +32,6 @@ import {
 const Dashboard = lazy(() => import("@/pages/Dashboard"));
 const Accounts = lazy(() => import("@/pages/Accounts"));
 const Register = lazy(() => import("@/pages/RegisterWorkbench"));
-const RegisterCenter = lazy(() => import("@/pages/RegisterCenter"));
 const OtherRegisterWorkbench = lazy(() => import("@/pages/OtherRegisterWorkbench"));
 const Tasks = lazy(() => import("@/pages/Tasks"));
 const SmsSettings = lazy(() => import("@/pages/SmsSettings"));
@@ -83,7 +82,8 @@ const SETTINGS_NAV_ITEMS: { labelKey: TranslationKey; hash: string }[] = [
 const NAV_ITEMS: NavItem[] = [
   { path: "/", labelKey: "nav.dashboard", icon: LayoutDashboard, exact: true, group: "总览" },
   { path: "/accounts/chatgpt", label: "账号池", icon: Users, group: "账号" },
-  { path: "/register-center", label: "注册中心", icon: UserPlus, group: "账号" },
+  { path: "/register", label: "ChatGPT 注册", icon: UserPlus, group: "账号" },
+  { path: "/register-other", label: "多平台注册", icon: UserPlus, group: "账号" },
   { path: "/tasks", label: "任务中心", icon: ClipboardList, group: "账号" },
   { path: "/history", label: "任务历史", icon: ClipboardList, group: "账号" },
   { path: "/plus-manager", label: "Plus 管理", icon: CreditCard, group: "PLUS" },
@@ -324,7 +324,6 @@ function Shell({
               <Route path="/accounts" element={<Accounts />} />
               <Route path="/accounts/:platform" element={<Accounts />} />
               <Route path="/register" element={<Register />} />
-              <Route path="/register-center" element={<RegisterCenter />} />
               <Route path="/register-other" element={<OtherRegisterWorkbench />} />
               <Route path="/tasks" element={<Tasks />} />
               <Route path="/ctf-gpt-plus" element={<CtfGptPlus />} />
